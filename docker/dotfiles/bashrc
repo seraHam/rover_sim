@@ -1,0 +1,13 @@
+# Bind-mounted from docker/dotfiles/bashrc (see docker/compose.yaml), not
+# baked into the image — an edit here (from the host or live in the
+# container, same file) survives down/up.
+source /opt/ros/humble/setup.bash
+source /home/swarm/code/mighty_ws/install/setup.bash
+source /opt/livox_ws/install/setup.bash
+
+### ALIASES ###
+alias tks="tmux kill-session"
+alias sb="source ~/.bashrc"
+alias run_multi="tmuxp load /home/swarm/rover_sim/launch/multi_agent_swap_demo.yaml"
+# Kills everything any sim session started (launch children, backgrounded TF publishers), then the current (or most recent) tmux session.
+alias stop='pkill -9 -f "gzserver|gzclient|rviz2|ros2 launch|/mighty_ws/install/.*/lib/|robot_state_publisher|static_transform_publisher"; tmux kill-session 2>/dev/null; true'

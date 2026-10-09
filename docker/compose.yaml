@@ -1,0 +1,56 @@
+# rover_sim — one idling container with Gazebo + the sim-side mighty stack
+# baked in; nodes/launch files are docker-exec'd in (or run from an attached
+# shell). See Dockerfile for how the image is assembled.
+#
+#   build:   make build   (docker compose build --ssh ...; see Makefile)
+#   up:      make up
+#   attach:  make shell   (docker exec -it rover-sim bash)
+#   down:    make down
+#
+# DISPLAY inherits from the host shell running `docker compose up`.
+# RMW_IMPLEMENTATION (rmw_fastrtps_cpp) and ROS_DOMAIN_ID (20) are fixed,
+# whatever the host has set.
+name: rover-sim
+services:
+  rover-sim:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: rover-sim:local
+    container_name: rover-sim
+    network_mode: host                 # simplest path to share ROS graph with the host
+                                        # (Linux only — see README.md's macOS note)
+    environment:
+      DISPLAY: ${DISPLAY:-}
+      RMW_IMPLEMENTATION: rmw_fastrtps_cpp
+      ROS_DOMAIN_ID: 20                # same as the launch/ sessions
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      # Per-file overrides of mighty's installed files: edit here, no rebuild or mighty push.
+      - "../config/mighty_ground_robot.yaml:/home/swarm/code/mighty_ws/install/mighty/share/mighty/config/mighty_ground_robot.yaml"
+      - "../rviz/mighty_sim_ground_robot.rviz:/home/swarm/code/mighty_ws/install/mighty/share/mighty/rviz/mighty_sim_ground_robot.rviz"
+      - "../urdf/p3at.urdf.xacro:/home/swarm/code/mighty_ws/install/mighty/share/mighty/urdf/p3at.urdf.xacro"
+      - "../urdf/pioneer3at_body.urdf.xacro:/home/swarm/code/mighty_ws/install/mighty/share/mighty/urdf/pioneer3at_body.urdf.xacro"
+      - "../launch:/home/swarm/rover_sim/launch:ro"
+      # Bind-mounted, not baked: an edit (from the host or live in the
+      # container, same file) survives down/up.
+      - "./dotfiles/bashrc:/root/.bashrc"
+      - "./dotfiles/tmux.conf:/root/.tmux.conf"
+      # mpc and livox_laser_simulation_ros2 are separate pinned repos, not
+      # part of this checkout — see docker/overrides/ for why these need
+      # their own overrides.
+      - "./overrides/mpc_sim.yaml:/home/swarm/code/mighty_ws/install/mpc/share/mpc/config/mpc_sim.yaml"
+      - "./overrides/mid360.xacro:/home/swarm/code/mighty_ws/install/ros2_livox_simulation/share/ros2_livox_simulation/urdf/mid360.xacro"
+    privileged: true                   # GL/X11
+    # Default 64MB /dev/shm is way too small once enough nodes run at once
+    # (each node's own shm transport segment) — crashed almost
+    # everything with ENOMEM in a multi-agent session.
+    shm_size: "2gb"
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    init: true
+    stop_grace_period: 15s
+    restart: "no"
+    command: ["sleep", "infinity"]

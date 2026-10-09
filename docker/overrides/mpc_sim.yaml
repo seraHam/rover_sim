@@ -1,0 +1,34 @@
+# Bind-mounted over the pinned mpc's installed mpc_sim.yaml (see
+# docker/compose.yaml). Tuned for the sim: v_max, R_w and control_rate_hz
+# differ from that commit's defaults.
+/**:
+  ros__parameters:
+    # Frames — use TF for pose in simulation (fake_sim publishes map → {ns}/base_link)
+    use_tf_pose: true
+    base_frame: "base_link"           # resolved relative to namespace
+    tracking_frame: "map"
+
+    # Topics (relative — namespace is set at launch via -r __ns:=/{agent})
+    path_topic: "mpc_waypoints"               # path_msgs/SpeedyPath from mighty
+    cmd_vel_topic: "cmd_vel"                   # geometry_msgs/Twist output to Gazebo
+
+    # Behavior
+    goal_tolerance: 0.3          # stop radius [m]
+    control_rate_hz: 10.0        # lowered from 30 — at v_max 0.5 m/s that's 5cm/solve, still much
+                                 # faster than the robot or a new obstacle can move; cuts solver CPU 3x
+
+    # MPC horizon and dynamics
+    dt: 0.05                     # time step [s]
+    N_horizon: 20
+    v_min: 0.0
+    v_max: 0.5
+    w_max: 0.5
+    max_linear_accel: 0.5    # [m/s^2] trapezoidal ramp-up/down rate
+
+    # Cost weights
+    Q_pos: 5.0
+    Q_yaw: 1.0
+    R_v: 0.1
+    R_w: 0.1
+    dR_v: 0.1
+    dR_w: 0.01

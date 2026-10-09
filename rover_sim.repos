@@ -1,0 +1,58 @@
+repositories:
+  # mighty itself is NOT listed here on purpose — it's cloned as its own
+  # Dockerfile step (MIGHTY_GIT_URL/MIGHTY_GIT_REF build args), not via
+  # `vcs import` alongside these. Keeping it separate means bumping mighty's
+  # pin only invalidates that one cheap clone layer, not this whole deps
+  # layer (the slow rosdep+colcon one). See docker/Dockerfile for the pin.
+
+  # ROS 2 dependencies (build with colcon)
+  acl-mapping:
+    type: git
+    url: git@gitlab.com:mit-acl/lab/acl-mapping.git
+    version: 9bed2cfbc4bf96769b879a6999d9ce32533ef06a
+  direct_lidar_inertial_odometry:
+    type: git
+    url: git@github.com:blakete/direct_lidar_inertial_odometry.git
+    version: 73c24893eb3d2eb6baa9f75fdc905483b201255c
+  dynus_interfaces:
+    type: git
+    url: https://github.com/kotakondo/dynus_interfaces.git
+    version: c43bcec6d4b67c6f8a8baabb1b2f8c1ba8b919d1
+  gazebo_ros_pkgs:
+    type: git
+    url: https://github.com/kotakondo/gazebo_ros_pkgs.git
+    version: ed1f7b886971d7bf898e6e0f59c622df929c0521
+  livox_laser_simulation_ros2:
+    type: git
+    url: https://github.com/kotakondo/livox_laser_simulation_ros2.git
+    version: 044e83e6fc5d527b082852550d7206dd4308d950
+  mpc:
+    type: git
+    url: git@gitlab.com:mit-acl/ugv/ugv_control/mpc.git
+    version: 7efbfe5ff76d70a332287f5b884248c29f197cba
+  realsense_gazebo_plugin:
+    type: git
+    url: https://github.com/kotakondo/realsense_gazebo_plugin.git
+    version: 8c357e69da2160f54328db70915bd9b28eb975bf
+  uav_simulator:
+    type: git
+    url: https://github.com/kotakondo/uav_simulator.git
+    version: b196208d3cbf0269b8e80220f7cc1cc992b6c7f8
+
+  # Decomp (built in decomp_ws — decomp_util first, then the rest)
+  DecompROS2:
+    type: git
+    url: https://github.com/kotakondo/DecompROS2.git
+    version: a2bc42ed46bf934323994706f17af8a3883860ea
+
+  # Livox dependencies (special build — Livox-SDK2 cmake-installed,
+  # livox_ros_driver2 built in livox_ws via its own build.sh)
+  livox_ros_driver2:
+    type: git
+    url: git@github.com:blakete/livox_ros_driver2.git
+    # fix/build-vs-sdk-1.2.5 — f103b4e + numeric-compare patch so it compiles vs SDK v1.2.5
+    version: 37a62915b4e3f82ce4fbf5bbf7bc16b3ce498aaa
+  Livox-SDK2:
+    type: git
+    url: https://github.com/Livox-SDK/Livox-SDK2.git
+    version: 6a940156dd7151c3ab6a52442d86bc83613bd11b

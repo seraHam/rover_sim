@@ -1,0 +1,100 @@
+# Ground-robot multi-agent sim: 4 agents at the corners of an 8x8 square,
+# swapping to the opposite corner (goal_monitor_node.py, from num_agents,
+# radius, angle_offset), one goal_monitor_node.py per agent.
+session_name: multi_agent_swap_demo
+shell_command_before: &base
+- source /opt/ros/humble/setup.bash
+- source /home/swarm/code/mighty_ws/install/setup.bash
+- source /opt/livox_ws/install/setup.bash
+- export ROS_DOMAIN_ID=20
+windows:
+  - window_name: sim
+    layout: even-horizontal
+    shell_command_before: *base
+    panes:
+      - shell_command:
+        - sleep 5
+        - source /usr/share/gazebo/setup.bash
+        - ros2 launch mighty base_mighty.launch.py use_gazebo_gui:=false use_rviz:=true env:=empty use_ground_robot:=true
+
+  - window_name: core
+    layout: tiled
+    shell_command_before: *base
+    panes:
+      - shell_command:
+        - sleep 12
+        - ros2 launch mighty onboard_mighty.launch.py namespace:=RR01 x:=4.0 y:=4.0 z:=0.0 yaw:=-135 sim_env:=gazebo use_ground_robot:=true num_agents:=4
+      - shell_command:
+        - sleep 12
+        - ros2 launch mighty onboard_mighty.launch.py namespace:=RR02 x:=-4.0 y:=4.0 z:=0.0 yaw:=-45 sim_env:=gazebo use_ground_robot:=true num_agents:=4
+      - shell_command:
+        - sleep 12
+        - ros2 launch mighty onboard_mighty.launch.py namespace:=RR03 x:=-4.0 y:=-4.0 z:=0.0 yaw:=45 sim_env:=gazebo use_ground_robot:=true num_agents:=4
+      - shell_command:
+        - sleep 12
+        - ros2 launch mighty onboard_mighty.launch.py namespace:=RR04 x:=4.0 y:=-4.0 z:=0.0 yaw:=135 sim_env:=gazebo use_ground_robot:=true num_agents:=4
+
+  - window_name: mapping
+    layout: tiled
+    shell_command_before: *base
+    panes:
+      - shell_command:
+        - sleep 10
+        - ros2 launch global_mapper_ros global_mapper_node.launch.py use_gazebo:=true use_obstacle_tracker:=false param_file:=sim_ground_robot.yaml quad:=RR01
+      - shell_command:
+        - sleep 10
+        - ros2 launch global_mapper_ros global_mapper_node.launch.py use_gazebo:=true use_obstacle_tracker:=false param_file:=sim_ground_robot.yaml quad:=RR02
+      - shell_command:
+        - sleep 10
+        - ros2 launch global_mapper_ros global_mapper_node.launch.py use_gazebo:=true use_obstacle_tracker:=false param_file:=sim_ground_robot.yaml quad:=RR03
+      - shell_command:
+        - sleep 10
+        - ros2 launch global_mapper_ros global_mapper_node.launch.py use_gazebo:=true use_obstacle_tracker:=false param_file:=sim_ground_robot.yaml quad:=RR04
+
+  - window_name: state
+    layout: tiled
+    shell_command_before: *base
+    panes:
+      # Static identity transform map -> RRxx/map, backgrounded: mpc_node
+      # (the pinned mpc) always namespace-prefixes tracking_frame
+      # regardless of a leading slash (onboard_mighty.launch.py tries to
+      # pass it as absolute via '/'+map_frame_id, but mpc_node.py's
+      # .lstrip('/') strips that before checking, defeating it) — so
+      # RRxx/map never otherwise exists. Publishing it directly sidesteps
+      # the bug without touching the private mpc repo.
+      - shell_command:
+        - sleep 10
+        - ros2 run tf2_ros static_transform_publisher 0 0 0 0 0 0 1 map RR01/map &
+        - ros2 run mighty convert_odom_to_state --ros-args -r __ns:=/RR01 -r odom:=odom -r state:=state
+      - shell_command:
+        - sleep 10
+        - ros2 run tf2_ros static_transform_publisher 0 0 0 0 0 0 1 map RR02/map &
+        - ros2 run mighty convert_odom_to_state --ros-args -r __ns:=/RR02 -r odom:=odom -r state:=state
+      - shell_command:
+        - sleep 10
+        - ros2 run tf2_ros static_transform_publisher 0 0 0 0 0 0 1 map RR03/map &
+        - ros2 run mighty convert_odom_to_state --ros-args -r __ns:=/RR03 -r odom:=odom -r state:=state
+      - shell_command:
+        - sleep 10
+        - ros2 run tf2_ros static_transform_publisher 0 0 0 0 0 0 1 map RR04/map &
+        - ros2 run mighty convert_odom_to_state --ros-args -r __ns:=/RR04 -r odom:=odom -r state:=state
+
+  - window_name: goals
+    layout: tiled
+    shell_command_before: *base
+    panes:
+      # radius/angle_offset reproduce the same corners as the start
+      # positions above, so each agent's first swap target is the
+      # diametrically opposite corner. Staggered 3s apart.
+      - shell_command:
+        - sleep 20
+        - ros2 run mighty goal_monitor_node.py --ros-args -r __ns:=/RR01 -p goal_tolerance:=1.0 -p use_ground_robot:=true -p num_agents:=4 -p radius:=5.657 -p angle_offset:=0.7854
+      - shell_command:
+        - sleep 23
+        - ros2 run mighty goal_monitor_node.py --ros-args -r __ns:=/RR02 -p goal_tolerance:=1.0 -p use_ground_robot:=true -p num_agents:=4 -p radius:=5.657 -p angle_offset:=0.7854
+      - shell_command:
+        - sleep 26
+        - ros2 run mighty goal_monitor_node.py --ros-args -r __ns:=/RR03 -p goal_tolerance:=1.0 -p use_ground_robot:=true -p num_agents:=4 -p radius:=5.657 -p angle_offset:=0.7854
+      - shell_command:
+        - sleep 29
+        - ros2 run mighty goal_monitor_node.py --ros-args -r __ns:=/RR04 -p goal_tolerance:=1.0 -p use_ground_robot:=true -p num_agents:=4 -p radius:=5.657 -p angle_offset:=0.7854
