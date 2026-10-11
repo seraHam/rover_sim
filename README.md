@@ -2,9 +2,10 @@
 
 Standalone Docker build of the mighty ground-robot simulation stack: mighty +
 mpc + global_mapper_ros (acl-mapping) + Gazebo/RViz/Livox-sim, pulled from
-their upstream repos (`rover_sim.repos`, and `docker/Dockerfile`'s `MIGHTY_GIT_*`
-args for mighty's `feature/rover_sim` branch) rather than requiring a local
-checkout of any of them. No native ROS install needed on the host.
+their upstream repos (`rover_sim.repos`, and the pins in `docker/Dockerfile`
+for the `feature/rover_sim` branches of mighty, mpc and a fork of acl-mapping) rather than
+requiring a local checkout of any of them (though see "Building from local
+checkouts"). No native ROS install needed on the host.
 
 Your own stack runs alongside it: the container is `rover-sim`, on the
 host network, so its ROS graph is shared with the host.
@@ -80,6 +81,20 @@ make build JOBS=4    # more jobs: faster, but uses more RAM
 Rerunning a killed build resumes from the last finished step, as long as `JOBS`
 is the same; a different `JOBS` recompiles everything.
 
+### Building from local checkouts
+
+mighty, acl-mapping and mpc are normally cloned at the commits pinned in
+`docker/Dockerfile`. To build any of them from a local checkout instead (e.g.
+to test a change before pushing it), point the matching variable at it:
+```bash
+make build MIGHTY_SRC=~/code/mighty ACL_MAPPING_SRC=~/code/acl-mapping MPC_SRC=~/code/mpc
+```
+Set only the ones you need. The folder is copied in as it is, uncommitted
+changes included, and needs no SSH access. A change in mighty rebuilds only
+mighty; a change in acl-mapping or mpc rebuilds only those two. Any change in
+the folder counts, `.git` included (e.g. a new commit). An image built this way
+keeps the local version until you build again without the variable.
+
 ## Usage
 
 Start the container, from the repo root (the `make` commands all run there):
@@ -103,8 +118,8 @@ Stop the container, from the host:
 ```bash
 make down    # stop the container (and everything running in it)
 ```
-After changing `docker/Dockerfile`, `rover_sim.repos` or the mighty pin, rebuild
-with `make build` (see "Build the image" above).
+After changing `docker/Dockerfile`, `rover_sim.repos` or a pin, rebuild with
+`make build` (see "Build the image" above).
 
 These files are bind-mounted over mighty's installed copies, so an edit
 takes effect in a running container with no rebuild or mighty push:
@@ -121,7 +136,7 @@ mpc's `mpc_sim.yaml` (sim tuning) and the Livox sim's `mid360.xacro` (lidar at
 
 `multi_agent_swap_demo.yaml` (`run_swap4`): 4 ground robots (`RR01`-`RR04`),
 empty world, swapping to opposite corners via `goal_monitor_node.py` (no manual
-RViz goal-clicking). Windows: `sim`, `core`, `mapping`, `state`, `goals`.
+RViz goal-clicking). Windows: `sim`, `spawn`, `core`, `mapping`, `state`, `goals`.
 `env:=ACL_office_simple` in `base_mighty.launch.py` loads the office world
 instead of `empty`. Run it inside the container:
 ```bash
@@ -130,14 +145,35 @@ run_swap4    # tmuxp load /home/swarm/rover_sim/launch/multi_agent_swap_demo.yam
 
 `office_explore_demo.yaml` (`run_explore4`): the same 4 robots in the office world
 (`ACL_office_simple`), exploring it with mighty's frontier exploration instead of
-swapping goals. The session runs mighty with `config_file:=/tmp/mighty_explore.yaml`,
-a copy of `config/mighty_ground_robot.yaml` with `exploration.enabled` and
-`exploration.bounds.enabled` turned on, written when the session starts.
+swapping goals. It turns on `exploration.enabled` and `exploration.bounds.enabled`
+in the session's copy of `config/mighty_ground_robot.yaml` (see below).
 ```bash
 run_explore4 # tmuxp load /home/swarm/rover_sim/launch/office_explore_demo.yaml
 ```
 
-RViz shows each robot's 2D occupancy map (`/RRxx/occ_2d_topic`) as it is built.
+Its RViz uses `rviz/office_explore.rviz`, which also shows each robot's 2D
+occupancy map (`/RRxx/occ_2d_topic`) as it is built.
+
+`office_prior_map_demo.yaml` (`run_prior4`): the 4 robots at the office's corners,
+starting from its known map (see "Starting from a known map" below), each
+swapping with the diagonally opposite corner (`scripts/swap_goals.py`).
+```bash
+run_prior4   # tmuxp load /home/swarm/rover_sim/launch/office_prior_map_demo.yaml
+```
+
+The sessions start by running `scripts/write_configs.sh`, which writes the
+mapper and mighty configs they use to `/tmp/rover_sim/`.
+
+### Starting from a known map
+
+With `PRIOR_MAP` set to a nav2 map yaml (e.g. `maps/acl_office_simple.yaml`,
+made from the office world), `write_configs.sh` starts each robot's map from it;
+`run_prior4` does this. The lidar keeps updating the map from there. The mapper's grid is fixed to the
+map's area instead of following the robot, and mighty plans with
+`use_soft_cost_obstacles: false` and `horizon: 40.0`. mighty plans on a window
+centered on the robot and moves a goal outside it to the window's edge, which
+can be inside a wall, so `PRIOR_WINDOW` (m) sets the window's minimum size: twice
+the farthest goal offset (48 in `run_prior4`).
 
 To stop a run, `stop` inside the container (or `make down` from the host).
 `tmux kill-session` alone can leave `ros2 launch` children and the

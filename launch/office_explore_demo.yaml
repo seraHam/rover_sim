@@ -1,7 +1,7 @@
 # Ground-robot multi-agent exploration: 4 agents start at the corners of an 8x8
 # square in the office (ACL_office_simple) and explore it with mighty's frontier
-# exploration. The sim pane writes /tmp/mighty_explore.yaml: the installed
-# ground-robot config with exploration and its bounds turned on.
+# exploration. The sim pane writes the configs (scripts/write_configs.sh), then
+# turns on exploration and its bounds in mighty's.
 session_name: office_explore_demo
 shell_command_before: &base
 - source /opt/ros/humble/setup.bash
@@ -14,11 +14,35 @@ windows:
     shell_command_before: *base
     panes:
       - shell_command:
-        - sed -e 's/\(exploration\.enabled:\) false/\1 true/' -e 's/\(exploration\.bounds\.enabled:\) false/\1 true/' /home/swarm/code/mighty_ws/install/mighty/share/mighty/config/mighty_ground_robot.yaml > /tmp/mighty_explore.yaml
+        - /home/swarm/rover_sim/scripts/write_configs.sh
+        - sed -i -e 's/\(exploration\.enabled:\) false/\1 true/' -e 's/\(exploration\.bounds\.enabled:\) false/\1 true/' /tmp/rover_sim/mighty.yaml
         - sleep 5
         - source /usr/share/gazebo/setup.bash
         - export GAZEBO_MODEL_PATH=/home/swarm/code/mighty_ws/install/mighty/share:$GAZEBO_MODEL_PATH
-        - ros2 launch mighty base_mighty.launch.py use_gazebo_gui:=false use_rviz:=true env:=ACL_office_simple use_ground_robot:=true
+        - ros2 launch mighty base_mighty.launch.py use_gazebo_gui:=false use_rviz:=false env:=ACL_office_simple use_ground_robot:=true pause:=true
+      - shell_command:
+        - sleep 5
+        - ros2 run rviz2 rviz2 -d /home/swarm/rover_sim/rviz/office_explore.rviz --ros-args --log-level error
+
+  # Every robot is spawned into the paused Gazebo before it is unpaused and
+  # fake_sim, mighty and the mpc start: fake_sim's set_entity_state calls
+  # racing a model insertion segfault Gazebo.
+  - window_name: spawn
+    layout: tiled
+    shell_command_before: *base
+    panes:
+      - shell_command:
+        - sleep 12
+        - ros2 launch mighty onboard_mighty.launch.py namespace:=RR01 x:=4.0 y:=4.0 z:=0.0 yaw:=-135 sim_env:=gazebo use_ground_robot:=true num_agents:=4 config_file:=/tmp/rover_sim/mighty.yaml only_nodes:=robot_state_publisher,spawn_entity
+      - shell_command:
+        - sleep 12
+        - ros2 launch mighty onboard_mighty.launch.py namespace:=RR02 x:=-4.0 y:=4.0 z:=0.0 yaw:=-45 sim_env:=gazebo use_ground_robot:=true num_agents:=4 config_file:=/tmp/rover_sim/mighty.yaml only_nodes:=robot_state_publisher,spawn_entity
+      - shell_command:
+        - sleep 12
+        - ros2 launch mighty onboard_mighty.launch.py namespace:=RR03 x:=-4.0 y:=-4.0 z:=0.0 yaw:=45 sim_env:=gazebo use_ground_robot:=true num_agents:=4 config_file:=/tmp/rover_sim/mighty.yaml only_nodes:=robot_state_publisher,spawn_entity
+      - shell_command:
+        - sleep 12
+        - ros2 launch mighty onboard_mighty.launch.py namespace:=RR04 x:=4.0 y:=-4.0 z:=0.0 yaw:=135 sim_env:=gazebo use_ground_robot:=true num_agents:=4 config_file:=/tmp/rover_sim/mighty.yaml only_nodes:=robot_state_publisher,spawn_entity
 
   - window_name: core
     layout: tiled
@@ -26,16 +50,24 @@ windows:
     panes:
       - shell_command:
         - sleep 12
-        - ros2 launch mighty onboard_mighty.launch.py namespace:=RR01 x:=4.0 y:=4.0 z:=0.0 yaw:=-135 sim_env:=gazebo use_ground_robot:=true num_agents:=4 config_file:=/tmp/mighty_explore.yaml
+        - until pgrep -f "[r]obot_state_publisher --ros-args" | wc -l | grep -qx 4 && ! pgrep -f "[s]pawn_entity.py" >/dev/null; do sleep 1; done
+        - timeout 20 ros2 service call /unpause_physics std_srvs/srv/Empty >/dev/null
+        - ros2 launch mighty onboard_mighty.launch.py namespace:=RR01 x:=4.0 y:=4.0 z:=0.0 yaw:=-135 sim_env:=gazebo use_ground_robot:=true num_agents:=4 config_file:=/tmp/rover_sim/mighty.yaml only_nodes:=fake_sim,mighty_node,mpc
       - shell_command:
         - sleep 12
-        - ros2 launch mighty onboard_mighty.launch.py namespace:=RR02 x:=-4.0 y:=4.0 z:=0.0 yaw:=-45 sim_env:=gazebo use_ground_robot:=true num_agents:=4 config_file:=/tmp/mighty_explore.yaml
+        - until pgrep -f "[r]obot_state_publisher --ros-args" | wc -l | grep -qx 4 && ! pgrep -f "[s]pawn_entity.py" >/dev/null; do sleep 1; done
+        - timeout 20 ros2 service call /unpause_physics std_srvs/srv/Empty >/dev/null
+        - ros2 launch mighty onboard_mighty.launch.py namespace:=RR02 x:=-4.0 y:=4.0 z:=0.0 yaw:=-45 sim_env:=gazebo use_ground_robot:=true num_agents:=4 config_file:=/tmp/rover_sim/mighty.yaml only_nodes:=fake_sim,mighty_node,mpc
       - shell_command:
         - sleep 12
-        - ros2 launch mighty onboard_mighty.launch.py namespace:=RR03 x:=-4.0 y:=-4.0 z:=0.0 yaw:=45 sim_env:=gazebo use_ground_robot:=true num_agents:=4 config_file:=/tmp/mighty_explore.yaml
+        - until pgrep -f "[r]obot_state_publisher --ros-args" | wc -l | grep -qx 4 && ! pgrep -f "[s]pawn_entity.py" >/dev/null; do sleep 1; done
+        - timeout 20 ros2 service call /unpause_physics std_srvs/srv/Empty >/dev/null
+        - ros2 launch mighty onboard_mighty.launch.py namespace:=RR03 x:=-4.0 y:=-4.0 z:=0.0 yaw:=45 sim_env:=gazebo use_ground_robot:=true num_agents:=4 config_file:=/tmp/rover_sim/mighty.yaml only_nodes:=fake_sim,mighty_node,mpc
       - shell_command:
         - sleep 12
-        - ros2 launch mighty onboard_mighty.launch.py namespace:=RR04 x:=4.0 y:=-4.0 z:=0.0 yaw:=135 sim_env:=gazebo use_ground_robot:=true num_agents:=4 config_file:=/tmp/mighty_explore.yaml
+        - until pgrep -f "[r]obot_state_publisher --ros-args" | wc -l | grep -qx 4 && ! pgrep -f "[s]pawn_entity.py" >/dev/null; do sleep 1; done
+        - timeout 20 ros2 service call /unpause_physics std_srvs/srv/Empty >/dev/null
+        - ros2 launch mighty onboard_mighty.launch.py namespace:=RR04 x:=4.0 y:=-4.0 z:=0.0 yaw:=135 sim_env:=gazebo use_ground_robot:=true num_agents:=4 config_file:=/tmp/rover_sim/mighty.yaml only_nodes:=fake_sim,mighty_node,mpc
 
   - window_name: mapping
     layout: tiled
@@ -43,16 +75,16 @@ windows:
     panes:
       - shell_command:
         - sleep 10
-        - ros2 launch global_mapper_ros global_mapper_node.launch.py use_gazebo:=true use_obstacle_tracker:=false param_file:=sim_ground_robot.yaml quad:=RR01
+        - ros2 launch global_mapper_ros global_mapper_node.launch.py use_gazebo:=true use_obstacle_tracker:=false param_file:=/tmp/rover_sim/mapper.yaml quad:=RR01
       - shell_command:
         - sleep 10
-        - ros2 launch global_mapper_ros global_mapper_node.launch.py use_gazebo:=true use_obstacle_tracker:=false param_file:=sim_ground_robot.yaml quad:=RR02
+        - ros2 launch global_mapper_ros global_mapper_node.launch.py use_gazebo:=true use_obstacle_tracker:=false param_file:=/tmp/rover_sim/mapper.yaml quad:=RR02
       - shell_command:
         - sleep 10
-        - ros2 launch global_mapper_ros global_mapper_node.launch.py use_gazebo:=true use_obstacle_tracker:=false param_file:=sim_ground_robot.yaml quad:=RR03
+        - ros2 launch global_mapper_ros global_mapper_node.launch.py use_gazebo:=true use_obstacle_tracker:=false param_file:=/tmp/rover_sim/mapper.yaml quad:=RR03
       - shell_command:
         - sleep 10
-        - ros2 launch global_mapper_ros global_mapper_node.launch.py use_gazebo:=true use_obstacle_tracker:=false param_file:=sim_ground_robot.yaml quad:=RR04
+        - ros2 launch global_mapper_ros global_mapper_node.launch.py use_gazebo:=true use_obstacle_tracker:=false param_file:=/tmp/rover_sim/mapper.yaml quad:=RR04
 
   - window_name: state
     layout: tiled

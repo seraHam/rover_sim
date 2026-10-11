@@ -1,30 +1,68 @@
 # syntax=docker/dockerfile:1.7
 # rover_sim — standalone Docker build of the mighty ground-robot sim stack:
 # mighty + mpc + global_mapper_ros (acl-mapping) + Gazebo/RViz/Livox-sim, all
-# pulled from their upstream repos (rover_sim.repos + the MIGHTY_GIT_* args
-# below) rather than requiring a local checkout of any of them.
+# pulled from their upstream repos (rover_sim.repos + the *_GIT_* args below)
+# rather than requiring a local checkout of any of them.
 #
 # Stages:
-#   deps-src     clone every rover_sim.repos entry (dependencies only)
-#   deps-build   rosdep + colcon the deps, plus the two non-colcon Livox builds
-#   mighty-build clone mighty itself (separate from deps-src, see
-#                rover_sim.repos' comment on why), colcon BUILD_SIMULATION=ON
-#   runtime      exec deps + Gazebo/RViz + the install tree
+#   *-src         mighty, acl-mapping and mpc at their pinned commits. Each can
+#                 be replaced by a local checkout: --build-context <name>-src=<dir>
+#                 (make build MIGHTY_SRC=... ACL_MAPPING_SRC=... MPC_SRC=...)
+#   deps-src      clone the rest of rover_sim.repos
+#   deps-build    rosdep + colcon the deps, plus the two non-colcon Livox builds
+#   overlay-build acl-mapping + mpc on top of the deps
+#   mighty-build  mighty on top of the deps, colcon BUILD_SIMULATION=ON
+#   runtime       exec deps + Gazebo/RViz + the install trees
 #
-# Needs SSH for the private mpc/acl-mapping repos and mighty itself:
-#   docker compose -f docker/compose.yaml build --ssh default[=~/.ssh/<key>]
-# (make build does this; see Makefile).
+# Needs SSH for the private repos (make build forwards the agent's key).
 ARG WS=/home/swarm/code/mighty_ws
 # Caps colcon/make/ninja parallelism. Uncapped, package-level parallelism
 # stacks with each package's own thread count and can exhaust RAM on a build
 # host with heavy template-instantiation packages (PCL/Eigen/Gazebo).
 # --build-arg JOBS=N to change.
 ARG JOBS=1
-# mighty itself — deliberately not in rover_sim.repos, see its header comment.
 ARG MIGHTY_GIT_URL=git@github.com:blakete/mighty.git
-ARG MIGHTY_GIT_REF=68a09873b3cd54a47f2fb46a85336d4081c9b634
+ARG MIGHTY_GIT_REF=0bf2fd761d48eff0456f4280d953fe5746821d0e
+ARG ACL_MAPPING_GIT_URL=git@gitlab.com:seraHam/acl-mapping.git
+ARG ACL_MAPPING_GIT_REF=349a77b226e5b42fc93df1c15086a124ea711564
+ARG MPC_GIT_URL=git@gitlab.com:mit-acl/ugv/ugv_control/mpc.git
+ARG MPC_GIT_REF=7efbfe5ff76d70a332287f5b884248c29f197cba
 
-# ---------- deps-src: every pinned dependency source (not mighty itself) ----
+# ---------- *-src: the repos a local checkout can replace -------------------
+FROM ros:humble-ros-base AS git-base
+SHELL ["/bin/bash", "-c"]
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends openssh-client git \
+    && rm -rf /var/lib/apt/lists/*
+
+FROM git-base AS mighty-git
+ARG MIGHTY_GIT_URL
+ARG MIGHTY_GIT_REF
+RUN --mount=type=ssh \
+    mkdir -p -m 0700 ~/.ssh && ssh-keyscan -H github.com gitlab.com >> ~/.ssh/known_hosts 2>/dev/null \
+ && git clone "${MIGHTY_GIT_URL}" /src && git -C /src checkout "${MIGHTY_GIT_REF}"
+FROM scratch AS mighty-src
+COPY --from=mighty-git /src /
+
+FROM git-base AS acl-mapping-git
+ARG ACL_MAPPING_GIT_URL
+ARG ACL_MAPPING_GIT_REF
+RUN --mount=type=ssh \
+    mkdir -p -m 0700 ~/.ssh && ssh-keyscan -H github.com gitlab.com >> ~/.ssh/known_hosts 2>/dev/null \
+ && git clone "${ACL_MAPPING_GIT_URL}" /src && git -C /src checkout "${ACL_MAPPING_GIT_REF}"
+FROM scratch AS acl-mapping-src
+COPY --from=acl-mapping-git /src /
+
+FROM git-base AS mpc-git
+ARG MPC_GIT_URL
+ARG MPC_GIT_REF
+RUN --mount=type=ssh \
+    mkdir -p -m 0700 ~/.ssh && ssh-keyscan -H github.com gitlab.com >> ~/.ssh/known_hosts 2>/dev/null \
+ && git clone "${MPC_GIT_URL}" /src && git -C /src checkout "${MPC_GIT_REF}"
+FROM scratch AS mpc-src
+COPY --from=mpc-git /src /
+
+# ---------- deps-src: every other pinned dependency source -------------------
 FROM ros:humble-ros-base AS deps-src
 ARG WS
 SHELL ["/bin/bash", "-c"]
@@ -33,7 +71,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         openssh-client python3-vcstool \
     && rm -rf /var/lib/apt/lists/*
 COPY rover_sim.repos /tmp/rover_sim.repos
-# --mount=type=ssh forwards the caller's key for the private mpc/acl-mapping repos.
+# --mount=type=ssh forwards the caller's key for the private repos.
 RUN --mount=type=ssh \
     mkdir -p -m 0700 ~/.ssh && ssh-keyscan -H github.com gitlab.com >> ~/.ssh/known_hosts 2>/dev/null \
  && mkdir -p ${WS}/src \
@@ -47,7 +85,7 @@ SHELL ["/bin/bash", "-c"]
 ENV DEBIAN_FRONTEND=noninteractive
 # MAKEFLAGS covers GNU Make; CMAKE_BUILD_PARALLEL_LEVEL is generator-agnostic
 # (some packages here pull in Ninja, which ignores MAKEFLAGS). Inherited by
-# mighty-build via FROM deps-build.
+# overlay-build and mighty-build via FROM deps-build.
 ENV MAKEFLAGS=-j${JOBS}
 ENV CMAKE_BUILD_PARALLEL_LEVEL=${JOBS}
 WORKDIR ${WS}
@@ -95,21 +133,39 @@ RUN source /opt/ros/humble/setup.bash \
  && colcon build --executor sequential --packages-skip decomp_util --cmake-args -DCMAKE_BUILD_TYPE=Release \
  && rm -rf build log
 
-# ---------- mighty-build: mighty itself, cloned separately, on top of deps --
-FROM deps-build AS mighty-build
+# ---------- overlay-build: acl-mapping + mpc on top of the deps ---------------
+FROM deps-build AS overlay-build
 ARG WS
-ARG MIGHTY_GIT_URL
-ARG MIGHTY_GIT_REF
 SHELL ["/bin/bash", "-c"]
 ENV DEBIAN_FRONTEND=noninteractive
 WORKDIR ${WS}
-RUN --mount=type=ssh \
-    mkdir -p -m 0700 ~/.ssh && ssh-keyscan -H github.com gitlab.com >> ~/.ssh/known_hosts 2>/dev/null \
- && git clone "${MIGHTY_GIT_URL}" ${WS}/src/mighty \
- && git -C ${WS}/src/mighty checkout "${MIGHTY_GIT_REF}"
+COPY --from=acl-mapping-src / ${WS}/src/acl-mapping
+COPY --from=mpc-src / ${WS}/src/mpc
 RUN apt-get update && rosdep update \
  && rosdep install -y --ignore-src --from-paths src \
         --skip-keys "catkin ament_python Eigen3 Armadillo Boost OpenCV PCL livox_ros_driver2 tf dynamic_reconfigure" \
+ && rm -rf /var/lib/apt/lists/*
+# Only these packages' install dirs go to the runtime stage (the deps come from mighty-build).
+RUN source /opt/ros/humble/setup.bash && source install/setup.bash \
+ && pkgs=$(colcon list --names-only --base-paths src/acl-mapping src/mpc) \
+ && colcon build --executor sequential --base-paths src/acl-mapping src/mpc \
+        --cmake-args -DCMAKE_BUILD_TYPE=Release \
+ && mkdir -p /overlay-install && for p in $pkgs; do cp -a install/$p /overlay-install/; done \
+ && rm -rf build log
+RUN mkdir -p /manifests/overlay && cd src \
+ && find acl-mapping mpc -name package.xml -exec cp --parents {} /manifests/overlay \; \
+ && find /manifests -exec touch -d @0 {} +
+
+# ---------- mighty-build: mighty on top of the deps --------------------------
+FROM deps-build AS mighty-build
+ARG WS
+SHELL ["/bin/bash", "-c"]
+ENV DEBIAN_FRONTEND=noninteractive
+WORKDIR ${WS}
+COPY --from=mighty-src / ${WS}/src/mighty
+RUN apt-get update && rosdep update \
+ && rosdep install -y --ignore-src --from-paths src \
+        --skip-keys "catkin ament_python Eigen3 Armadillo Boost OpenCV PCL livox_ros_driver2 tf dynamic_reconfigure mpc" \
  && apt-get install -y --no-install-recommends nlohmann-json3-dev \
  && rm -rf /var/lib/apt/lists/*
 RUN source /opt/ros/humble/setup.bash && source install/setup.bash \
@@ -117,7 +173,7 @@ RUN source /opt/ros/humble/setup.bash && source install/setup.bash \
         --cmake-args -DCMAKE_BUILD_TYPE=Release -DBUILD_SIMULATION=ON -DBUILD_TESTING=OFF \
  && rm -rf build log
 # Manifests for the runtime stage's rosdep, mtime-pinned so this stays cached
-# across mighty pin bumps.
+# across source changes that leave the package.xml files alone.
 RUN mkdir -p /manifests && cd src \
  && find . -name package.xml -exec cp --parents {} /manifests \; \
  && find /manifests -exec touch -d @0 {} +
@@ -157,6 +213,7 @@ RUN ldconfig
 ENV LD_LIBRARY_PATH=/opt/livox_ws/install/livox_ros_driver2/lib:/usr/local/lib:${LD_LIBRARY_PATH}
 
 COPY --from=mighty-build ${WS}/install ${WS}/install
+COPY --from=overlay-build /overlay-install ${WS}/install
 # Baked fallback .bashrc for running standalone without compose. Under the
 # normal make workflow, compose.yaml mounts docker/dotfiles/bashrc over
 # this same path instead, which is what actually applies.

@@ -1,15 +1,10 @@
 repositories:
-  # mighty itself is NOT listed here on purpose — it's cloned as its own
-  # Dockerfile step (MIGHTY_GIT_URL/MIGHTY_GIT_REF build args), not via
-  # `vcs import` alongside these. Keeping it separate means bumping mighty's
-  # pin only invalidates that one cheap clone layer, not this whole deps
-  # layer (the slow rosdep+colcon one). See docker/Dockerfile for the pin.
+  # mighty, acl-mapping and mpc are NOT listed here: each is cloned in its own
+  # Dockerfile stage (*_GIT_URL/*_GIT_REF build args in docker/Dockerfile) so it
+  # can be replaced by a local checkout, and bumping its pin doesn't rebuild
+  # this whole deps layer (the slow rosdep+colcon one).
 
   # ROS 2 dependencies (build with colcon)
-  acl-mapping:
-    type: git
-    url: git@gitlab.com:mit-acl/lab/acl-mapping.git
-    version: 9bed2cfbc4bf96769b879a6999d9ce32533ef06a
   direct_lidar_inertial_odometry:
     type: git
     url: git@github.com:blakete/direct_lidar_inertial_odometry.git
@@ -26,10 +21,6 @@ repositories:
     type: git
     url: https://github.com/kotakondo/livox_laser_simulation_ros2.git
     version: 044e83e6fc5d527b082852550d7206dd4308d950
-  mpc:
-    type: git
-    url: git@gitlab.com:mit-acl/ugv/ugv_control/mpc.git
-    version: 7efbfe5ff76d70a332287f5b884248c29f197cba
   realsense_gazebo_plugin:
     type: git
     url: https://github.com/kotakondo/realsense_gazebo_plugin.git
