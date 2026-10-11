@@ -22,7 +22,7 @@ ARG WS=/home/swarm/code/mighty_ws
 ARG JOBS=1
 # mighty itself — deliberately not in rover_sim.repos, see its header comment.
 ARG MIGHTY_GIT_URL=git@github.com:blakete/mighty.git
-ARG MIGHTY_GIT_REF=6a0986dbbc7a4d563d09c96f9077e055ae33cc29
+ARG MIGHTY_GIT_REF=68a09873b3cd54a47f2fb46a85336d4081c9b634
 
 # ---------- deps-src: every pinned dependency source (not mighty itself) ----
 FROM ros:humble-ros-base AS deps-src

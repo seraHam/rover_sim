@@ -2,7 +2,8 @@
 <!-- Bind-mounted over livox_laser_simulation_ros2's baked mid360.xacro (see
      docker/compose.yaml) — that's a separate pinned repo, not part of this
      checkout, so it can't carry its own edits the way config/launch/rviz/urdf
-     do. Only change from upstream: update_rate 1000 -> 10, matching real
+     do. Changes from upstream: accumulate_scans 5 -> 1 (at 10 Hz, 5 scans span
+     0.5 s and smear walls while turning), and update_rate 1000 -> 10, matching real
      Mid360 hardware (~10Hz) instead of Gazebo raycasting 100x360 rays per
      robot as fast as possible — a major, likely the single largest, CPU cost
      in a multi-agent session. -->
@@ -85,7 +86,7 @@
           <visualize>false</visualize>
           <samples>${samples}</samples>
           <downsample>1</downsample>
-          <accumulate_scans>5</accumulate_scans>
+          <accumulate_scans>1</accumulate_scans>
           <num_phases>5</num_phases>
           <csv_file_name>$(find ros2_livox_simulation)/scan_mode/mid360.csv</csv_file_name>
           <topic>${topic}</topic>

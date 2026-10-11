@@ -93,7 +93,7 @@ make shell   # docker exec -it rover-sim bash
 ```
 Inside the container, run the 4-rover swap demo:
 ```bash
-run_multi    # tmuxp load /home/swarm/rover_sim/launch/multi_agent_swap_demo.yaml
+run_swap4    # tmuxp load /home/swarm/rover_sim/launch/multi_agent_swap_demo.yaml
 ```
 Stop the run, still inside the container:
 ```bash
@@ -114,19 +114,30 @@ An editor that saves by replacing the file needs `make down && make up` to
 show the change. RViz's "Save Config" writes into `rviz/mighty_sim_ground_robot.rviz`
 here. `docker/overrides/` does the same for two files from other pinned repos:
 mpc's `mpc_sim.yaml` (sim tuning) and the Livox sim's `mid360.xacro` (lidar at
-10 Hz instead of 1000). `docker/Dockerfile`, `rover_sim.repos` and mighty's C++
-source need `make build`.
+10 Hz instead of 1000, one scan per cloud instead of 5). `docker/Dockerfile`,
+`rover_sim.repos` and mighty's C++ source need `make build`.
 
-## Demo session (`launch/`)
+## Demo sessions (`launch/`)
 
-`multi_agent_swap_demo.yaml` (`run_multi`): 4 ground robots (`RR01`-`RR04`),
+`multi_agent_swap_demo.yaml` (`run_swap4`): 4 ground robots (`RR01`-`RR04`),
 empty world, swapping to opposite corners via `goal_monitor_node.py` (no manual
 RViz goal-clicking). Windows: `sim`, `core`, `mapping`, `state`, `goals`.
 `env:=ACL_office_simple` in `base_mighty.launch.py` loads the office world
 instead of `empty`. Run it inside the container:
 ```bash
-run_multi    # tmuxp load /home/swarm/rover_sim/launch/multi_agent_swap_demo.yaml
+run_swap4    # tmuxp load /home/swarm/rover_sim/launch/multi_agent_swap_demo.yaml
 ```
+
+`office_explore_demo.yaml` (`run_explore4`): the same 4 robots in the office world
+(`ACL_office_simple`), exploring it with mighty's frontier exploration instead of
+swapping goals. The session runs mighty with `config_file:=/tmp/mighty_explore.yaml`,
+a copy of `config/mighty_ground_robot.yaml` with `exploration.enabled` and
+`exploration.bounds.enabled` turned on, written when the session starts.
+```bash
+run_explore4 # tmuxp load /home/swarm/rover_sim/launch/office_explore_demo.yaml
+```
+
+RViz shows each robot's 2D occupancy map (`/RRxx/occ_2d_topic`) as it is built.
 
 To stop a run, `stop` inside the container (or `make down` from the host).
 `tmux kill-session` alone can leave `ros2 launch` children and the
@@ -143,6 +154,9 @@ Per robot:
 - **State out**: `/RRxx/state` (`dynus_interfaces/State`) and TF
   `map -> RRxx/base_link`.
 - **Map out**: `/RRxx/occ_2d_topic` (`nav_msgs/OccupancyGrid`).
+- **Turn in place**: publish a `std_msgs/Float64` (radians, + = CCW) on
+  `/RRxx/rotate_by`; mpc turns the robot on the spot by that angle, then
+  resumes path tracking.
 
 Your stack can run on the host or inside the container (`make shell`); the
 container shares the host network. Inside the container everything is already on
@@ -155,10 +169,3 @@ pose updates stop reaching Gazebo and the lidar scans from a frozen model
 ## Known issues
 
 - **macOS support is unbuilt** — see "First-time setup" above.
-- **`mpc_node`'s `tracking_frame`**: `onboard_mighty.launch.py` tries to pass
-  it as an absolute frame (`'/' + map_frame_id`) for sim, but the pinned
-  `mpc_node.py` unconditionally strips a leading `/` before checking, so it
-  always gets namespace-prefixed to `{ns}/map` regardless — which nothing
-  else publishes. A consumer needs a static identity transform
-  (`map -> {ns}/map`) per robot to work around it (the demo session
-  publishes one per robot) rather than patching the private `mpc` repo.
