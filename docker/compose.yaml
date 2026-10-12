@@ -27,10 +27,13 @@ services:
     volumes:
       - /tmp/.X11-unix:/tmp/.X11-unix:rw
       # Per-file overrides of mighty's installed files: edit here, no rebuild or mighty push.
-      - "../config/mighty_ground_robot.yaml:/home/swarm/code/mighty_ws/install/mighty/share/mighty/config/mighty_ground_robot.yaml"
-      - "../rviz/mighty_sim_ground_robot.rviz:/home/swarm/code/mighty_ws/install/mighty/share/mighty/rviz/mighty_sim_ground_robot.rviz"
-      - "../urdf/p3at.urdf.xacro:/home/swarm/code/mighty_ws/install/mighty/share/mighty/urdf/p3at.urdf.xacro"
-      - "../urdf/pioneer3at_body.urdf.xacro:/home/swarm/code/mighty_ws/install/mighty/share/mighty/urdf/pioneer3at_body.urdf.xacro"
+      - "../config/mighty_ground_robot.yaml:/home/swarm/code/rover_sim_ws/install/mighty/share/mighty/config/mighty_ground_robot.yaml"
+      - "../rviz/mighty_sim_ground_robot.rviz:/home/swarm/code/rover_sim_ws/install/mighty/share/mighty/rviz/mighty_sim_ground_robot.rviz"
+      # Spawning through mighty's own onboard_mighty.launch.py gets rover_sim's P3-AT too.
+      - "../src/rover_sim/urdf/p3at.urdf.xacro:/home/swarm/code/rover_sim_ws/install/mighty/share/mighty/urdf/p3at.urdf.xacro"
+      # rover_sim's robot models and spawn launch: edit here, no rebuild.
+      - "../src/rover_sim/urdf:/home/swarm/code/rover_sim_ws/install/rover_sim/share/rover_sim/urdf"
+      - "../src/rover_sim/launch:/home/swarm/code/rover_sim_ws/install/rover_sim/share/rover_sim/launch"
       - "../launch:/home/swarm/rover_sim/launch:ro"
       - "../rviz:/home/swarm/rover_sim/rviz:ro"
       - "../maps:/home/swarm/rover_sim/maps:ro"
@@ -42,8 +45,8 @@ services:
       # mpc and livox_laser_simulation_ros2 are separate pinned repos, not
       # part of this checkout — see docker/overrides/ for why these need
       # their own overrides.
-      - "./overrides/mpc_sim.yaml:/home/swarm/code/mighty_ws/install/mpc/share/mpc/config/mpc_sim.yaml"
-      - "./overrides/mid360.xacro:/home/swarm/code/mighty_ws/install/ros2_livox_simulation/share/ros2_livox_simulation/urdf/mid360.xacro"
+      - "./overrides/mpc_sim.yaml:/home/swarm/code/rover_sim_ws/install/mpc/share/mpc/config/mpc_sim.yaml"
+      - "./overrides/mid360.xacro:/home/swarm/code/rover_sim_ws/install/ros2_livox_simulation/share/ros2_livox_simulation/urdf/mid360.xacro"
     privileged: true                   # GL/X11
     # Default 64MB /dev/shm is way too small once enough nodes run at once
     # (each node's own shm transport segment) — crashed almost

@@ -12,10 +12,11 @@
 #   deps-build    rosdep + colcon the deps, plus the two non-colcon Livox builds
 #   overlay-build acl-mapping + mpc on top of the deps
 #   mighty-build  mighty on top of the deps, colcon BUILD_SIMULATION=ON
+#   rover-sim-build this repo's rover_sim package (robot models, spawn launch)
 #   runtime       exec deps + Gazebo/RViz + the install trees
 #
 # Needs SSH for the private repos (make build forwards the agent's key).
-ARG WS=/home/swarm/code/mighty_ws
+ARG WS=/home/swarm/code/rover_sim_ws
 # Caps colcon/make/ninja parallelism. Uncapped, package-level parallelism
 # stacks with each package's own thread count and can exhaust RAM on a build
 # host with heavy template-instantiation packages (PCL/Eigen/Gazebo).
@@ -178,6 +179,16 @@ RUN mkdir -p /manifests && cd src \
  && find . -name package.xml -exec cp --parents {} /manifests \; \
  && find /manifests -exec touch -d @0 {} +
 
+# ---------- rover-sim-build: this repo's rover_sim package ---------------------
+FROM ros:humble-ros-base AS rover-sim-build
+ARG WS
+SHELL ["/bin/bash", "-c"]
+WORKDIR ${WS}
+COPY src/rover_sim ${WS}/src/rover_sim
+RUN source /opt/ros/humble/setup.bash \
+ && colcon build --packages-select rover_sim \
+ && rm -rf build log
+
 # ---------- runtime: exec deps + Gazebo/RViz + the baked workspace -----------
 FROM ros:humble-ros-base
 ARG WS
@@ -214,6 +225,9 @@ ENV LD_LIBRARY_PATH=/opt/livox_ws/install/livox_ros_driver2/lib:/usr/local/lib:$
 
 COPY --from=mighty-build ${WS}/install ${WS}/install
 COPY --from=overlay-build /overlay-install ${WS}/install
+COPY --from=rover-sim-build ${WS}/install/rover_sim ${WS}/install/rover_sim
+# Lets Gazebo resolve package://rover_sim/... and package://mighty/... meshes.
+ENV GAZEBO_MODEL_PATH=${WS}/install/rover_sim/share:${WS}/install/mighty/share
 # Baked fallback .bashrc for running standalone without compose. Under the
 # normal make workflow, compose.yaml mounts docker/dotfiles/bashrc over
 # this same path instead, which is what actually applies.

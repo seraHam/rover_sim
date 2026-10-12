@@ -123,8 +123,7 @@ After changing `docker/Dockerfile`, `rover_sim.repos` or a pin, rebuild with
 
 These files are bind-mounted over mighty's installed copies, so an edit
 takes effect in a running container with no rebuild or mighty push:
-`config/mighty_ground_robot.yaml`, `rviz/mighty_sim_ground_robot.rviz`,
-`urdf/p3at.urdf.xacro` (camera commented out), `urdf/pioneer3at_body.urdf.xacro`.
+`config/mighty_ground_robot.yaml`, `rviz/mighty_sim_ground_robot.rviz`.
 An editor that saves by replacing the file needs `make down && make up` to
 show the change. RViz's "Save Config" writes into `rviz/mighty_sim_ground_robot.rviz`
 here. `docker/overrides/` does the same for two files from other pinned repos:
@@ -132,7 +131,23 @@ mpc's `mpc_sim.yaml` (sim tuning) and the Livox sim's `mid360.xacro` (lidar at
 10 Hz instead of 1000, one scan per cloud instead of 5). `docker/Dockerfile`,
 `rover_sim.repos` and mighty's C++ source need `make build`.
 
+## Robot models (`src/rover_sim`)
+
+The `rover_sim` ROS package holds the robot models, `urdf/p3at.urdf.xacro`
+(Pioneer 3-AT) and `urdf/p3dx.urdf.xacro` (Pioneer 3-DX), with a Livox MID-360
+and no camera. The sessions spawn each robot with
+```bash
+ros2 launch rover_sim spawn_robot.launch.py namespace:=RR01 model:=rr x:=4.0 y:=4.0 yaw:=-135
+```
+`model:=rr` is the red rover (P3-AT), `model:=jr` the red rover junior (P3-DX).
+`urdf/` and `launch/` are mounted into the container, so edits there need no rebuild.
+RViz outside the container needs the package for the meshes: `colcon build
+--base-paths src` here, then source `install/local_setup.bash`.
+
 ## Demo sessions (`launch/`)
+
+Every demo runs with red rovers by default; add `model:=jr` for red rover
+juniors, e.g. `run_swap4 model:=jr`.
 
 `multi_agent_swap_demo.yaml` (`run_swap4`): 4 ground robots (`RR01`-`RR04`),
 empty world, swapping to opposite corners via `goal_monitor_node.py` (no manual
@@ -158,7 +173,7 @@ occupancy map (`/RRxx/occ_2d_topic`) as it is built.
 starting from its known map (see "Starting from a known map" below), each
 swapping with the diagonally opposite corner (`scripts/swap_goals.py`).
 ```bash
-run_prior4   # tmuxp load /home/swarm/rover_sim/launch/office_prior_map_demo.yaml
+run_prior4 model:=jr  # tmuxp load /home/swarm/rover_sim/launch/office_prior_map_demo.yaml, set model to the rover jrs
 ```
 
 The sessions start by running `scripts/write_configs.sh`, which writes the

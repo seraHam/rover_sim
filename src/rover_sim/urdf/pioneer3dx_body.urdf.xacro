@@ -1,0 +1,56 @@
+<?xml version="1.0"?>
+<!-- Pioneer 3-DX body. Geometry from gazebo_ros_pkgs' multi_robot_scenario
+     P3-DX model; all joints fixed (fake_sim moves the robot), base_link on the
+     floor between the drive wheels. -->
+<robot xmlns:xacro="http://ros.org/wiki/xacro" name="pioneer3dx">
+
+  <xacro:property name="meshes" value="package://rover_sim/meshes/p3dx"/>
+
+  <xacro:macro name="part" params="name mesh xyz rgba parent:=base_link">
+    <link name="${name}">
+      <visual>
+        <geometry><mesh filename="${meshes}/${mesh}.stl"/></geometry>
+        <material name="${name}_color"><color rgba="${rgba}"/></material>
+      </visual>
+    </link>
+    <joint name="${parent}_${name}_joint" type="fixed">
+      <origin xyz="${xyz}" rpy="0 0 0"/>
+      <parent link="${parent}"/>
+      <child link="${name}"/>
+    </joint>
+  </xacro:macro>
+
+  <link name="base_link">
+    <inertial>
+      <mass value="9.0"/>
+      <origin xyz="-0.045 0 0.1"/>
+      <inertia ixx="0.07" ixy="0.0" ixz="0.0" iyy="0.08" iyz="0.0" izz="0.1"/>
+    </inertial>
+    <visual>
+      <origin xyz="-0.045 0 0.148" rpy="0 0 0"/>
+      <geometry><mesh filename="${meshes}/chassis.stl"/></geometry>
+      <material name="ChassisRed"><color rgba="0.851 0.0 0.0 1.0"/></material>
+    </visual>
+    <collision>
+      <origin xyz="-0.045 0 0.148" rpy="0 0 0"/>
+      <geometry><mesh filename="${meshes}/chassis.stl"/></geometry>
+    </collision>
+  </link>
+  <gazebo reference="base_link">
+    <material>Gazebo/Red</material>
+  </gazebo>
+
+  <xacro:part name="top_plate" mesh="top" xyz="-0.045 0 0.234" rgba="0.038 0.038 0.038 1.0"/>
+  <xacro:part name="front_sonar" mesh="front_sonar" xyz="0.109 0 0.209" rgba="0.715 0.583 0.210 1.0"/>
+  <xacro:part name="back_sonar" mesh="back_sonar" xyz="-0.198 0 0.208" rgba="0.715 0.583 0.210 1.0"/>
+
+  <xacro:part name="left_wheel" mesh="left_wheel" xyz="0 0.158 0.091" rgba="0.117 0.117 0.117 1.0"/>
+  <xacro:part name="left_hub" mesh="left_hubcap" xyz="0 0.158 0.091" rgba="1.0 0.811 0.151 1.0"/>
+  <xacro:part name="right_wheel" mesh="right_wheel" xyz="0 -0.158 0.091" rgba="0.117 0.117 0.117 1.0"/>
+  <xacro:part name="right_hub" mesh="right_hubcap" xyz="0 -0.158 0.091" rgba="1.0 0.811 0.151 1.0"/>
+
+  <xacro:part name="caster_swivel" mesh="caster_swivel" xyz="-0.185 0 0.055" rgba="0.5 0.5 0.5 1.0"/>
+  <xacro:part name="caster_wheel" mesh="caster_wheel" xyz="-0.211 0 0.039" rgba="0.117 0.117 0.117 1.0"/>
+  <xacro:part name="caster_hub" mesh="caster_hubcap" xyz="-0.211 0 0.039" rgba="0.5 0.5 0.5 1.0"/>
+
+</robot>

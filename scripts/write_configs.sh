@@ -7,8 +7,8 @@
 set -e
 out=/tmp/rover_sim
 mkdir -p $out
-mapper=/home/swarm/code/mighty_ws/install/global_mapper_ros/share/global_mapper_ros/cfg/sim_ground_robot.yaml
-mighty=/home/swarm/code/mighty_ws/install/mighty/share/mighty/config/mighty_ground_robot.yaml
+mapper=/home/swarm/code/rover_sim_ws/install/global_mapper_ros/share/global_mapper_ros/cfg/sim_ground_robot.yaml
+mighty=/home/swarm/code/rover_sim_ws/install/mighty/share/mighty/config/mighty_ground_robot.yaml
 
 if [ -z "$PRIOR_MAP" ]; then
   cp $mapper $out/mapper.yaml

@@ -4,7 +4,7 @@
 session_name: multi_agent_swap_demo
 shell_command_before: &base
 - source /opt/ros/humble/setup.bash
-- source /home/swarm/code/mighty_ws/install/setup.bash
+- source /home/swarm/code/rover_sim_ws/install/setup.bash
 - source /opt/livox_ws/install/setup.bash
 - export ROS_DOMAIN_ID=20
 windows:
@@ -16,7 +16,6 @@ windows:
         - /home/swarm/rover_sim/scripts/write_configs.sh
         - sleep 5
         - source /usr/share/gazebo/setup.bash
-        - export GAZEBO_MODEL_PATH=/home/swarm/code/mighty_ws/install/mighty/share:$GAZEBO_MODEL_PATH
         - ros2 launch mighty base_mighty.launch.py use_gazebo_gui:=false use_rviz:=true env:=empty use_ground_robot:=true pause:=true
 
   # Every robot is spawned into the paused Gazebo before it is unpaused and
@@ -28,16 +27,16 @@ windows:
     panes:
       - shell_command:
         - sleep 12
-        - ros2 launch mighty onboard_mighty.launch.py namespace:=RR01 x:=4.0 y:=4.0 z:=0.0 yaw:=-135 sim_env:=gazebo use_ground_robot:=true num_agents:=4 config_file:=/tmp/rover_sim/mighty.yaml only_nodes:=robot_state_publisher,spawn_entity
+        - ros2 launch rover_sim spawn_robot.launch.py namespace:=RR01 model:=$ROBOT_MODEL x:=4.0 y:=4.0 yaw:=-135
       - shell_command:
         - sleep 12
-        - ros2 launch mighty onboard_mighty.launch.py namespace:=RR02 x:=-4.0 y:=4.0 z:=0.0 yaw:=-45 sim_env:=gazebo use_ground_robot:=true num_agents:=4 config_file:=/tmp/rover_sim/mighty.yaml only_nodes:=robot_state_publisher,spawn_entity
+        - ros2 launch rover_sim spawn_robot.launch.py namespace:=RR02 model:=$ROBOT_MODEL x:=-4.0 y:=4.0 yaw:=-45
       - shell_command:
         - sleep 12
-        - ros2 launch mighty onboard_mighty.launch.py namespace:=RR03 x:=-4.0 y:=-4.0 z:=0.0 yaw:=45 sim_env:=gazebo use_ground_robot:=true num_agents:=4 config_file:=/tmp/rover_sim/mighty.yaml only_nodes:=robot_state_publisher,spawn_entity
+        - ros2 launch rover_sim spawn_robot.launch.py namespace:=RR03 model:=$ROBOT_MODEL x:=-4.0 y:=-4.0 yaw:=45
       - shell_command:
         - sleep 12
-        - ros2 launch mighty onboard_mighty.launch.py namespace:=RR04 x:=4.0 y:=-4.0 z:=0.0 yaw:=135 sim_env:=gazebo use_ground_robot:=true num_agents:=4 config_file:=/tmp/rover_sim/mighty.yaml only_nodes:=robot_state_publisher,spawn_entity
+        - ros2 launch rover_sim spawn_robot.launch.py namespace:=RR04 model:=$ROBOT_MODEL x:=4.0 y:=-4.0 yaw:=135
 
   - window_name: core
     layout: tiled
