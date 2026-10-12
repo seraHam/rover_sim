@@ -148,6 +148,7 @@ RViz outside the container needs the package for the meshes: `colcon build
 
 Every demo runs with red rovers by default; add `model:=jr` for red rover
 juniors, e.g. `run_swap4 model:=jr`.
+Add `rviz:=false` to skip RViz, e.g. on a headless machine.
 
 `multi_agent_swap_demo.yaml` (`run_swap4`): 4 ground robots (`RR01`-`RR04`),
 empty world, swapping to opposite corners via `goal_monitor_node.py` (no manual

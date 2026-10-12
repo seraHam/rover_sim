@@ -8,17 +8,18 @@ source /opt/livox_ws/install/setup.bash
 ### ALIASES ###
 alias tks="tmux kill-session"
 alias sb="source ~/.bashrc"
-# run_<demo> [model:=rr|jr]  (red rover = Pioneer 3-AT, junior = Pioneer 3-DX)
+# run_<demo> [model:=rr|jr] [rviz:=true|false]  (red rover = Pioneer 3-AT, junior = Pioneer 3-DX)
 unalias run_swap4 run_explore4 run_prior4 2>/dev/null
 function run_session {
-  local session=$1 model=rr arg; shift
+  local session=$1 model=rr rviz=true arg; shift
   for arg in "$@"; do
     case $arg in
       model:=*) model=${arg#model:=} ;;
-      *) echo "unknown argument: $arg (expected model:=rr|jr)"; return 1 ;;
+      rviz:=true|rviz:=false) rviz=${arg#rviz:=} ;;
+      *) echo "unknown argument: $arg (expected model:=rr|jr, rviz:=true|false)"; return 1 ;;
     esac
   done
-  ROBOT_MODEL=$model tmuxp load "/home/swarm/rover_sim/launch/$session.yaml"
+  ROBOT_MODEL=$model USE_RVIZ=$rviz tmuxp load "/home/swarm/rover_sim/launch/$session.yaml"
 }
 function run_swap4 { run_session multi_agent_swap_demo "$@"; }
 function run_explore4 { run_session office_explore_demo "$@"; }
