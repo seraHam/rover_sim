@@ -8,6 +8,7 @@ shell_command_before: &base
 - source /home/swarm/code/rover_sim_ws/install/setup.bash
 - source /opt/livox_ws/install/setup.bash
 - export ROS_DOMAIN_ID=20
+- export ROVER_SIM_WORLD=ACL_office_simple
 windows:
   - window_name: sim
     layout: even-horizontal
@@ -18,7 +19,7 @@ windows:
         - sed -i -e 's/\(exploration\.enabled:\) false/\1 true/' -e 's/\(exploration\.bounds\.enabled:\) false/\1 true/' /tmp/rover_sim/mighty.yaml
         - sleep 5
         - source /usr/share/gazebo/setup.bash
-        - ros2 launch mighty base_mighty.launch.py use_gazebo_gui:=false use_rviz:=false env:=ACL_office_simple use_ground_robot:=true pause:=true
+        - ros2 launch mighty base_mighty.launch.py use_gazebo_gui:=false use_rviz:=false env:=$ROVER_SIM_WORLD use_ground_robot:=true pause:=true
       - shell_command:
         - sleep 5
         - ros2 run rviz2 rviz2 -d /home/swarm/rover_sim/rviz/office_explore.rviz --ros-args --log-level error

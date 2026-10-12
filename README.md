@@ -221,9 +221,10 @@ cloud, and maps in frame `map` instead of `RRxx/odom`
 grids and treats unseen ground as blocked, so mighty runs with `map_2d_only: true`
 (set by `write_configs.sh`). The lidar can't see the floor around the robot,
 which the real rovers handle by being driven a bit first; here
-`scripts/elevation_start.py` marks the floor under each robot and 1.5 m ahead of it, waits
-for some lidar, and only then passes the planning grid on to mighty, which
-doesn't plan before it gets one.
+`scripts/elevation_start.py` gives the mapper what is really within 2.5 m of each
+robot, the floor and the obstacles from the boxes and cylinders of the session's
+Gazebo world (`ROVER_SIM_WORLD`), waits for some lidar, and only then passes the
+planning grid on to mighty, which doesn't plan before it gets one.
 
 ### Using another mapper
 

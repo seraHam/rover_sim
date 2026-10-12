@@ -7,6 +7,7 @@ shell_command_before: &base
 - source /home/swarm/code/rover_sim_ws/install/setup.bash
 - source /opt/livox_ws/install/setup.bash
 - export ROS_DOMAIN_ID=20
+- export ROVER_SIM_WORLD=empty
 windows:
   - window_name: sim
     layout: even-horizontal
@@ -16,7 +17,7 @@ windows:
         - /home/swarm/rover_sim/scripts/write_configs.sh
         - sleep 5
         - source /usr/share/gazebo/setup.bash
-        - ros2 launch mighty base_mighty.launch.py use_gazebo_gui:=false use_rviz:=${USE_RVIZ:-true} env:=empty use_ground_robot:=true pause:=true
+        - ros2 launch mighty base_mighty.launch.py use_gazebo_gui:=false use_rviz:=${USE_RVIZ:-true} env:=$ROVER_SIM_WORLD use_ground_robot:=true pause:=true
 
   # Every robot is spawned into the paused Gazebo before it is unpaused and
   # fake_sim, mighty and the mpc start: fake_sim's set_entity_state calls
