@@ -1,0 +1,13 @@
+# Added by `make up` when the image has the elevation mapper (make build
+# MAPPER=elevation). Needs the NVIDIA Container Toolkit. To use other GPUs or
+# give them some other way, override this in docker/compose.local.yaml
+# (e.g. `deploy: !reset {}`).
+services:
+  rover-sim:
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

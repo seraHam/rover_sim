@@ -271,6 +271,7 @@ mighty_node:
 
         # --- 2D Ground Robot Planning (not used for UAV) ---
         use_2d_planning: true                          # [-] Enable 2D terrain-aware planning for ground robots
+        map_2d_only: false                             # [-] Map from the 2D grids alone, for a mapper with no 3D clouds (hardware always is)
         robot_height: 1.0                               # [m] Robot height for obstacle column detection
         obstacle_min_height: 0.3                        # [m] Min column height span to classify as obstacle
         use_column_any_occupied: true                    # [-] Any occupied voxel in column → 2D occupied

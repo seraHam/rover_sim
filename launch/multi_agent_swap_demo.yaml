@@ -69,16 +69,16 @@ windows:
     panes:
       - shell_command:
         - sleep 10
-        - ros2 launch global_mapper_ros global_mapper_node.launch.py use_gazebo:=true use_obstacle_tracker:=false param_file:=/tmp/rover_sim/mapper.yaml quad:=RR01
+        - /home/swarm/rover_sim/scripts/run_mapper.sh RR01
       - shell_command:
         - sleep 10
-        - ros2 launch global_mapper_ros global_mapper_node.launch.py use_gazebo:=true use_obstacle_tracker:=false param_file:=/tmp/rover_sim/mapper.yaml quad:=RR02
+        - /home/swarm/rover_sim/scripts/run_mapper.sh RR02
       - shell_command:
         - sleep 10
-        - ros2 launch global_mapper_ros global_mapper_node.launch.py use_gazebo:=true use_obstacle_tracker:=false param_file:=/tmp/rover_sim/mapper.yaml quad:=RR03
+        - /home/swarm/rover_sim/scripts/run_mapper.sh RR03
       - shell_command:
         - sleep 10
-        - ros2 launch global_mapper_ros global_mapper_node.launch.py use_gazebo:=true use_obstacle_tracker:=false param_file:=/tmp/rover_sim/mapper.yaml quad:=RR04
+        - /home/swarm/rover_sim/scripts/run_mapper.sh RR04
 
   - window_name: state
     layout: tiled

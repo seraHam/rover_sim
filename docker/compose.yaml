@@ -16,6 +16,7 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
+      target: runtime
     image: rover-sim:local
     container_name: rover-sim
     network_mode: host                 # simplest path to share ROS graph with the host
@@ -37,6 +38,7 @@ services:
       - "../launch:/home/swarm/rover_sim/launch:ro"
       - "../rviz:/home/swarm/rover_sim/rviz:ro"
       - "../maps:/home/swarm/rover_sim/maps:ro"
+      - "../config:/home/swarm/rover_sim/config:ro"
       - "../scripts:/home/swarm/rover_sim/scripts:ro"
       # Bind-mounted, not baked: an edit (from the host or live in the
       # container, same file) survives down/up.

@@ -4,15 +4,22 @@
 # fixed grid covering it, and mighty plans with hard obstacles over a 40 m horizon.
 # PRIOR_WINDOW (m) sets mighty's minimum planning window; it is centered on the
 # robot, so it must be twice the farthest goal offset to hold the goal.
+# MAPPER=elevation: mighty builds its map from the 2D grids alone (map_2d_only),
+# and keeps frontiers 0.1 m from obstacles as on the rovers: that mapper's ESDF
+# counts unknown space as obstacle, so frontiers are always next to one.
 set -e
 out=/tmp/rover_sim
 mkdir -p $out
 mapper=/home/swarm/code/rover_sim_ws/install/global_mapper_ros/share/global_mapper_ros/cfg/sim_ground_robot.yaml
 mighty=/home/swarm/code/rover_sim_ws/install/mighty/share/mighty/config/mighty_ground_robot.yaml
 
+mighty_sed=()
+[ "${MAPPER:-acl}" = elevation ] && mighty_sed=(-e 's/^\( *map_2d_only:\) false/\1 true/'
+  -e 's/^\( *exploration\.detector\.min_obstacle_distance_m:\) [0-9.]*/\1 0.1/')
+
 if [ -z "$PRIOR_MAP" ]; then
   cp $mapper $out/mapper.yaml
-  cp $mighty $out/mighty.yaml
+  sed -e '' "${mighty_sed[@]}" $mighty > $out/mighty.yaml
   exit 0
 fi
 
@@ -33,5 +40,5 @@ window=()
 [ -n "$PRIOR_WINDOW" ] && window=(-e "s/^\( *min_wd[xy]:\) [0-9.]*/\1 $(printf %.1f "$PRIOR_WINDOW")/")
 sed -e 's/^\( *use_soft_cost_obstacles:\) true/\1 false/' \
     -e 's/^\( *horizon:\) [0-9.]*/\1 40.0/' \
-    "${window[@]}" \
+    "${window[@]}" "${mighty_sed[@]}" \
     $mighty > $out/mighty.yaml

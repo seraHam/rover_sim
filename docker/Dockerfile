@@ -5,15 +5,19 @@
 # rather than requiring a local checkout of any of them.
 #
 # Stages:
-#   *-src         mighty, acl-mapping and mpc at their pinned commits. Each can
-#                 be replaced by a local checkout: --build-context <name>-src=<dir>
-#                 (make build MIGHTY_SRC=... ACL_MAPPING_SRC=... MPC_SRC=...)
+#   *-src         mighty, acl-mapping, mpc and elevation_mapping_cupy at their
+#                 pinned commits. Each can be replaced by a local checkout:
+#                 --build-context <name>-src=<dir>
+#                 (make build MIGHTY_SRC=... ACL_MAPPING_SRC=... MPC_SRC=... ELEVATION_SRC=...)
 #   deps-src      clone the rest of rover_sim.repos
 #   deps-build    rosdep + colcon the deps, plus the two non-colcon Livox builds
 #   overlay-build acl-mapping + mpc on top of the deps
 #   mighty-build  mighty on top of the deps, colcon BUILD_SIMULATION=ON
 #   rover-sim-build this repo's rover_sim package (robot models, spawn launch)
-#   runtime       exec deps + Gazebo/RViz + the install trees
+#   elevation-build elevation_mapping_cupy (the rovers' mapper)
+#   runtime       exec deps + Gazebo/RViz + the install trees (ACL mapper)
+#   runtime-elevation runtime + elevation_mapping_cupy and its CUDA Python deps
+#                 (make build MAPPER=elevation; needs an NVIDIA GPU to run)
 #
 # Needs SSH for the private repos (make build forwards the agent's key).
 ARG WS=/home/swarm/code/rover_sim_ws
@@ -23,11 +27,16 @@ ARG WS=/home/swarm/code/rover_sim_ws
 # --build-arg JOBS=N to change.
 ARG JOBS=1
 ARG MIGHTY_GIT_URL=git@github.com:blakete/mighty.git
-ARG MIGHTY_GIT_REF=0bf2fd761d48eff0456f4280d953fe5746821d0e
+ARG MIGHTY_GIT_REF=6caed3835fad7be951fb1715b59bec7dab2de49c
 ARG ACL_MAPPING_GIT_URL=git@gitlab.com:seraHam/acl-mapping.git
 ARG ACL_MAPPING_GIT_REF=349a77b226e5b42fc93df1c15086a124ea711564
 ARG MPC_GIT_URL=git@gitlab.com:mit-acl/ugv/ugv_control/mpc.git
 ARG MPC_GIT_REF=7efbfe5ff76d70a332287f5b884248c29f197cba
+# The commit the rovers run.
+ARG ELEVATION_GIT_URL=https://github.com/nehirgerek/elevation_mapping_cupy.git
+ARG ELEVATION_GIT_REF=3968f412e799098b63d7dc3d0def30b784c378f5
+ARG ROS2_NUMPY_GIT_URL=https://github.com/Box-Robotics/ros2_numpy.git
+ARG ROS2_NUMPY_GIT_REF=d5ebf723e1d2457d36fa89bf021b212e340c3c11
 
 # ---------- *-src: the repos a local checkout can replace -------------------
 FROM ros:humble-ros-base AS git-base
@@ -62,6 +71,13 @@ RUN --mount=type=ssh \
  && git clone "${MPC_GIT_URL}" /src && git -C /src checkout "${MPC_GIT_REF}"
 FROM scratch AS mpc-src
 COPY --from=mpc-git /src /
+
+FROM git-base AS elevation-git
+ARG ELEVATION_GIT_URL
+ARG ELEVATION_GIT_REF
+RUN git clone "${ELEVATION_GIT_URL}" /src && git -C /src checkout "${ELEVATION_GIT_REF}"
+FROM scratch AS elevation-src
+COPY --from=elevation-git /src /
 
 # ---------- deps-src: every other pinned dependency source -------------------
 FROM ros:humble-ros-base AS deps-src
@@ -189,8 +205,32 @@ RUN source /opt/ros/humble/setup.bash \
  && colcon build --packages-select rover_sim \
  && rm -rf build log
 
+# ---------- elevation-build: elevation_mapping_cupy + ros2_numpy -------------
+FROM git-base AS elevation-build
+ARG WS
+ARG ROS2_NUMPY_GIT_URL
+ARG ROS2_NUMPY_GIT_REF
+WORKDIR ${WS}
+COPY --from=elevation-src / ${WS}/src/elevation_mapping_cupy
+# sensor_processing (semantic_sensor, for camera semantics) isn't used.
+RUN git clone "${ROS2_NUMPY_GIT_URL}" src/ros2_numpy && git -C src/ros2_numpy checkout "${ROS2_NUMPY_GIT_REF}" \
+ && touch src/elevation_mapping_cupy/sensor_processing/COLCON_IGNORE \
+ && apt-get update && rosdep update \
+ && rosdep install -y --ignore-src --from-paths src --skip-keys "semantic_sensor" \
+ && rm -rf /var/lib/apt/lists/*
+RUN source /opt/ros/humble/setup.bash \
+ && pkgs=$(colcon list --names-only --base-paths src) \
+ && colcon build --base-paths src --cmake-args -DBUILD_TESTING=OFF \
+ && mkdir -p /elevation-install && for p in $pkgs; do cp -a install/$p /elevation-install/; done \
+ && rm -rf build log
+RUN mkdir -p /manifests && cd src \
+ && find . -name package.xml -not -path "*/sensor_processing/*" -not -path "*/plane_segmentation/*" \
+        -exec cp --parents {} /manifests \; \
+ && find /manifests -exec touch -d @0 {} +
+
 # ---------- runtime: exec deps + Gazebo/RViz + the baked workspace -----------
-FROM ros:humble-ros-base
+FROM ros:humble-ros-base AS runtime
+LABEL rover_sim.mappers="acl"
 ARG WS
 SHELL ["/bin/bash", "-c"]
 ENV DEBIAN_FRONTEND=noninteractive
@@ -235,3 +275,25 @@ ENV GAZEBO_MODEL_PATH=${WS}/install/rover_sim/share:${WS}/install/mighty/share
 RUN printf 'source /opt/ros/humble/setup.bash\nsource %s/install/setup.bash\nsource /opt/livox_ws/install/setup.bash\n' "${WS}" >> /root/.bashrc
 # Command comes from compose: container just idles (sleep infinity); nodes
 # are docker-exec'd in or run from an attached shell.
+
+# ---------- runtime-elevation: + elevation_mapping_cupy (MAPPER=elevation) ----
+FROM runtime AS runtime-elevation
+ARG WS
+LABEL rover_sim.mappers="acl elevation"
+COPY --from=elevation-build /manifests /tmp/manifests
+RUN apt-get update && rosdep update \
+ && rosdep install -y --ignore-src --dependency-types exec --from-paths /tmp/manifests --skip-keys "semantic_sensor" \
+ && rm -rf /var/lib/apt/lists/* /tmp/manifests
+# The rovers' Python deps. CUDA comes from pip (12.4, what l01's 550 driver
+# supports): torch's cu124 wheels and CuPy's cuda-toolkit extra. numpy 2 (CuPy
+# 14 needs it) breaks jammy's apt cv2, so OpenCV comes from pip too.
+RUN pip3 install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cu124 \
+        torch==2.6.0+cu124 \
+        cupy-cuda12x==14.1.1 "cuda-toolkit[cublas,cudart,cufft,curand,cusolver,cusparse,nvrtc]==12.4.1" \
+        opencv-python-headless==5.0.0.93 simple-parsing==0.1.9 shapely==2.1.2 \
+        transforms3d==0.4.2 ruamel.yaml==0.19.1 numpy==2.2.6 scipy==1.15.3
+# CuPy's cupyx.cusolver links libcusolver.so.11 by name, so the pip CUDA
+# libraries have to be on the loader path.
+ARG NV=/usr/local/lib/python3.10/dist-packages/nvidia
+ENV LD_LIBRARY_PATH=${NV}/cusolver/lib:${NV}/cublas/lib:${NV}/cusparse/lib:${NV}/nvjitlink/lib:${NV}/cufft/lib:${NV}/curand/lib:${NV}/cuda_runtime/lib:${NV}/cuda_nvrtc/lib:${LD_LIBRARY_PATH}
+COPY --from=elevation-build /elevation-install ${WS}/install

@@ -83,11 +83,12 @@ is the same; a different `JOBS` recompiles everything.
 
 ### Building from local checkouts
 
-mighty, acl-mapping and mpc are normally cloned at the commits pinned in
-`docker/Dockerfile`. To build any of them from a local checkout instead (e.g.
+mighty, acl-mapping, mpc and elevation_mapping_cupy are normally cloned at the
+commits pinned in `docker/Dockerfile`. To build any of them from a local checkout instead (e.g.
 to test a change before pushing it), point the matching variable at it:
 ```bash
 make build MIGHTY_SRC=~/code/mighty ACL_MAPPING_SRC=~/code/acl-mapping MPC_SRC=~/code/mpc
+make build MAPPER=elevation ELEVATION_SRC=~/code/elevation_mapping_cupy
 ```
 Set only the ones you need. The folder is copied in as it is, uncommitted
 changes included, and needs no SSH access. A change in mighty rebuilds only
@@ -148,7 +149,8 @@ RViz outside the container needs the package for the meshes: `colcon build
 
 Every demo runs with red rovers by default; add `model:=jr` for red rover
 juniors, e.g. `run_swap4 model:=jr`.
-Add `rviz:=false` to skip RViz, e.g. on a headless machine.
+Add `rviz:=false` to skip RViz, e.g. on a headless machine, and
+`mapper:=elevation` to map with the rovers' mapper (see "Mappers" below).
 
 `multi_agent_swap_demo.yaml` (`run_swap4`): 4 ground robots (`RR01`-`RR04`),
 empty world, swapping to opposite corners via `goal_monitor_node.py` (no manual
@@ -159,7 +161,7 @@ instead of `empty`. Run it inside the container:
 run_swap4    # tmuxp load /home/swarm/rover_sim/launch/multi_agent_swap_demo.yaml
 ```
 
-`office_explore_demo.yaml` (`run_explore4`): the same 4 robots in the office world
+`office_explore_demo.yaml` (`run_explore4`): the same 4 robots, starting at the office's corners
 (`ACL_office_simple`), exploring it with mighty's frontier exploration instead of
 swapping goals. It turns on `exploration.enabled` and `exploration.bounds.enabled`
 in the session's copy of `config/mighty_ground_robot.yaml` (see below).
@@ -195,6 +197,49 @@ To stop a run, `stop` inside the container (or `make down` from the host).
 `tmux kill-session` alone can leave `ros2 launch` children and the
 backgrounded static TF publishers running, which then publish duplicate TF
 into the next run.
+
+## Mappers
+
+- `acl` (default): `global_mapper_ros` from acl-mapping. Always in the image.
+- `elevation`: `elevation_mapping_cupy` with the rovers' commit and config. It
+  needs an NVIDIA GPU. `make build MAPPER=elevation` adds it to the image (with
+  CUDA, PyTorch and CuPy; the ACL mapper stays), then pick it per run, e.g.
+  `run_swap4 mapper:=elevation`. Not with `run_prior4`: only the ACL mapper
+  takes a prior map.
+
+When the image has the elevation mapper, `make up` gives the container the GPUs
+through `docker/compose.gpu.yaml`, which needs the NVIDIA Container Toolkit
+(`docker run --rm --gpus all ubuntu nvidia-smi` should work). Put this machine's
+changes to that (other GPUs, GPUs without the toolkit) in
+`docker/compose.local.yaml`, which `make up` adds when it exists and git ignores.
+
+The elevation mapper runs with the rovers' config, with
+`config/elevation_sim.yaml` on top (a 20 m map instead of 60 m; edit it to change
+more, no rebuild). It gets the sim's lidar cloud in place of the rovers' DLIO
+cloud, and maps in frame `map` instead of `RRxx/odom`
+(`src/rover_sim/launch/elevation_mapping_sim.launch.py`). It publishes only 2D
+grids and treats unseen ground as blocked, so mighty runs with `map_2d_only: true`
+(set by `write_configs.sh`). The lidar can't see the floor around the robot,
+which the real rovers handle by being driven a bit first; here
+`scripts/elevation_start.py` marks the floor under each robot and 1.5 m ahead of it, waits
+for some lidar, and only then passes the planning grid on to mighty, which
+doesn't plan before it gets one.
+
+### Using another mapper
+
+`scripts/run_mapper.sh RRxx` starts a robot's mapper; add a case there and to
+the `mapper:=` check in `docker/dotfiles/bashrc`. Per robot, a mapper has:
+- **In**: the lidar cloud `/RRxx/mid360_PointCloud2` (`sensor_msgs/PointCloud2`,
+  frame `RRxx/RRxx_livox`, 10 Hz, wall-clock stamps), TF
+  `map -> RRxx/base_link -> RRxx/RRxx_livox`, and `/RRxx/state`
+  (`dynus_interfaces/State`).
+- **Out**, for mighty, in frame `map`: the 2D grids (`nav_msgs/OccupancyGrid`)
+  `/RRxx/planning_occ_2d_topic` (A* planning), `/RRxx/occ_2d_topic` (exploration
+  frontiers) and `/RRxx/esdf_2d_topic` (clearance, encoded over
+  `esdf_truncation_distance` cells as in mighty's `esdf_grid_2d.hpp`), with
+  `map_2d_only: true`. Or, as the ACL mapper does, the 3D clouds
+  `/RRxx/occupancy_grid` and `/RRxx/unknown_grid` (`sensor_msgs/PointCloud2`)
+  plus `occ_2d_topic` and `esdf_2d_topic`.
 
 ## Connecting your own planner or goal sender
 
