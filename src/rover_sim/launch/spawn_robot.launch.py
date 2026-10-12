@@ -37,11 +37,14 @@ def spawn(context):
             }],
             arguments=['--ros-args', '--log-level', 'error'],
         ),
+        # spawn_entity.py waits forever for Gazebo's reply, which FastDDS sometimes drops
+        # ("failed to send response to /spawn_entity") after Gazebo has spawned the robot.
         Node(
             package='gazebo_ros',
             executable='spawn_entity.py',
             name='spawn_entity',
             namespace=namespace,
+            prefix='timeout 60',
             parameters=[{'use_sim_time': False}],
             arguments=['-topic', 'robot_description', '-entity', namespace,
                        '-x', x, '-y', y, '-z', z, '-Y', yaw, '--ros-args', '--log-level', 'error'],

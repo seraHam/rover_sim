@@ -276,6 +276,11 @@ RUN printf 'source /opt/ros/humble/setup.bash\nsource %s/install/setup.bash\nsou
 # Command comes from compose: container just idles (sleep infinity); nodes
 # are docker-exec'd in or run from an attached shell.
 
+# nav2's map_server, for stacks run in this container that publish a known map.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ros-humble-nav2-map-server ros-humble-nav2-lifecycle-manager \
+ && rm -rf /var/lib/apt/lists/*
+
 # ---------- runtime-elevation: + elevation_mapping_cupy (MAPPER=elevation) ----
 FROM runtime AS runtime-elevation
 ARG WS
