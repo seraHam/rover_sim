@@ -196,6 +196,7 @@ SHELL ["/bin/bash", "-c"]
 ENV DEBIAN_FRONTEND=noninteractive
 WORKDIR ${WS}
 COPY --from=mighty-build /manifests /tmp/manifests
+COPY --from=overlay-build /manifests/overlay /tmp/manifests/overlay
 
 # Stock Mesa: uses the GPU when it supports it, otherwise llvmpipe. GPUs newer
 # than jammy's Mesa need a newer one (e.g. the kisak/turtle PPA), added locally.
