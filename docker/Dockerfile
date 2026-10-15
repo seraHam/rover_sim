@@ -276,9 +276,11 @@ RUN printf 'source /opt/ros/humble/setup.bash\nsource %s/install/setup.bash\nsou
 # Command comes from compose: container just idles (sleep infinity); nodes
 # are docker-exec'd in or run from an attached shell.
 
-# nav2's map_server, for stacks run in this container that publish a known map.
+# For stacks run in this container: nav2's map_server (a known map) and the RViz
+# 2D overlay messages (on-screen text).
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ros-humble-nav2-map-server ros-humble-nav2-lifecycle-manager \
+        ros-humble-rviz-2d-overlay-msgs \
  && rm -rf /var/lib/apt/lists/*
 
 # ---------- runtime-elevation: + elevation_mapping_cupy (MAPPER=elevation) ----
