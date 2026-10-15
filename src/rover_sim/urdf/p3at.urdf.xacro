@@ -26,7 +26,7 @@
 
   <xacro:include filename="$(find ros2_livox_simulation)/urdf/mid360.xacro" />
   <xacro:mid360 name="$(arg namespace)_livox" namespace="$(arg namespace)" parent="base_link" topic="mid360" >
-    <origin xyz="0 0 0.5" rpy="0 0.349 0"/>  <!-- 0.5 m up, 20 deg down, as on the rovers -->
+    <origin xyz="0 0 0.5" rpy="0 0.359 0"/>  <!-- 0.5 m up, 20.6 deg down, as on the rovers -->
   </xacro:mid360>
 
   <!-- Uncomment to include camera -->
