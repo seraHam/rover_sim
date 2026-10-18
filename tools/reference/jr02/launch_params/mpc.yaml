@@ -1,0 +1,3 @@
+/JR02/mpc:
+  ros__parameters:
+    cmd_vel_topic: cmd_vel_auto

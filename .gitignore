@@ -3,3 +3,5 @@ install/
 log/
 __pycache__/
 docker/compose.local.yaml
+# scripts/build_images.sh: pinned source checkouts, build contexts, logs
+.cache/

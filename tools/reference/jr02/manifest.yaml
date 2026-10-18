@@ -1,0 +1,177 @@
+# What scripts/parity_check.py compares, node by node, for the JR02 reference.
+#
+# fqn        the node's name on JR02. The sim name is fqn with JR02 replaced by the agent
+#            namespace, or the rename in allowed_deviations.yaml.
+# container  the sim container running it ({class} = jr | rr).
+# params     kind dump:  a `ros2 param dump` of the robot node, its whole declared set, so keys
+#                        the sim adds are drift too.
+#            kind files: the param files and launch params the robot node was started with, in
+#                        --params-file order. Only keys those files set are compared: there is no
+#                        dump, so defaults are unknown.
+#            ref_fqn:    the node name to select file blocks for (default fqn).
+#            urdf_key:   compare this param's URDF joint by joint against tf/tf_tree.yaml.
+#            by_class:   overrides for a class. RR files are pinned-repo files, not captured
+#                        (no RR robot was surveyed); see README.md.
+#            A file listed under `external` below is fetched, not stored here.
+# No params entry: the robot node sets none, or they were not captured (note says which).
+reference: JR02
+captured: 2026-10-18
+classes: {JR: jr, RR: rr}
+# Robot names that parity_check replaces with the agent namespace. RR reuses JR02's launch
+# params (same commands, per mapping_ws tmux/mapping_host_tmux.sh), so both names occur there.
+reference_robots:
+  jr: [JR02]
+  rr: [RR08, JR02]
+
+# Reference files that come from private repos (GitLab mit-acl, github blakete/dlio_ws).
+# This repo is public, so they are not copied here: each one is named by repo, commit and
+# path, and parity_check reads it from a pinned checkout (build_images.sh's under .cache/,
+# else its own clone under .cache/reference/, with the key the image builds use). It is
+# refused unless its parsed content hashes to yaml_sha256, the hash of the robot's copy
+# (parity_check.py yaml_digest); for these files the two are identical.
+external:
+  config/mpc/mpc.yaml:  # hw-mighty share/mpc/config/mpc.yaml on JR02
+    url: git@gitlab.com:mit-acl/ugv/ugv_control/mpc.git
+    sha: 193c36bf7d78e7e10e493f9db38c31c6d84122b4
+    path: config/mpc.yaml
+    yaml_sha256: 8af27419e86ca628e3ebc6eae24c840e01e1489a991a4cbdc84619788ac1415f
+  config/mapping/global_mapper_junior_dlio.yaml:  # mapping:/mapping_config/ on JR02
+    url: git@gitlab.com:mit-acl/ugv/redrover/mapping_ws.git
+    sha: c1233f78eae7dab33ab881efab7bd7d59b679fdf
+    path: config/mapping/global_mapper_junior_dlio.yaml
+    yaml_sha256: 0c484842d8bf812e8aa8cd87f14ac343ce2abd9f1e4b98cdba724c568350b036
+  config/mapping/map_fusion_junior.yaml:  # mapping:/mapping_config/ on JR02
+    url: git@gitlab.com:mit-acl/ugv/redrover/mapping_ws.git
+    sha: c1233f78eae7dab33ab881efab7bd7d59b679fdf
+    path: config/mapping/map_fusion_junior.yaml
+    yaml_sha256: cf7ddb7d3e362802f48f105f760e173c71051002f1c820cf3f03c10c4ac0bd73
+  config/mapping/persistent_map.yaml:  # mapping:/mapping_config/ on JR02
+    url: git@gitlab.com:mit-acl/ugv/redrover/mapping_ws.git
+    sha: c1233f78eae7dab33ab881efab7bd7d59b679fdf
+    path: config/mapping/persistent_map.yaml
+    yaml_sha256: aa3452d5409415b6adc6e5899a9b444ecbaf758e148d10a06155847b374e46a6
+  class_rr/mapping/global_mapper_red_rover.yaml:  # RR class: the pinned file (no RR robot was captured)
+    url: git@gitlab.com:mit-acl/ugv/redrover/mapping_ws.git
+    sha: c1233f78eae7dab33ab881efab7bd7d59b679fdf
+    path: config/mapping/global_mapper_red_rover.yaml
+    yaml_sha256: 6b09ff91f227c0ce4a16d4b06f0cf8598c267615fc031f46e9281267a1b76ed6
+  class_rr/mapping/map_fusion_red_rover.yaml:  # RR class: the pinned file (no RR robot was captured)
+    url: git@gitlab.com:mit-acl/ugv/redrover/mapping_ws.git
+    sha: c1233f78eae7dab33ab881efab7bd7d59b679fdf
+    path: config/mapping/map_fusion_red_rover.yaml
+    yaml_sha256: 0008b3d92a3232828727c142793694aafb700e1d6182bf5a8c40443d03595ca6
+  config/dlio/dlio.yaml:  # dlio: share/direct_lidar_inertial_odometry/cfg/ on JR02
+    url: git@github.com:blakete/dlio_ws.git
+    sha: e67633154e7f41ed957cd3f29ba144d89ca85925
+    path: cfg_overlay/JR02/dlio.yaml
+    yaml_sha256: 6188aea6665577da7a572462caa5325cfa2aa44b682e195d0f912f5a3a0ef864
+  config/dlio/params.yaml:  # dlio: share/direct_lidar_inertial_odometry/cfg/ on JR02
+    url: git@github.com:blakete/dlio_ws.git
+    sha: e67633154e7f41ed957cd3f29ba144d89ca85925
+    path: cfg_overlay/JR02/params.yaml
+    yaml_sha256: deebee80a4391e369e48356ed96b7c83d4f1d7c288852cc03efc928834fbf1cf
+  class_rr/dlio/dlio.yaml:  # RR class: the pinned RR08 overlay (no RR robot was captured)
+    url: git@github.com:blakete/dlio_ws.git
+    sha: e67633154e7f41ed957cd3f29ba144d89ca85925
+    path: cfg_overlay/RR08/dlio.yaml
+    yaml_sha256: a07ec501fc6e33814eea73dba1cce3b4e52c1c80887bc142a2dda03ebd6c2ca1
+  class_rr/dlio/params.yaml:  # RR class: the pinned RR08 overlay (no RR robot was captured)
+    url: git@github.com:blakete/dlio_ws.git
+    sha: e67633154e7f41ed957cd3f29ba144d89ca85925
+    path: cfg_overlay/RR08/params.yaml
+    yaml_sha256: 3120fca00ef322ad4af1b2d58475d51d51375e0710c256c8b8f497e1d478992a
+  launch_params/safety_node.yaml:  # drive:/tmp/launch_params_5pz6vhj3 on JR02 (launch's copy of this file; rover b39c898 is what JR02 runs)
+    url: git@gitlab.com:mit-acl/ugv/redrover/rover.git
+    sha: b39c8982ca84c5c426068b8ae20f1fdf93bb7b33
+    path: rover_control/config/teleop_logitech.yaml
+    yaml_sha256: 16ceeac7e774f5e60f71db138eceb2b5be996d2e5222c3032586497b549ac3e5
+
+nodes:
+  # hw-mighty container on JR02 (mighty 5094cdb binary, db3018a config)
+  mighty_node:
+    fqn: /JR02/mighty_node
+    container: sim-mighty
+    params: {kind: dump, files: [params/mighty_node.yaml]}
+  goal_selector:
+    fqn: /JR02/goal_selector
+    container: sim-mighty
+    params: {kind: dump, files: [params/goal_selector.yaml]}
+  mpc:
+    fqn: /JR02/mpc
+    container: sim-mighty
+    params: {kind: files, files: [config/mpc/mpc.yaml, launch_params/mpc.yaml]}
+  convert_odom_to_state:
+    fqn: /JR02/convert_odom_to_state
+    container: sim-mighty
+    note: started with remaps only (odom:=dlio/odom_node/odom), no params; graph only
+
+  # mapping container (mapping_ws c1233f7 configs, acl-mapping f44e045, map_fusion 8ea4ca7)
+  global_mapper_ros:
+    fqn: /JR02/global_mapper_ros
+    container: sim-mapping
+    params:
+      kind: files
+      files: [config/mapping/global_mapper_junior_dlio.yaml, launch_params/global_mapper_ros.yaml]
+      by_class:
+        rr: {files: [class_rr/mapping/global_mapper_red_rover.yaml, launch_params/global_mapper_ros.yaml]}
+  map_fusion_node:
+    fqn: /JR02/map_fusion_node
+    container: sim-mapping
+    params:
+      kind: files
+      files: [config/mapping/map_fusion_junior.yaml, launch_params/map_fusion_node.yaml]
+      by_class:
+        rr: {files: [class_rr/mapping/map_fusion_red_rover.yaml, launch_params/map_fusion_node.yaml]}
+  persistent_map_node:
+    fqn: /JR02/persistent_map_node
+    container: sim-mapping
+    params: {kind: files, files: [config/mapping/persistent_map.yaml, launch_params/persistent_map_node.yaml]}
+
+  # on JR02's Orin (JX02), sim-elevation in the sim
+  elevation_mapping_node:
+    fqn: /JR02/elevation_mapping_node
+    container: sim-elevation
+    note: runs on the Orin (JX02), whose launch params were not captured for this reference; graph only
+
+  # dlio container (DLIO 73c2489, dlio_ws cfg_overlay/JR02 baked in, scripts 59f6ee2)
+  dlio_odom_node:
+    fqn: /JR02/dlio_odom_node
+    container: sim-dlio-{class}
+    params:
+      kind: files
+      files: [config/dlio/dlio.yaml, config/dlio/params.yaml,
+              launch_params/dlio_odom_node.initial_pose_topic.yaml, launch_params/dlio_odom_node.two_d_only.yaml]
+      by_class:
+        rr:
+          files: [class_rr/dlio/dlio.yaml, class_rr/dlio/params.yaml,
+                  launch_params/dlio_odom_node.initial_pose_topic.yaml, launch_params/dlio_odom_node.two_d_only.yaml]
+  dlio_map_node:
+    fqn: /dlio_map_node
+    container: sim-dlio-{class}
+    params:
+      kind: files
+      files: [config/dlio/dlio.yaml, config/dlio/params.yaml]
+      by_class:
+        rr: {files: [class_rr/dlio/dlio.yaml, class_rr/dlio/params.yaml]}
+  dlio_session:
+    fqn: /JR02/dlio_session
+    container: sim-dlio-{class}
+    note: dlio_ws scripts/dlio_session.py, no params; graph only
+  map_odom_tf_broadcaster:
+    fqn: /map_odom_tf_broadcaster
+    container: sim-dlio-{class}
+    note: dlio_ws scripts/map_odom_tf.py, no params; graph only
+
+  # drive container (rover b39c898 = tree 0dc816f; acl_ctrl_safety 5cb2be0)
+  safety_node:
+    fqn: /JR02/safety_node
+    container: sim-drive
+    params:
+      kind: files
+      files: [launch_params/safety_node.yaml]
+      by_class:
+        rr: {ref_fqn: /RR08/safety_node}  # the file has no RR08 block: the /** values apply
+  robot_state_publisher:
+    fqn: /JR02/robot_state_publisher
+    container: sim-drive
+    params: {kind: files, files: [launch_params/robot_state_publisher.yaml], urdf_key: robot_description}

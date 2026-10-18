@@ -1,0 +1,126 @@
+// Session config for every node in the sim-* containers (ZENOH_SESSION_CONFIG_URI in
+// config/sim.env). Based on mighty 3cf7320 docker/dev/zenoh_session_config.json5, with
+// JR02's session tuning (/home/swarm/config/zenoh_session_config.json5: stock rmw_zenoh
+// 0.1.9 defaults plus wait_before_close 5 s). Dropped from JR02's file: the Orin-link
+// listener and the fleet qos rule keyed on real router zids. Keys not listed here take
+// zenoh defaults.
+//
+// TOPOLOGY (the one deliberate difference from a rover): peer mode, but no
+// peer-to-peer links. On a rover every container shares the host's loopback, so the
+// sessions mesh over tcp/localhost. Here each container has its own netns, so a
+// loopback locator gossiped from another container points at the wrong place. These
+// sessions therefore listen on nothing and never dial gossiped peers. Each session
+// has one link, to the router in sim-drive, and the router brokers everything
+// (router.json5: peers_failover_brokering). Gossip stays on because the router learns
+// from it which peers are not linked to each other. `scripts/sim.py loadtest
+// --variant all` measures this against client mode, a loopback mesh per container,
+// and a full mesh over the container interfaces.
+//
+// Measured 2026-10-18 on alienware-02, 4 agents = 80 sessions in 7 containers
+// (loadtest --agents 4 --variant all, each variant started on an idle router;
+// discovery = all 80 hear every expected publisher):
+//   this file    2.9 s,   80 TCP links (all to the router),  delivery 1.01
+//   client       2.8 s,   80 links: as fast, and the plan's fallback if gossip ever
+//                         misbehaves
+//   local-mesh   3.5 s,  548 links (468 peer-to-peer)
+//   mesh         7.8 s, 3240 links (3160 peer-to-peer)
+// This file keeps the robot's peer mode with the fewest links. After 80 sessions close
+// the router is busy for 10-15 s cleaning up, and sessions opened meanwhile take 10-40 s
+// to start in any mode (an earlier run without that pause had client at 12 s); the load
+// test now waits for an idle router before each variant.
+{
+  mode: "peer",
+  connect: {
+    timeout_ms: { router: -1, peer: -1, client: 0 },
+    endpoints: ["tcp/sim-drive:7447"],
+    exit_on_failure: { router: false, peer: false, client: true },
+    retry: {
+      period_init_ms: 1000,
+      period_max_ms: 4000,
+      period_increase_factor: 2,
+    },
+  },
+  listen: {
+    timeout_ms: 0,
+    endpoints: [],
+    exit_on_failure: true,
+  },
+  open: {
+    return_conditions: { connect_scouted: true, declares: true },
+  },
+  scouting: {
+    timeout: 3000,
+    delay: 500,
+    multicast: { enabled: false },
+    gossip: {
+      enabled: true,
+      multihop: false,
+      target: { router: ["router", "peer"], peer: ["router"] },
+      autoconnect: { router: [], peer: ["router"] },
+      autoconnect_strategy: { peer: { to_router: "always", to_peer: "greater-zid" } },
+    },
+  },
+  timestamping: {
+    enabled: { router: true, peer: true, client: true },
+    drop_future_timestamp: false,
+  },
+  queries_default_timeout: 600000,
+  routing: {
+    router: { peers_failover_brokering: true },
+    peer: { mode: "peer_to_peer" },
+    interests: { timeout: 10000 },
+  },
+  transport: {
+    unicast: {
+      open_timeout: 60000,
+      accept_timeout: 60000,
+      accept_pending: 10000,
+      max_sessions: 10000,
+      max_links: 1,
+      lowlatency: false,
+      qos: { enabled: true },
+      compression: { enabled: false },
+    },
+    link: {
+      tx: {
+        sequence_number_resolution: "32bit",
+        lease: 60000,
+        keep_alive: 2,
+        batch_size: 65535,
+        queue: {
+          size: {
+            control: 2,
+            real_time: 2,
+            interactive_high: 2,
+            interactive_low: 2,
+            data_high: 2,
+            data: 2,
+            data_low: 2,
+            background: 2,
+          },
+          congestion_control: {
+            drop: {
+              wait_before_drop: 1000,
+              max_wait_before_drop_fragments: 50000,
+            },
+            // JR02's one change from the rmw_zenoh default of 60 s: declarations and
+            // service replies bypass the qos interceptors, so this is their only stall
+            // bound (rover rover_bringup/docker/compose.yaml).
+            block: { wait_before_close: 5000000 },
+          },
+          batching: { enabled: true, time_limit: 1 },
+          allocation: { mode: "lazy" },
+        },
+      },
+      rx: {
+        buffer_size: 65535,
+        max_message_size: 1073741824,
+      },
+    },
+    shared_memory: { enabled: false },
+  },
+  adminspace: {
+    enabled: true,
+    permissions: { read: true, write: false },
+  },
+}

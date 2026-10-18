@@ -1,0 +1,162 @@
+######## /JR02/mighty_node
+/JR02/mighty_node
+  Subscribers:
+    /JR02/esdf_2d_topic: nav_msgs/msg/OccupancyGrid
+    /JR02/geofence/goal_fence: std_msgs/msg/String
+    /JR02/occ_2d_topic: nav_msgs/msg/OccupancyGrid
+    /JR02/occupancy_grid: sensor_msgs/msg/PointCloud2
+    /JR02/predicted_trajs: dynus_interfaces/msg/DynTraj
+    /JR02/state: dynus_interfaces/msg/State
+    /JR02/term_goal: geometry_msgs/msg/PoseStamped
+    /JR02/unknown_grid: sensor_msgs/msg/PointCloud2
+    /frame_align/JR02/JR01: geometry_msgs/msg/TransformStamped
+    /frame_align/JR02/JR03: geometry_msgs/msg/TransformStamped
+    /frame_align/JR02/JR04: geometry_msgs/msg/TransformStamped
+    /frame_align/JR02/JR05: geometry_msgs/msg/TransformStamped
+    /frame_align/JR02/JR06: geometry_msgs/msg/TransformStamped
+    /frame_align/JR02/JR07: geometry_msgs/msg/TransformStamped
+    /frame_align/JR02/JR08: geometry_msgs/msg/TransformStamped
+    /frame_align/JR02/JR09: geometry_msgs/msg/TransformStamped
+    /frame_align/JR02/JR10: geometry_msgs/msg/TransformStamped
+    /parameter_events: rcl_interfaces/msg/ParameterEvent
+    /trajs: dynus_interfaces/msg/DynTraj
+  Publishers:
+    /JR02/actual_traj: visualization_msgs/msg/MarkerArray
+    /JR02/command_to_exec_time: std_msgs/msg/Float64
+    /JR02/corridor_yaw_target: visualization_msgs/msg/Marker
+    /JR02/cp: visualization_msgs/msg/MarkerArray
+    /JR02/dynamic_map_marker: visualization_msgs/msg/MarkerArray
+    /JR02/dynamic_occupied_grid: sensor_msgs/msg/PointCloud2
+    /JR02/fov: visualization_msgs/msg/Marker
+    /JR02/free_grid: sensor_msgs/msg/PointCloud2
+    /JR02/free_hgp_path_marker: visualization_msgs/msg/MarkerArray
+    /JR02/free_map_marker: visualization_msgs/msg/MarkerArray
+    /JR02/goal: dynus_interfaces/msg/Goal
+    /JR02/goal_reached: std_msgs/msg/Empty
+    /JR02/ground_2d_heat: sensor_msgs/msg/PointCloud2
+    /JR02/ground_2d_occupied: sensor_msgs/msg/PointCloud2
+    /JR02/heat_cloud: sensor_msgs/msg/PointCloud2
+    /JR02/hgp_path_marker: visualization_msgs/msg/MarkerArray
+    /JR02/local_global_path_after_push_marker: visualization_msgs/msg/MarkerArray
+    /JR02/local_global_path_marker: visualization_msgs/msg/MarkerArray
+    /JR02/map_hold: std_msgs/msg/Bool
+    /JR02/mpc_waypoints: dynus_interfaces/msg/SpeedyPath
+    /JR02/original_hgp_path_marker: visualization_msgs/msg/MarkerArray
+    /JR02/p_points: visualization_msgs/msg/MarkerArray
+    /JR02/planner_status: goal_selector_msgs/msg/PlannerStatus
+    /JR02/planning_map_2d: nav_msgs/msg/OccupancyGrid
+    /JR02/point_A: geometry_msgs/msg/PointStamped
+    /JR02/point_E: geometry_msgs/msg/PointStamped
+    /JR02/point_G: geometry_msgs/msg/PointStamped
+    /JR02/point_G_term: geometry_msgs/msg/PointStamped
+    /JR02/point_current_state: geometry_msgs/msg/PointStamped
+    /JR02/poly_safe: decomp_ros_msgs/msg/PolyhedronArray
+    /JR02/poly_whole: decomp_ros_msgs/msg/PolyhedronArray
+    /JR02/setpoint_vis: geometry_msgs/msg/PointStamped
+    /JR02/static_map_marker: visualization_msgs/msg/MarkerArray
+    /JR02/static_push_points: visualization_msgs/msg/MarkerArray
+    /JR02/traj_committed_colored: visualization_msgs/msg/MarkerArray
+    /JR02/traj_received: visualization_msgs/msg/Marker
+    /JR02/traj_subopt_colored: visualization_msgs/msg/MarkerArray
+    /JR02/traj_transformed: visualization_msgs/msg/Marker
+    /JR02/trajectory: dynus_interfaces/msg/Trajectory
+    /JR02/unknown_grid: sensor_msgs/msg/PointCloud2
+    /JR02/unknown_map_marker: visualization_msgs/msg/MarkerArray
+    /JR02/vel_text: visualization_msgs/msg/Marker
+    /JR02/yaw_output: dynus_interfaces/msg/YawOutput
+    /parameter_events: rcl_interfaces/msg/ParameterEvent
+    /rosout: rcl_interfaces/msg/Log
+    /trajs: dynus_interfaces/msg/DynTraj
+  Service Servers:
+    /JR02/mighty_node/describe_parameters: rcl_interfaces/srv/DescribeParameters
+    /JR02/mighty_node/get_parameter_types: rcl_interfaces/srv/GetParameterTypes
+    /JR02/mighty_node/get_parameters: rcl_interfaces/srv/GetParameters
+    /JR02/mighty_node/list_parameters: rcl_interfaces/srv/ListParameters
+    /JR02/mighty_node/set_parameters: rcl_interfaces/srv/SetParameters
+    /JR02/mighty_node/set_parameters_atomically: rcl_interfaces/srv/SetParametersAtomically
+  Service Clients:
+
+  Action Servers:
+
+  Action Clients:
+
+######## /JR02/goal_selector
+/JR02/goal_selector
+  Subscribers:
+    /JR02/geofence/goal_fence: std_msgs/msg/String
+    /JR02/occ_2d_topic: nav_msgs/msg/OccupancyGrid
+    /JR02/persistent_map/grid: nav_msgs/msg/OccupancyGrid
+    /JR02/planner_status: goal_selector_msgs/msg/PlannerStatus
+    /JR02/safety_node/geofence_gate: std_msgs/msg/String
+    /JR02/state: dynus_interfaces/msg/State
+    /JR02/term_goal_rviz: geometry_msgs/msg/PoseStamped
+    /exploration/return_home: std_msgs/msg/Empty
+    /parameter_events: rcl_interfaces/msg/ParameterEvent
+  Publishers:
+    /JR02/exploration/current_goal: geometry_msgs/msg/PoseStamped
+    /JR02/exploration/frontiers: visualization_msgs/msg/MarkerArray
+    /JR02/exploration/visited_map: nav_msgs/msg/OccupancyGrid
+    /JR02/point_selector_goal: geometry_msgs/msg/PointStamped
+    /JR02/selector_map_2d: nav_msgs/msg/OccupancyGrid
+    /JR02/term_goal: geometry_msgs/msg/PoseStamped
+    /parameter_events: rcl_interfaces/msg/ParameterEvent
+    /rosout: rcl_interfaces/msg/Log
+  Service Servers:
+    /JR02/goal_selector/describe_parameters: rcl_interfaces/srv/DescribeParameters
+    /JR02/goal_selector/get_parameter_types: rcl_interfaces/srv/GetParameterTypes
+    /JR02/goal_selector/get_parameters: rcl_interfaces/srv/GetParameters
+    /JR02/goal_selector/list_parameters: rcl_interfaces/srv/ListParameters
+    /JR02/goal_selector/set_parameters: rcl_interfaces/srv/SetParameters
+    /JR02/goal_selector/set_parameters_atomically: rcl_interfaces/srv/SetParametersAtomically
+  Service Clients:
+
+  Action Servers:
+
+  Action Clients:
+
+######## /JR02/convert_odom_to_state
+/JR02/convert_odom_to_state
+  Subscribers:
+    /JR02/dlio/odom_node/odom: nav_msgs/msg/Odometry
+    /parameter_events: rcl_interfaces/msg/ParameterEvent
+  Publishers:
+    /JR02/state: dynus_interfaces/msg/State
+    /parameter_events: rcl_interfaces/msg/ParameterEvent
+    /rosout: rcl_interfaces/msg/Log
+  Service Servers:
+    /JR02/convert_odom_to_state/describe_parameters: rcl_interfaces/srv/DescribeParameters
+    /JR02/convert_odom_to_state/get_parameter_types: rcl_interfaces/srv/GetParameterTypes
+    /JR02/convert_odom_to_state/get_parameters: rcl_interfaces/srv/GetParameters
+    /JR02/convert_odom_to_state/list_parameters: rcl_interfaces/srv/ListParameters
+    /JR02/convert_odom_to_state/set_parameters: rcl_interfaces/srv/SetParameters
+    /JR02/convert_odom_to_state/set_parameters_atomically: rcl_interfaces/srv/SetParametersAtomically
+  Service Clients:
+
+  Action Servers:
+
+  Action Clients:
+
+######## /JR02/mpc
+/JR02/mpc
+  Subscribers:
+    /JR02/dlio/odom_node/pose: geometry_msgs/msg/PoseStamped
+    /JR02/mpc_waypoints: dynus_interfaces/msg/SpeedyPath
+    /tf: tf2_msgs/msg/TFMessage
+    /tf_static: tf2_msgs/msg/TFMessage
+  Publishers:
+    /JR02/cmd_vel_auto: geometry_msgs/msg/Twist
+    /parameter_events: rcl_interfaces/msg/ParameterEvent
+    /rosout: rcl_interfaces/msg/Log
+  Service Servers:
+    /JR02/mpc/describe_parameters: rcl_interfaces/srv/DescribeParameters
+    /JR02/mpc/get_parameter_types: rcl_interfaces/srv/GetParameterTypes
+    /JR02/mpc/get_parameters: rcl_interfaces/srv/GetParameters
+    /JR02/mpc/list_parameters: rcl_interfaces/srv/ListParameters
+    /JR02/mpc/set_parameters: rcl_interfaces/srv/SetParameters
+    /JR02/mpc/set_parameters_atomically: rcl_interfaces/srv/SetParametersAtomically
+  Service Clients:
+
+  Action Servers:
+
+  Action Clients:
+

@@ -1,0 +1,8 @@
+# drive:/tmp/launch_params_z_ufdiqh on JR02 (robot_state_publisher), TRIMMED: the deployed
+# robot_description (rover_description's URDF with JR02's sensor_calib, from a private repo)
+# is not kept here. parity_check compares the sim's URDF joint by joint against
+# tf/tf_tree.yaml, which holds that URDF's joints.
+/JR02/robot_state_publisher:
+  ros__parameters:
+    robot_description: <not kept here; compared joint by joint against tf/tf_tree.yaml>
+    use_sim_time: false

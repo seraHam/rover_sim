@@ -1,0 +1,44 @@
+repositories:
+  # Sim-only dependencies of the stack images' `gazebo` target (docker/Dockerfile,
+  # stack-sim-git). Nothing here runs on a robot. The robot stacks (mighty,
+  # mapping_ws, dlio_ws, rover) are pinned in docker/stacks.env and built from
+  # their own Dockerfiles; rover_sim.repos is the legacy monolith's list.
+  #
+  # Bump a pin by editing url/version here. All are public over https, so the
+  # build needs no SSH key. To build from local checkouts instead, vcs-import
+  # this file into a directory, edit there, and pass
+  # --build-context stack-sim-src=<dir>.
+
+  # Gazebo classic ROS 2 bridge (gazebo_ros, gazebo_plugins: diff drive, IMU,
+  # p3d) and the MID-360 ray plugin. Same pins as mighty.repos; Phase 2 moves
+  # both to the blakete fix/sim-stamps forks (sensor stamps in sim time).
+  gazebo_ros_pkgs:
+    type: git
+    url: https://github.com/kotakondo/gazebo_ros_pkgs.git
+    version: ed1f7b886971d7bf898e6e0f59c622df929c0521
+  livox_laser_simulation_ros2:
+    type: git
+    url: https://github.com/kotakondo/livox_laser_simulation_ros2.git
+    version: 044e83e6fc5d527b082852550d7206dd4308d950
+
+  # RViz display of mighty's safe-corridor polyhedra (decomp_ros_msgs +
+  # decomp_rviz_plugins). Same pin as mighty.repos.
+  DecompROS2:
+    type: git
+    url: https://github.com/kotakondo/DecompROS2.git
+    version: a2bc42ed46bf934323994706f17af8a3883860ea
+
+  # livox_ros_driver2 for the CustomMsg type the Livox plugin publishes (the
+  # driver itself never runs in the sim). Not plain colcon packages: Livox-SDK2
+  # is cmake-installed and livox_ros_driver2 is built in /opt/livox_ws by its
+  # own build.sh. Same commits as mighty.repos; the driver's URL is https here
+  # (mighty.repos uses ssh).
+  livox_ros_driver2:
+    type: git
+    url: https://github.com/blakete/livox_ros_driver2.git
+    # fix/build-vs-sdk-1.2.5 — f103b4e + numeric-compare patch so it compiles vs SDK v1.2.5
+    version: 37a62915b4e3f82ce4fbf5bbf7bc16b3ce498aaa
+  Livox-SDK2:
+    type: git
+    url: https://github.com/Livox-SDK/Livox-SDK2.git
+    version: 6a940156dd7151c3ab6a52442d86bc83613bd11b
