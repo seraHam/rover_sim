@@ -1,0 +1,25 @@
+# DLIO against ground truth (scripts/odom_eval.py): the multi_agent_swap starts in the arena,
+# and as goals each agent's square of 3 m to its left and behind it (away from the centre), in
+# the world frame, ending back at the start. Four laps (48 m: odom_eval.py --drive --pattern
+# waypoints with the goals repeated 4 times) of all four agents at once stay 0.9 m off the
+# walls and never cross. This is the plan's "scripted 50 m square" check, and the drive the
+# arena's odom_eval.py numbers in src/rover_sim/config/worlds.yaml come from: one 12.5 m
+# square does not fit in the arena (drive_pattern.py refuses it there).
+#
+#   scripts/sim.py up odom_eval
+#
+# auto_arm: the drives go through cmd_vel_auto, so every safety_node is put in AUTO once its
+# DLIO tracks.
+#
+# Poses are [x m, y m, yaw deg] in the world frame; goals [x, y] likewise.
+name: odom_eval
+world: arena
+gui: false
+mapping: fallback
+rviz: false
+auto_arm: true
+agents:
+  - {name: JR81, class: jr, pose: [2.83, 2.83, -135.0], goals: [[4.95, 0.71], [7.07, 2.83], [4.95, 4.95], [2.83, 2.83]]}
+  - {name: JR82, class: jr, pose: [-2.83, 2.83, -45.0], goals: [[-0.71, 4.95], [-2.83, 7.07], [-4.95, 4.95], [-2.83, 2.83]]}
+  - {name: RR83, class: rr, pose: [-2.83, -2.83, 45.0], goals: [[-4.95, -0.71], [-7.07, -2.83], [-4.95, -4.95], [-2.83, -2.83]]}
+  - {name: RR84, class: rr, pose: [2.83, -2.83, 135.0], goals: [[0.71, -4.95], [2.83, -7.07], [4.95, -4.95], [2.83, -2.83]]}

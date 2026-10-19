@@ -36,6 +36,16 @@ x-sim-volumes:
   # No default: sim.py sets it to a dir it has checked only you can write
   # (/tmp/rover_sim-<uid>/run), as the containers run as root and execute files there.
   - &vol-run ${ROVER_SIM_RUN:?set by scripts/sim.py; plain compose needs ROVER_SIM_RUN=<a dir only you can write>}:/rover_sim/run
+  # The DLIO pane scripts, as on the robot: its dlio_ws compose bind-mounts the pinned
+  # checkout's scripts/ over the copy the image bakes. Here that is build_images.sh's checkout
+  # of DLIO_SHA, so a pin bump follows. Never created when missing (it would be root's):
+  # compose refuses to start, and sim.py says to run scripts/build_images.sh dlio-jr.
+  - &vol-dlio-scripts
+    type: bind
+    source: ../.cache/src/dlio_ws@${DLIO_SHA:?set in docker/stacks.env; pass --env-file docker/stacks.env}/scripts
+    target: /home/swarm/code/dlio_ws/scripts
+    read_only: true
+    bind: {create_host_path: false}
 
 # CPU budget: each service's cpuset comes from sim.py (cpu_budget: cores 0-1 left to the
 # host and the fleet C2 stack, sim-gazebo's cores for it alone, the rest shared), or from
@@ -103,6 +113,7 @@ services:
     container_name: sim-dlio-jr
     hostname: sim-dlio-jr
     cpuset: ${ROVER_SIM_CPUSET_DLIO_JR:-}
+    volumes: [*vol-zenoh, *vol-scripts, *vol-config, *vol-run, *vol-dlio-scripts]
 
   sim-dlio-rr:
     <<: *sim
@@ -110,6 +121,7 @@ services:
     container_name: sim-dlio-rr
     hostname: sim-dlio-rr
     cpuset: ${ROVER_SIM_CPUSET_DLIO_RR:-}
+    volumes: [*vol-zenoh, *vol-scripts, *vol-config, *vol-run, *vol-dlio-scripts]
 
   sim-mapping:
     <<: *sim

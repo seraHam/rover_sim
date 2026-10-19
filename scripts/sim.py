@@ -6,10 +6,12 @@ script brings them up and runs every node as a `docker exec` from a host tmux se
 per stack (rsim-<stack>), the way the robot's *_host_tmux.sh units do, so Ctrl-C / Up /
 Enter in a pane restarts that one node.
 
-  scripts/sim.py up <session> [--stacks a,b] [--partial] [--dry-run]
+  scripts/sim.py up <session> [--stacks a,b] [--partial] [--no-arm] [--dry-run]
   scripts/sim.py down [--containers]
   scripts/sim.py attach [<stack>]
   scripts/sim.py status
+  scripts/sim.py arm [<ns>...] [--now] [--timeout S]     (safety_node AUTO)
+  scripts/sim.py disarm [<ns>...]
   scripts/sim.py loadtest [--agents N] [--variant V|all ...]
   scripts/sim.py compose <docker compose args...>
   scripts/sim.py cpus gz|rest            (inside sim-gazebo: its panes' CPU split)
@@ -17,10 +19,12 @@ Enter in a pane restarts that one node.
 <session> is config/sessions/<name>.yaml, or a path to one:
 
   name: smoke
-  world: empty                  # src/rover_sim/worlds/<world>.world
+  world: arena                  # src/rover_sim/worlds/<world>.world; not empty: DLIO drifts
+                                # metres on a bare floor (src/rover_sim/config/worlds.yaml)
   gui: false                    # gzclient on $DISPLAY
   mapping: fallback             # gpu (parity) | fallback (no GPU, "not parity")
   rviz: false
+  auto_arm: false               # true: put each safety_node in AUTO once its DLIO tracks
   agents:                       # pose: world frame, [x m, y m, yaw deg]
     - {name: JR81, class: jr, pose: [-2.0, 0.0, 0.0]}
     - {name: RR83, class: rr, pose: [2.0, 0.0, 180.0]}
@@ -30,10 +34,20 @@ across classes: mighty takes its agent id from them. Each class is calibrated fr
 real robot, the one its DLIO image is built for (docker/stacks.env DLIO_<CLASS>_ROBOT).
 
 Stacks are a registry (STACKS below). Each names its containers and builds its panes
-from the session. Phases 1-2 run `zenoh` (the router in sim-drive), `gazebo` (world,
-spawns, sensor bridges, world-><ns>/map), `drive` (rover_description per agent) and
-`frame_align` (ground-truth alignment for mighty). The others are placeholders that
-later phases fill in.
+from the session. Phases 1-3 run `zenoh` (the router in sim-drive), `gazebo` (world,
+spawns, sensor bridges, world-><ns>/map), `drive` (teleop + safety_node, rover_description
+per agent), `frame_align` (ground-truth alignment for mighty) and `dlio` (DLIO, its seed
+pose and map->odom per agent). The others are placeholders that later phases fill in.
+`up` starts them all at once, in registry order, then waits until every agent is spawned
+and physics runs (wait_spawned), and fails if the spawn pane does.
+
+safety_node starts DISARMED, holding the agent still (zero cmd_vel) while DLIO calibrates
+its IMU, and stays so, as on the robot, until `arm` calls its /<ns>/auto_mode once DLIO
+registers scans from the seed pose. With auto_arm, `up` does that itself. From then on
+/<ns>/cmd_vel_auto drives the agent, and safety_node zeroes the command when cmd_vel_auto
+stops for 1 s. `disarm` calls /<ns>/disarm. Every call is logged to <pane-log dir>/arm.log.
+auto_arm is off by default until Phase 5's mpc publishes cmd_vel_auto: in AUTO without it,
+each safety_node logs a line every 20 ms (about 6.5 KB/s of pane log per agent).
 
 Per-run generated files go to $ROVER_SIM_RUN (default /tmp/rover_sim-<uid>/run), which
 is mounted at /rover_sim/run in every container. It must be yours and writable by no one
@@ -101,12 +115,17 @@ SESSION_URI_IN = '/rover_sim/zenoh/session.json5'
 SCRIPTS_IN = '/rover_sim/scripts'    # this repo's scripts/ inside every container
 WORLDS_DIR = REPO / 'src' / 'rover_sim' / 'worlds'
 WORLD_BUDGETS = REPO / 'src' / 'rover_sim' / 'config' / 'worlds.yaml'   # MID-360 rays per world
+CLASSES_YAML = REPO / 'src' / 'rover_sim' / 'config' / 'classes.yaml'
 
 # Per-run files (in the run dir; contracts with the sim's own nodes).
 SPAWN_FILE = 'spawn.yaml'            # agents and spawn poses: sim_tf.py, the spawn pane
 CALIB_DIR = 'sensor_calib'           # <ns>_lidar_mount.yaml, <ns>_calib.npy
 URDF_DIR = 'urdf'                    # <ns>.urdf, as spawned (xacro output)
 FRAME_ALIGN_FILE = 'frame_align.yaml'
+CLASSES_FILE = 'classes.yaml'        # the checkout's classes.yaml: drive_pattern.py's limits
+TELEOP_FILE = 'teleop_sim.yaml'      # rover_control's teleop file + the sim agents' blocks
+DLIO_LAUNCH_FILE = 'dlio_sim.launch.py'   # the robot's DLIO launch with a per-agent map node name
+ARM_LOG = 'arm.log'                  # in the pane-log dir: every auto_mode / disarm call
 RTF_LOG = 'rtf_violations.log'       # appended by livox_sim_bridge.py; any line = run invalid
 
 LOG_ROOT = Path.home() / '.local' / 'state' / 'rover_sim' / 'logs'
@@ -116,6 +135,7 @@ LOG_KEEP = 20                        # newest pane-log dirs kept
 TMUX_SIZE = ('220', '56')
 TMUX_HISTORY = 50000                 # scrollback lines per pane (pipe-pane logs keep it all)
 TMUX_PLACEHOLDER = '_starting'
+PANE_SLUG_OPTION = '@rsim_slug'      # tmux pane option: which pane is which (titles are display only)
 MAX_PANES_PER_WINDOW = 8             # beyond this tmux runs out of room to split
 
 
@@ -201,7 +221,7 @@ ROBOT_CLASSES = OrderedDict([
 CLASS_PREFIXES = OrderedDict((k, c.prefix) for k, c in ROBOT_CLASSES.items())  # class -> name prefix
 MAPPING_MODES = ('gpu', 'fallback')
 IDENT_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_.-]*$')
-SESSION_KEYS = ('name', 'world', 'gui', 'mapping', 'rviz', 'agents')
+SESSION_KEYS = ('name', 'world', 'gui', 'mapping', 'rviz', 'auto_arm', 'agents')
 AGENT_KEYS = ('name', 'class', 'pose', 'goals')
 
 
@@ -238,6 +258,7 @@ class Session:
     agents: Tuple[Agent, ...]
     source: str = ''
     gui: bool = False
+    auto_arm: bool = False             # TODO(Phase 5): sessions with mpc arm; see the module docstring
 
     @property
     def num_agents(self) -> int:
@@ -250,7 +271,8 @@ class Session:
     def to_json(self) -> Dict[str, Any]:
         return OrderedDict([
             ('name', self.name), ('world', self.world), ('gui', self.gui), ('mapping', self.mapping),
-            ('rviz', self.rviz), ('num_agents', self.num_agents), ('source', self.source),
+            ('rviz', self.rviz), ('auto_arm', self.auto_arm), ('num_agents', self.num_agents),
+            ('source', self.source),
             ('agents', [OrderedDict([('name', a.name), ('class', a.cls), ('id', a.id),
                                      ('pose', [a.x, a.y, a.yaw_deg]),
                                      ('goals', [list(g) for g in a.goals])])
@@ -279,11 +301,10 @@ def validate_session(data: Any, source: str = '<session>') -> Session:
     mapping = data.get('mapping', 'gpu')
     if mapping not in MAPPING_MODES:
         errs.append('mapping: %r is not one of %s' % (mapping, ', '.join(MAPPING_MODES)))
-    rviz, gui = data.get('rviz', False), data.get('gui', False)
-    if not isinstance(rviz, bool):
-        errs.append('rviz: %r is not true/false' % (rviz,))
-    if not isinstance(gui, bool):
-        errs.append('gui: %r is not true/false' % (gui,))
+    flags = OrderedDict((k, data.get(k, d)) for k, d in (('rviz', False), ('gui', False), ('auto_arm', False)))
+    for k, v in flags.items():
+        if not isinstance(v, bool):
+            errs.append('%s: %r is not true/false' % (k, v))
 
     agents = []  # type: List[Agent]
     raw = data.get('agents')
@@ -335,7 +356,7 @@ def validate_session(data: Any, source: str = '<session>') -> Session:
                                 tuple(tuple(float(v) for v in g) for g in goals)))
     if errs:
         raise SessionError('%s: invalid session:\n  - %s' % (source, '\n  - '.join(errs)))
-    return Session(name, world, mapping, rviz, tuple(agents), source, gui)
+    return Session(name, world, mapping, flags['rviz'], tuple(agents), source, flags['gui'], flags['auto_arm'])
 
 
 def session_path(arg: str) -> Path:
@@ -386,6 +407,23 @@ def world_lidar_samples(world: str, path: Path = WORLD_BUDGETS) -> int:
     if not isinstance(n, int) or isinstance(n, bool) or not 1 <= n <= 20000:
         raise SimError('%s: lidar_samples_4_agents.%s = %r is not 1..20000' % (path, world, n))
     return n
+
+
+def world_walls(world: str, path: Path = WORLD_BUDGETS) -> Optional[List[float]]:
+    """[xmin, ymin, xmax, ymax], the inner faces of the world's outer walls (worlds.yaml
+    walls), or None for a world that has no such box. spawn.yaml carries it to
+    drive_pattern.py, which refuses a plan that leaves it."""
+    try:
+        walls = (yaml.safe_load(path.read_text()) or {}).get('walls') or {}
+    except (OSError, yaml.YAMLError) as e:
+        raise SimError('%s: %s' % (path, e))
+    box = walls.get(world)
+    if box is None:
+        return None
+    if not (isinstance(box, list) and len(box) == 4 and all(_is_num(v) for v in box)
+            and box[0] < box[2] and box[1] < box[3]):
+        raise SimError('%s: walls.%s = %r is not [xmin, ymin, xmax, ymax]' % (path, world, box))
+    return [float(v) for v in box]
 
 
 def read_pins(path: Path = STACKS_ENV) -> Dict[str, str]:
@@ -459,6 +497,14 @@ CONTAINERS = OrderedDict((c.name, c) for c in (
 # for <robot_name>_lidar_mount.yaml and <robot_name>_calib.npy.
 RD_SHARE = '/home/swarm/code/rover_ws/install/share/rover_description'
 DESCRIPTION_CONTAINER = 'sim-drive'
+# The robot's teleop/safety parameters, as the drive image installs them (rover_control).
+TELEOP_SRC = '/home/swarm/code/rover_ws/install/share/rover_control/config/teleop_logitech.yaml'
+
+# dlio_ws as its image bakes it. On the robot, the pinned checkout's scripts/ is bind-mounted
+# over the image's (dlio_ws docker/compose.yaml); compose.stack.yaml mounts build_images.sh's
+# checkout of DLIO_SHA there, read-only.
+DLIO_WS = '/home/swarm/code/dlio_ws'
+DLIO_SCRIPTS = ('dlio_with_session.launch.py', 'dlio_session.py', 'map_odom_tf.py', 'wait_zenoh_ready.py')
 
 
 def sim_only(name: str) -> str:
@@ -651,14 +697,16 @@ def spawn_agent_cmd(a: Agent, lidar_samples: int) -> str:
 def spawn_cmd(session: Session, ctx: RunContext) -> str:
     """Into the paused world one by one, then unpause once, so no robot moves (or DLIO
     calibrates on a falling IMU) before all are in. The pane then idles: `status` shows
-    it running when everything spawned, EXITED when a step failed."""
+    it running when everything spawned, EXITED when a step failed. Each CLI has a SIGKILL
+    backstop: gzserver has stopped answering ROS services after start-up (1 in 10
+    bring-ups), and a call that never returns would leave the pane waiting forever."""
     names = ' '.join(a.name for a in session.agents)
     samples = world_lidar_samples(session.world)
     return ' && '.join(
         [pin_self('rest', ctx), 'echo "[rover_sim] waiting for /spawn_entity (gzserver)..."',
-         'until ros2 service list --no-daemon 2>/dev/null | grep -qx /spawn_entity; do sleep 2; done']
+         'until timeout -k 2 15 ros2 service list --no-daemon 2>/dev/null | grep -qx /spawn_entity; do sleep 2; done']
         + [spawn_agent_cmd(a, samples) for a in session.agents]
-        + ['ros2 service call /unpause_physics std_srvs/srv/Empty',
+        + ['timeout -k 2 30 ros2 service call /unpause_physics std_srvs/srv/Empty',
            'echo "[rover_sim] spawned %s; physics unpaused at $(date +%%T)"' % names,
            'exec sleep infinity'])
 
@@ -694,16 +742,27 @@ def robot_env(a: Agent) -> Tuple[Tuple[str, str], ...]:
     return (('VEHTYPE', a.prefix), ('VEHNUM', '%02d' % a.id), ('ROBOT_NAME', a.name))
 
 
+def teleop_cmd(a: Agent) -> str:
+    """The robot's 'teleop + safety' pane with the sim's teleop file. joy_id stays the
+    default 0: the containers have no input devices, and joy_node (SDL) then just waits
+    for one, as on a robot without its gamepad."""
+    return ('ros2 launch rover_control teleop.launch.yaml robot_name:=%s teleop_file:=%s'
+            % (a.name, run_path(TELEOP_FILE)))
+
+
 def drive_panes(session: Session, ctx: RunContext) -> List[Pane]:
-    """sim-drive, the Phase 2 part: per agent the robot's 'description / TF' pane
-    (rover drive_host_tmux.sh), i.e. robot_state_publisher with <ns>/base_link -> <ns>/lidar
-    from the agent's generated mount file (link_calib) on /tf_static. Phase 3 adds
-    rover_control teleop.launch.yaml with <run>/teleop_sim.yaml (safety_node). No firmware
-    driver: Gazebo's diff drive consumes /<ns>/cmd_vel."""
-    return [Pane('%s description / TF' % a.name, 'description-tf-' + a.name, 'sim-drive',
-                 'ros2 launch rover_description state_publisher.launch.py robot_name:=%s ns_tf_frame_ids:=true'
-                 % a.name, env=robot_env(a), window='description')
-            for a in session.agents]
+    """sim-drive: per agent the robot's 'teleop + safety' and 'description / TF' panes
+    (rover drive_host_tmux.sh). teleop.launch.yaml runs joy_node, teleop_twist_joy and
+    safety_node in /<ns> with <run>/teleop_sim.yaml (write_teleop_file); safety_node starts
+    DISARMED and publishes zero cmd_vel until armed (arm_agents). robot_state_publisher
+    puts <ns>/base_link -> <ns>/lidar from the agent's generated mount file (link_calib) on
+    /tf_static. No firmware driver: Gazebo's diff drive consumes /<ns>/cmd_vel."""
+    return ([Pane('%s teleop + safety' % a.name, 'teleop-safety-' + a.name, 'sim-drive', teleop_cmd(a),
+                  env=robot_env(a), window='teleop') for a in session.agents]
+            + [Pane('%s description / TF' % a.name, 'description-tf-' + a.name, 'sim-drive',
+                    'ros2 launch rover_description state_publisher.launch.py robot_name:=%s ns_tf_frame_ids:=true'
+                    % a.name, env=robot_env(a), window='description')
+               for a in session.agents])
 
 
 FRAME_ALIGN_KEYS = ('tx', 'ty', 'tz', 'qx', 'qy', 'qz', 'qw')
@@ -763,10 +822,16 @@ def frame_align_panes(session: Session, ctx: RunContext) -> List[Pane]:
 # ---------------------------------------------------------------------------- per-run files
 
 def spawn_table(session: Session, pins: Dict[str, str]) -> Dict[str, Any]:
-    """<run>/spawn.yaml: what sim_tf.py and the spawn pane place every agent from."""
-    return {'agents': [{'name': a.name, 'class': a.cls, 'id': a.id, 'x': a.x, 'y': a.y, 'yaw': a.yaw,
-                        'yaw_deg': a.yaw_deg, 'lidar_height': ROBOT_CLASSES[a.cls].lidar_height,
-                        'reference_robot': reference_robot(a.cls, pins)} for a in session.agents]}
+    """<run>/spawn.yaml: what sim_tf.py and the spawn pane place every agent from, and the
+    world's walls (world_walls) for drive_pattern.py."""
+    out = {'world': session.world}  # type: Dict[str, Any]
+    walls = world_walls(session.world)
+    if walls:
+        out['walls'] = walls
+    out['agents'] = [{'name': a.name, 'class': a.cls, 'id': a.id, 'x': a.x, 'y': a.y, 'yaw': a.yaw,
+                      'yaw_deg': a.yaw_deg, 'lidar_height': ROBOT_CLASSES[a.cls].lidar_height,
+                      'reference_robot': reference_robot(a.cls, pins)} for a in session.agents]
+    return out
 
 
 def generated_yaml(session: Session, what: str, data: Dict[str, Any]) -> str:
@@ -883,6 +948,8 @@ def write_agent_files(session: Session, ctx: RunContext) -> None:
       <run>/sensor_calib/<ns>_lidar_mount.yaml  the reference robot's, plus a header line
       <run>/sensor_calib/<ns>_calib.npy      the reference robot's, byte for byte
       <run>/frame_align.yaml                 what the frame_align panes publish
+      <run>/classes.yaml                     the drive limits, for drive_pattern.py / odom_eval.py
+                                             in any container (only sim-gazebo mounts src/)
       <run>/urdf/                            the spawn pane's xacro output
     Stale files of an earlier session go first: the containers read these by name."""
     if not running(DESCRIPTION_CONTAINER):
@@ -904,8 +971,10 @@ def write_agent_files(session: Session, ctx: RunContext) -> None:
     write_file(run_dir / FRAME_ALIGN_FILE, generated_yaml(
         session, 'Ground-truth frame alignment, inverse(T_world_egomap) * T_world_othermap',
         frame_align_table(session)).encode())
-    info('wrote %s, %s/ (%s) and %s' % (SPAWN_FILE, CALIB_DIR, ', '.join(
-        '%s from %s' % (a.name, reference_robot(a.cls, pins)) for a in session.agents), FRAME_ALIGN_FILE))
+    write_file(run_dir / CLASSES_FILE, CLASSES_YAML.read_bytes())
+    info('wrote %s, %s/ (%s), %s and %s' % (SPAWN_FILE, CALIB_DIR, ', '.join(
+        '%s from %s' % (a.name, reference_robot(a.cls, pins)) for a in session.agents), FRAME_ALIGN_FILE,
+        CLASSES_FILE))
 
 
 # Links each agent's calib files into the share; refuses to shadow a file the image has.
@@ -938,11 +1007,204 @@ def link_calib(session: Session, ctx: RunContext) -> None:
             '\n  rename that agent: sim agents need names no real robot has (e.g. JR81)' if p.returncode == 3 else ''))
 
 
+class _UniqueKeyLoader(yaml.SafeLoader):
+    """SafeLoader that refuses a repeated mapping key (PyYAML keeps the last silently,
+    so a cloned block that repeats a file's key would look fine here)."""
+
+
+def _unique_mapping(loader: yaml.SafeLoader, node: yaml.Node, deep: bool = False) -> Dict[Any, Any]:
+    keys = set()
+    for k, _ in node.value:
+        key = loader.construct_object(k, deep=deep)
+        if key in keys:
+            raise yaml.constructor.ConstructorError(None, None, 'duplicate key %r' % (key,), k.start_mark)
+        keys.add(key)
+    return loader.construct_mapping(node, deep=deep)
+
+
+_UniqueKeyLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _unique_mapping)
+
+
+def teleop_blocks(text: str, where: str) -> Dict[str, Any]:
+    """The node blocks of a teleop file: flat, fully qualified keys ('/**/joy_teleop/joy_node',
+    '/JR02/safety_node'), each with only ros__parameters."""
+    try:
+        doc = yaml.load(text, Loader=_UniqueKeyLoader)
+    except yaml.YAMLError as e:
+        raise SimError('%s: %s' % (where, e))
+    if not isinstance(doc, dict) or not doc:
+        raise SimError('%s: expected node blocks at the top level' % where)
+    for k, v in doc.items():
+        if not (isinstance(k, str) and k.startswith('/')) or not (isinstance(v, dict) and list(v) == ['ros__parameters']):
+            raise SimError('%s: %r is not a flat /<ns>/<node>: {ros__parameters: ...} block' % (where, k))
+    return doc
+
+
+def teleop_sim_yaml(base: str, session: Session, pins: Dict[str, str], source: str) -> str:
+    """<run>/teleop_sim.yaml: rover_control's teleop_logitech.yaml verbatim, then for every
+    agent a copy of its reference robot's own blocks under the agent's name (JR02's
+    /JR02/joy_teleop/teleop_twist_joy_node and /JR02/safety_node become /JR81/...). A robot
+    without blocks of its own (RR08) runs on the /** defaults, and so do its agents. The
+    copies stay flat, fully qualified keys: the file's own note explains that nesting them
+    under a namespace key makes rcl drop siblings. Launch reads the file with allow_substs,
+    so nothing generated may contain '$('."""
+    blocks = teleop_blocks(base, source)
+    out = ['# rover_sim: %s for session %s, generated by scripts/sim.py; rewritten on every `up`.' % (
+        TELEOP_FILE, session.name),
+        '# Below: %s verbatim, then each sim agent\'s copy of its reference robot\'s blocks.' % source, '', '']
+    tail = ['', '', '# ' + '-' * 75, '# rover_sim agents: copies of their reference robot\'s blocks (flat keys).']
+    added = OrderedDict()  # type: Dict[str, Any]
+    for a in session.agents:
+        if any(k.split('/')[1] == a.name for k in blocks):
+            raise SimError('%s has blocks for %s, a real robot: sim agents need names no real robot has '
+                           '(e.g. JR81)' % (source, a.name))
+        ref = reference_robot(a.cls, pins)
+        mine = [(k, v) for k, v in blocks.items() if k.split('/')[1] == ref and k.count('/') > 1]
+        if not mine:
+            tail.append('# %s: %s has no blocks of its own; the /** defaults apply.' % (a.name, ref))
+            continue
+        tail.append('# %s (class %s): from %s' % (a.name, a.cls, ref))
+        for k, v in mine:
+            key = '/%s/%s' % (a.name, k.split('/', 2)[2])
+            added[key] = copy.deepcopy(v)
+            tail.append(yaml.safe_dump({key: v}, default_flow_style=False, sort_keys=False).rstrip('\n'))
+    text = '\n'.join(out) + base.rstrip('\n') + '\n'.join(tail) + '\n'
+    if '$(' in '\n'.join(out + tail):
+        raise SimError('BUG: generated teleop blocks contain a launch substitution')
+    want = OrderedDict(blocks)
+    want.update(added)
+    if teleop_blocks(text, TELEOP_FILE) != want:
+        raise SimError('BUG: %s does not parse back to the base file plus the agents\' blocks' % TELEOP_FILE)
+    return text
+
+
+def write_teleop_file(session: Session, ctx: RunContext) -> None:
+    """<run>/teleop_sim.yaml (teleop_sim_yaml) from the drive image's installed rover_control,
+    the pinned rover's: the file safety_node runs with on the robot, not a local copy."""
+    if not running(DESCRIPTION_CONTAINER):
+        raise SimError('%s is read from %s, which is not running' % (TELEOP_SRC, DESCRIPTION_CONTAINER))
+    pins = read_pins()
+    src = '%s:%s (rover %s)' % (pins.get('DRIVE_IMAGE', '?'), TELEOP_SRC, pins.get('DRIVE_SHA', '?')[:7])
+    try:
+        base = read_container_file(DESCRIPTION_CONTAINER, TELEOP_SRC).decode('utf-8')
+    except UnicodeDecodeError as e:
+        raise SimError('%s: %s' % (src, e))
+    write_file(ctx.run_dir / TELEOP_FILE, teleop_sim_yaml(base, session, pins, src).encode())
+    info('wrote %s (%s)' % (TELEOP_FILE, ', '.join(
+        '%s from %s' % (a.name, reference_robot(a.cls, pins)) for a in session.agents)))
+
+
+def dlio_scripts_dir(pins: Dict[str, str]) -> Path:
+    """build_images.sh's checkout of the dlio_ws pin (.cache/src/dlio_ws@<DLIO_SHA>): its
+    scripts/ is what compose.stack.yaml mounts in both DLIO containers."""
+    return REPO / '.cache' / 'src' / ('dlio_ws@' + pins.get('DLIO_SHA', '')) / 'scripts'
+
+
+def dlio_scripts_problem(pins: Dict[str, str]) -> Optional[str]:
+    d = dlio_scripts_dir(pins)
+    missing = [f for f in DLIO_SCRIPTS if not (d / f).is_file()]
+    if not missing:
+        return None
+    return ('the pinned dlio_ws scripts the DLIO containers mount are missing (%s in %s): '
+            'run scripts/build_images.sh dlio-jr' % (', '.join(missing), d))
+
+
+# The robot's DLIO pane launches dlio_with_session.launch.py, whose dlio_map_node has a fixed
+# name and no namespace. Two agents share a sim DLIO container (and four, one graph), so this
+# wrapper adds one rcl node-specific remap, dlio_map_node:__node:=dlio_map_node_<ns>, which
+# renames that node only (allowed_deviations.yaml rename). Everything else is the robot's file.
+# The node's own interfaces keep their root names, so every agent's map node shares them:
+# /save_pcd (a call reaches any one of them), /map and the /dlio/odom_node/pointcloud/keyframe
+# subscription. JR02 has one of each, and nothing publishes those keyframes there either (the
+# odom node's are under /<ns>); allowed_deviations.yaml notes it next to the rename.
+DLIO_SIM_LAUNCH = '''"""rover_sim: the robot's DLIO pane launch with a per-agent DLIO map node name.
+
+    ros2 launch {run}/{name} namespace:=JR81 initial_pose_topic:=world two_d_only:=false
+
+Includes {robot_launch} unchanged (the pinned dlio_ws
+scripts/, mounted as on the robot), with one rcl node-specific remap in scope:
+dlio_map_node:__node:=dlio_map_node_<namespace> renames the unnamespaced dlio_map_node, and only
+it, so the agents sharing this container and graph do not share a node name. Its /save_pcd,
+/map and keyframe topic stay at the root, shared by every agent's map node.
+Generated by rover_sim scripts/sim.py; rewritten on every `up`.
+"""
+from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
+from launch.launch_description_sources import PythonLaunchDescriptionSource
+from launch.substitutions import LaunchConfiguration
+from launch_ros.actions import SetRemap
+
+ROBOT_LAUNCH = {robot_launch!r}
+ARGS = ('namespace', 'initial_pose_topic', 'two_d_only')
+
+
+def generate_launch_description():
+    return LaunchDescription(
+        [DeclareLaunchArgument(a) for a in ARGS]
+        + [SetRemap(src='dlio_map_node:__node', dst=['dlio_map_node_', LaunchConfiguration('namespace')]),
+           IncludeLaunchDescription(PythonLaunchDescriptionSource(ROBOT_LAUNCH),
+                                    launch_arguments=[(a, LaunchConfiguration(a)) for a in ARGS])])
+'''.format(run=RUN_DIR_IN, name=DLIO_LAUNCH_FILE, robot_launch=DLIO_WS + '/scripts/dlio_with_session.launch.py')
+
+
+def write_dlio_launch(session: Session, ctx: RunContext) -> None:
+    problem = dlio_scripts_problem(read_pins())
+    if problem:
+        raise SimError(problem)
+    write_file(ctx.run_dir / DLIO_LAUNCH_FILE, DLIO_SIM_LAUNCH.encode())
+
+
+# DLIO registers scans as soon as its 3 s IMU calibration ends, seed or not; a seed that lands
+# later leaves odom anchored at z 0 instead of the lidar height (odom.cc:844-853, 916). The
+# robot starts its three panes at once and its seed usually wins; here every stack's panes
+# start at once, and their gates finish seconds apart. So the DLIO pane first waits for its
+# seed pane's `ros2 topic pub` process (matched from the start of its command line, which no
+# pane's bash -c has), then SEED_LEAD_S for its first message.
+SEED_LEAD_S = 3
+
+
+def seed_wait(a: Agent) -> str:
+    return ('until pgrep -f "^[^ ]*python3 [^ ]*/ros2 topic pub -r 2 /%s/world " >/dev/null; do '
+            'echo "[rover_sim] waiting for the %s seed pose pane..."; sleep 1; done && sleep %d'
+            % (a.name, a.name, SEED_LEAD_S))
+
+
+def dlio_launch_cmd(a: Agent) -> str:
+    """dlio_host_tmux.sh pane 0 (JR02 runs two_d_only false), through the wrapper, once the
+    seed pose is being published (seed_wait)."""
+    return ('%s && ros2 launch %s namespace:=%s initial_pose_topic:=world two_d_only:=false'
+            % (seed_wait(a), run_path(DLIO_LAUNCH_FILE), a.name))
+
+
+def seed_pose_cmd(a: Agent) -> str:
+    """dlio_host_tmux.sh pane 1: DLIO holds its initialisation until a pose arrives on
+    /<ns>/world and anchors odom there, at the robot's DLIO_SEED_Z (the lidar height)."""
+    return ('ros2 topic pub -r 2 /%s/world geometry_msgs/msg/PoseStamped "{header: {frame_id: world}, '
+            'pose: {position: {z: %s}, orientation: {w: 1}}}"' % (a.name, fmt_float(ROBOT_CLASSES[a.cls].lidar_height)))
+
+
+def map_odom_tf_cmd(a: Agent) -> str:
+    """dlio_host_tmux.sh pane 2. map_odom_tf.py names its node map_odom_tf_broadcaster
+    whatever the namespace; its rclpy.init() reads sys.argv, so a __node remap renames it."""
+    return ('python3 %s/scripts/map_odom_tf.py %s --ros-args -r __node:=map_odom_tf_broadcaster_%s'
+            % (DLIO_WS, a.name, a.name))
+
+
 def dlio_panes(session: Session, ctx: RunContext) -> List[Pane]:
-    """TODO(Phase 3), sim-dlio-<class> (dlio_container). Per agent, as dlio_host_tmux.sh:
-    dlio_with_session.launch.py namespace:=<ns>, the seed pose publisher, and
-    map_odom_tf.py <ns> with per-agent node names."""
-    raise _not_yet('dlio')
+    """sim-dlio-<class> (dlio_container): per agent one window with dlio_host_tmux.sh's three
+    panes, the class's image baking its reference robot's cfg_overlay. DLIO calibrates its
+    IMU for 3 s after the first sample: safety_node holds the agent still (DISARMED) until
+    arm_agents. The kernel balances the DLIO processes within the container's cpuset."""
+    panes = []
+    for a in session.agents:
+        c = dlio_container(a)
+        panes += [Pane('%s dlio odometry' % a.name, 'dlio-' + a.name, c, dlio_launch_cmd(a), env=robot_env(a),
+                       window=a.name),
+                  Pane('%s seed pose' % a.name, 'seed-' + a.name, c, seed_pose_cmd(a), env=robot_env(a),
+                       window=a.name),
+                  Pane('%s tf map->odom' % a.name, 'map-odom-tf-' + a.name, c, map_odom_tf_cmd(a), env=robot_env(a),
+                       window=a.name)]
+    return panes
 
 
 def mapping_panes(session: Session, ctx: RunContext) -> List[Pane]:
@@ -977,12 +1239,12 @@ STACKS = OrderedDict((s.name, s) for s in (
     Stack('zenoh', 1, 'zenoh router in sim-drive', ('sim-drive',), zenoh_panes, implemented=True),
     Stack('gazebo', 2, 'Gazebo world, spawns, sensor bridges, world-><ns>/map', ('sim-gazebo',), gazebo_panes,
           implemented=True, generate=(write_agent_files,), needs_display=lambda s: s.gui),
-    # Phase 3 adds safety_node/teleop per agent.
-    Stack('drive', 2, 'rover_description per agent', ('sim-drive',), drive_panes, implemented=True,
-          generate=(write_agent_files, link_calib)),
+    Stack('drive', 2, 'teleop + safety_node and rover_description per agent', ('sim-drive',), drive_panes,
+          implemented=True, generate=(write_agent_files, link_calib, write_teleop_file)),
     Stack('frame_align', 2, 'ground-truth frame_align per ordered agent pair', ('sim-mighty',),
           frame_align_panes, implemented=True, wanted=lambda s: len(s.agents) > 1),
-    Stack('dlio', 3, 'DLIO, seed pose and map->odom per agent', ('sim-dlio-jr', 'sim-dlio-rr'), dlio_panes),
+    Stack('dlio', 3, 'DLIO, seed pose and map->odom per agent', ('sim-dlio-jr', 'sim-dlio-rr'), dlio_panes,
+          implemented=True, generate=(write_dlio_launch,)),
     Stack('mapping', 4, 'global_mapper, map_fusion, persistent_map per agent', ('sim-mapping',),
           mapping_panes),
     Stack('elevation', 4, 'GPU elevation mapping per agent', ('sim-elevation',), elevation_panes,
@@ -1079,6 +1341,7 @@ def start_stack(stack: Stack, panes: Sequence[Pane], log_dir: Path) -> str:
         ids = tmux('list-panes', '-t', target, '-F', '#{pane_id}').stdout.split()
         for pid, pane in zip(ids, wpanes):
             tmux('select-pane', '-t', pid, '-T', pane.title)
+            tmux('set-option', '-p', '-t', pid, PANE_SLUG_OPTION, pane.slug)
             # pipe-pane taps the pane at the tmux server: nodes run under docker exec, so
             # this is the only full record of their output, across restarts too.
             tmux('pipe-pane', '-o', '-t', pid, 'cat >> ' + shlex.quote(str(stack_log / (pane.slug + '.log'))))
@@ -2302,7 +2565,7 @@ def print_loadtest(summaries: Sequence[Dict[str, Any]], max_discovery: float) ->
 
 # ---------------------------------------------------------------------------- commands
 
-def print_plan(session: Session, plan: Sequence[Tuple[Stack, List[Pane]]]) -> None:
+def print_plan(session: Session, plan: Sequence[Tuple[Stack, List[Pane]]], arm: bool = False) -> None:
     print('session %s (%s): world %s (MID-360 %d rays/scan), gui %s, mapping %s, rviz %s, num_agents %d' % (
         session.name, session.source, session.world, world_lidar_samples(session.world),
         'on' if session.gui else 'off', session.mapping, 'on' if session.rviz else 'off', session.num_agents))
@@ -2314,12 +2577,26 @@ def print_plan(session: Session, plan: Sequence[Tuple[Stack, List[Pane]]]) -> No
     steps = generate_steps([stack for stack, _ in plan])
     if steps:
         print('before the panes: %s' % ', '.join(g.__name__ for g in steps))
+    if any(stack.name == 'dlio' for stack, _ in plan):
+        problem = dlio_scripts_problem(pins)
+        print('dlio_ws scripts: %s -> %s/scripts (ro)' % (dlio_scripts_dir(pins), DLIO_WS) if not problem
+              else 'WARNING: ' + problem)
     for stack, panes in plan:
         print('stack %s -> tmux session %s%s' % (stack.name, TMUX_PREFIX, stack.name))
         for wname, wpanes in tmux_windows(panes):
             print('  window %s' % wname)
             for p in wpanes:
                 print('    [%s] %s\n      %s' % (p.slug, p.title, pane_command(p)))
+    if any(stack.name == 'gazebo' for stack, _ in plan):
+        print('after the panes: wait until the spawn pane has unpaused the world (up to %d s; fails if it '
+              'fails)' % SPAWN_WAIT_S)
+    if arm:
+        print('after the panes: arm %s: /<ns>/auto_mode once its DLIO registers scans (auto_arm; '
+              '--no-arm skips)' % ', '.join(a.name for a in session.agents))
+    elif session.auto_arm:
+        print('not arming: auto_arm needs the dlio and drive stacks (or --no-arm was given)')
+    else:
+        print('not arming: auto_arm is off, so every safety_node stays DISARMED (scripts/sim.py arm)')
     pending = pending_stacks(session)
     if pending:
         print('not started yet (later phases): ' + ', '.join(pending))
@@ -2363,6 +2640,58 @@ def rotate_rtf_log(run_dir: Path) -> None:
         log.replace(log.with_name('rtf_violations.prev.log'))
 
 
+_CLEAR_ROS_LOGS_SH = 'rm -rf -- "${ROS_LOG_DIR:-${ROS_HOME:-$HOME/.ros}/log}"'
+
+
+def clear_ros_logs(names: Sequence[str]) -> None:
+    """Each node also logs to its container's ROS log dir, in the writable layer that outlives
+    `up`: sim-drive's grew 26 MB in 25 minutes of safety_nodes in AUTO with no cmd_vel_auto.
+    The pane logs have the same lines, so each run starts with an empty one."""
+    parallel(lambda n: dexec(n, ['sh', '-c', _CLEAR_ROS_LOGS_SH], check=False, timeout=30), list(names))
+
+
+# The spawn pane's last line once every agent is in the world and physics runs (spawn_cmd); the
+# command line the pane log also holds has $(date ...) where this has the time.
+SPAWNED_RE = re.compile(r'\[rover_sim\] spawned .*; physics unpaused at \d\d:\d\d:\d\d')
+SPAWN_WAIT_S = 300            # gzserver's start, then up to 125 s per stuck spawn_entity (spawn_agent.launch.py)
+SPAWN_PANE_GRACE_S = 10       # before a pane's docker exec runs, tmux reports its bash
+
+
+def spawn_pane_exited() -> bool:
+    """The spawn pane is found by its slug (start_stack's pane option), not its title: a
+    shell prompt may retitle the pane (an xterm PS1 does)."""
+    p = tmux('list-panes', '-s', '-t', '=%sgazebo' % TMUX_PREFIX, '-F',
+             '#{%s}\t#{pane_current_command}' % PANE_SLUG_OPTION, check=False)
+    rows = [l.split('\t') for l in (p.stdout or '').splitlines() if l.split('\t')[0] == 'spawn']
+    return p.returncode != 0 or not rows or rows[0][1] != 'docker'
+
+
+def wait_spawned(log_dir: Path, timeout: float = SPAWN_WAIT_S) -> float:
+    """Until the spawn pane has put every agent in the world and unpaused it. Once in 10
+    bring-ups gzserver never answered a /spawn_entity call (nor any other ROS service after
+    it): the pane then fails after spawn_agent's timeout (or the unpause call's), and this
+    says so instead of arming waiting 3 minutes for IMU data. Holding the other stacks until
+    here was tried and dropped: their start-up then lands in the first seconds of physics,
+    and in 1 of 3 runs cost an RTF violation (their ~40 processes load cores 12-15, the SMT
+    siblings of gzserver's).
+    Raises when the pane fails or takes longer than timeout; returns the seconds waited."""
+    log, t0 = log_dir / 'gazebo' / 'spawn.log', time.time()
+    while True:
+        try:
+            if SPAWNED_RE.search(log.read_text(errors='replace')):
+                return time.time() - t0
+        except FileNotFoundError:
+            pass
+        waited = time.time() - t0
+        if waited > SPAWN_PANE_GRACE_S and spawn_pane_exited():
+            raise SimError('the spawn pane failed (%s): an agent was not spawned, or physics was not unpaused; '
+                           'scripts/sim.py down, then up again' % log)
+        if waited > timeout:
+            raise SimError('the agents were not all spawned within %.0f s (%s; scripts/sim.py attach gazebo): '
+                           'scripts/sim.py down, then up again' % (timeout, log))
+        time.sleep(1)
+
+
 def cmd_up(args: argparse.Namespace) -> int:
     session = load_session(args.session)
     stacks = select_stacks(session, args.stacks)
@@ -2374,8 +2703,9 @@ def cmd_up(args: argparse.Namespace) -> int:
         problem = world_problem(session.world)
         if problem:
             warn(problem + ': gzserver will fail to load it')
+    arm = will_arm(session, stacks, args.no_arm)
     if args.dry_run:
-        print_plan(session, plan)
+        print_plan(session, plan, arm)
         return 0
     for tool in ('docker', 'tmux'):
         if shutil.which(tool) is None:
@@ -2390,6 +2720,10 @@ def cmd_up(args: argparse.Namespace) -> int:
                 else list(images))
     used = OrderedDict((k, v) for k, v in images.items() if k in services)
     check_images(used)
+    if any(c.startswith('sim-dlio-') for c in services):
+        problem = dlio_scripts_problem(read_pins())     # compose would refuse the mount
+        if problem:
+            raise SimError(problem)
     for line in image_provenance(used):
         warn(line)
 
@@ -2410,6 +2744,7 @@ def cmd_up(args: argparse.Namespace) -> int:
         grant_x_access()
     write_session_file(session, run_dir)
     rotate_rtf_log(run_dir)
+    clear_ros_logs(services)
     log_dir = make_log_dir()
     ctx = dataclasses.replace(ctx, log_dir=log_dir)
     for step in generate_steps(stacks):
@@ -2423,7 +2758,67 @@ def cmd_up(args: argparse.Namespace) -> int:
         info('not started yet (later phases): ' + ', '.join(pending))
     info('pane logs: %s' % log_dir)
     info('run dir:   %s' % run_dir)
-    return 0
+    if any(s.name == 'gazebo' for s in stacks):
+        info('every agent spawned, physics running, after %.0f s' % wait_spawned(log_dir))
+    if not arm:
+        if session.auto_arm and not args.no_arm:
+            info('not arming: the dlio and drive stacks are not both started (scripts/sim.py arm)')
+        elif not session.auto_arm:
+            info('not arming: auto_arm is off; every safety_node stays DISARMED until scripts/sim.py arm')
+        return 0
+    return arm_after_up(session, log_dir)
+
+
+def arm_after_up(session: Session, log_dir: Path) -> int:
+    """auto_arm: every agent's safety_node to AUTO once its DLIO is past the IMU calibration.
+    Isolation is checked again first: no ROS session is opened on a broken network."""
+    names = [a.name for a in session.agents]
+    problems = check_isolation()
+    if problems:
+        raise SimError('NOT ARMING: the sim is not isolated from this host:\n  - ' + '\n  - '.join(problems))
+    info('arming %s once each DLIO registers scans (auto_arm; Ctrl-C stops and disarms them; later: '
+         'scripts/sim.py arm)' % ', '.join(names))
+    try:
+        res = arm_agents(names, 'auto_mode', 'dlio', ARM_TIMEOUT_UP_S, log_dir / ARM_LOG)
+    except ArmInterrupted as e:
+        report_interrupted(e)
+        return 130
+    except KeyboardInterrupt:       # a second Ctrl-C while arm_agents was cleaning up
+        warn(ARM_STATE_UNKNOWN)
+        return 130
+    if report_arm(res, 'auto_mode'):
+        return 0
+    warn('the stacks are up, but not every agent is in AUTO: scripts/sim.py status, scripts/sim.py arm')
+    return 1
+
+
+def cmd_arm(args: argparse.Namespace) -> int:
+    """arm: /<ns>/auto_mode once DLIO tracks (--now: at once); disarm: /<ns>/disarm at once.
+    Fails closed like status: with isolation broken it opens no ROS session (exit 3)."""
+    service = ARM_SERVICES[args.cmd]
+    # The query's container must be one check_isolation inspects (the compose project's).
+    if QUERY_CONTAINER not in running_sim_containers():
+        raise SimError('%s of project %s is not running (scripts/sim.py up <session>)' % (QUERY_CONTAINER, PROJECT))
+    run_dir = resolve_run_dir()
+    names = session_agents(run_dir, args.agents)
+    problems = check_isolation()
+    if problems:
+        print('isolation: BROKEN\n  - ' + '\n  - '.join(problems))
+        print('not calling /<ns>/%s: no ROS session is opened while isolation is broken' % service)
+        return 3
+    if TMUX_PREFIX + 'drive' not in tmux_sessions():
+        warn('no %sdrive session: is safety_node running?' % TMUX_PREFIX)
+    latest = LOG_ROOT / 'latest'
+    gate = 'dlio' if service == 'auto_mode' and not args.now else 'none'
+    try:
+        res = arm_agents(names, service, gate, args.timeout, latest / ARM_LOG if latest.is_dir() else None)
+    except ArmInterrupted as e:
+        report_interrupted(e)
+        return 130
+    except KeyboardInterrupt:
+        warn(ARM_STATE_UNKNOWN)
+        return 130
+    return 0 if report_arm(res, service) else 1
 
 
 def cmd_down(args: argparse.Namespace) -> int:
@@ -2488,15 +2883,24 @@ def cmd_status(args: argparse.Namespace) -> int:
     print('run dir: %s' % run_dir)
     if (LOG_ROOT / 'latest').exists():
         print('logs:    %s' % (LOG_ROOT / 'latest').resolve())
+    stacks = {r[0][len(TMUX_PREFIX):] for r in rows} & {'gazebo', 'dlio', 'drive'}
     if problems:
         # The query opens a ROS session; `up` starts none on a broken network either.
         print('sim time: not queried (isolation BROKEN)')
-    elif s and 'sim-gazebo' in up and TMUX_PREFIX + 'gazebo' in {r[0] for r in rows}:
+    elif s and QUERY_CONTAINER in up and stacks:
         names = [a['name'] for a in s['agents']]
-        vals = sim_time_values(names, RunContext(run_dir=run_dir, gz_spare_cpus=gz_spare_from_env()))
-        print('sim time (each agent\'s livox_sim_bridge; time_offset = wall - sim):')
-        for line in sim_time_lines(names, vals):
-            print('  ' + line)
+        vals = status_values(status_specs(names, stacks))
+        if 'gazebo' in stacks:
+            print('sim time (each agent\'s livox_sim_bridge; time_offset = wall - sim):')
+            for line in sim_time_lines(names, vals):
+                print('  ' + line)
+        else:
+            print('sim time: n/a (the gazebo stack is not running)')
+        if stacks & {'dlio', 'drive'}:
+            print('agents (DLIO over %g s; safety_node mode%s):' % (
+                RATE_WINDOW_S, '' if s.get('auto_arm', False) else '; auto_arm off'))
+            for line in agent_lines(names, vals, stacks):
+                print('  ' + line)
     else:
         print('sim time: n/a (the gazebo stack is not running)')
     bad = rtf_violations(run_dir)
@@ -2511,69 +2915,137 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 3 if problems else 2 if bad else 0
 
 
-# ---------------------------------------------------------------------------- sim time status
+# ---------------------------------------------------------------------------- ROS queries: status, arm
 
 RTF_MIN = 0.95                         # the bridges log a violation below this for > 5 s
 ECHO_TIMEOUT_S = 8                     # topics are 1 Hz; rclpy itself takes 1-2 s to start
-# One rclpy session reads every agent's values, rather than a `ros2 topic echo` per topic:
-# 8 CLI sessions starting at once on the bridges' one core joined so slowly that the
-# router blocked on them (5 s per undeliverable declaration) and stalled the whole sim
-# graph for 3 minutes. SIGKILL backs up the timeout: a session stuck in its close keeps
-# the router waiting until its socket closes. Prints '@@ <topic> <value or nothing>'.
-_SIM_TIME_PY = r"""
+RATE_WINDOW_S = 3.0                    # DLIO odom (100 Hz) and scan (10 Hz) rates are taken over this
+ODOM_MAX_AGE_S = 1.0                   # an older DLIO odom stamp: no IMU is reaching DLIO
+# Both queries run in sim-drive, on the cores the non-Gazebo stacks share, not on the core of
+# sim-gazebo where the sensor bridges run: DLIO odom is 100 Hz per agent.
+QUERY_CONTAINER = ROUTER_CONTAINER
+# One rclpy session reads every value, rather than a `ros2 topic echo` per topic: 8 CLI
+# sessions starting at once on the bridges' one core joined so slowly that the router blocked
+# on them (5 s per undeliverable declaration) and stalled the whole sim graph for 3 minutes.
+# SIGKILL backs up the timeout: a session stuck in its close keeps the router waiting until
+# its socket closes. Arguments are <kind>:<topic>, and each prints one line:
+#   f64    std_msgs/Float64, first value                    '@@ <topic> <value>'
+#   str    std_msgs/String, last value                      '@@ <topic> <value>'
+#   odom   nav_msgs/Odometry: rate, last stamp's age, count  '@@ <topic> <Hz> <age s|inf> <n>'
+#   count  sensor_msgs/PointCloud2 (not deserialised): rate  '@@ <topic> <Hz> <n>'
+# or '@@ <topic>' if nothing came. It stops when every one-shot value is in and every rate
+# has RATE_WINDOW_S of samples, or at the deadline. Subscriptions are best effort, so the
+# publishers' KEEP_LAST queues never wait for this reader; safety_node's mode is
+# TRANSIENT_LOCAL but also re-published at 2 Hz, so no late-joiner delivery is needed.
+_STATUS_PY = r"""
 import sys, time
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy
-from std_msgs.msg import Float64
-end, topics = time.time() + float(sys.argv[1]), sys.argv[2:]
+from nav_msgs.msg import Odometry
+from sensor_msgs.msg import PointCloud2
+from std_msgs.msg import Float64, String
+end, window = time.time() + float(sys.argv[1]), float(sys.argv[2])
+specs = [a.split(':', 1) for a in sys.argv[3:]]
 rclpy.init(args=[])
 node = Node('sim_status_%d' % (time.time_ns() % 1000000))
-vals = {}
-qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
-subs = [node.create_subscription(Float64, t, lambda m, t=t: vals.setdefault(t, m.data), qos) for t in topics]
-while time.time() < end and len(vals) < len(topics):
-    rclpy.spin_once(node, timeout_sec=0.1)
-print(''.join('@@ %s %s\n' % (t, vals.get(t, '')) for t in topics), end='', flush=True)
+qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
+TYPES = {'f64': Float64, 'str': String, 'odom': Odometry, 'count': PointCloud2}
+times, last = {t: [] for _, t in specs}, {}
+def cb(kind, topic):
+    def f(m):
+        times[topic].append(time.time())
+        if kind == 'f64':
+            last.setdefault(topic, m.data)
+        elif kind == 'str':
+            last[topic] = m.data
+        elif kind == 'odom':
+            last[topic] = m.header.stamp.sec + m.header.stamp.nanosec * 1e-9
+    return f
+subs = [node.create_subscription(TYPES[k], t, cb(k, t), qos, raw=(k == 'count')) for k, t in specs]
+def complete():
+    return all((t in last) if k in ('f64', 'str') else (times[t] and times[t][-1] - times[t][0] >= window)
+               for k, t in specs)
+while time.time() < end and not complete():
+    rclpy.spin_once(node, timeout_sec=0.05)
+now = time.time()
+def rate(r):
+    return '%.2f' % ((len(r) - 1) / (r[-1] - r[0])) if len(r) > 1 and r[-1] > r[0] else '0'
+out = []
+for k, t in specs:
+    r = times[t]
+    if not r:
+        out.append('@@ %s' % t)
+    elif k in ('f64', 'str'):
+        out.append('@@ %s %s' % (t, last[t]))
+    elif k == 'odom':
+        out.append('@@ %s %s %.3f %d' % (t, rate(r), now - last[t] if last[t] else float('inf'), len(r)))
+    else:
+        out.append('@@ %s %s %d' % (t, rate(r), len(r)))
+print('\n'.join(out), flush=True)
 node.destroy_node()
 rclpy.try_shutdown()
 """
-_SIM_TIME_SH = 'exec timeout -k 2 %d python3 -c "$SIM_STATUS_PY" %d "$@"' % (ECHO_TIMEOUT_S + 4, ECHO_TIMEOUT_S)
+_STATUS_SH = 'exec timeout -k 2 %d python3 -c "$SIM_STATUS_PY" %d %g "$@"' % (
+    ECHO_TIMEOUT_S + 4, ECHO_TIMEOUT_S, RATE_WINDOW_S)
 
 
-def sim_time_topics(names: Sequence[str]) -> List[str]:
-    return ['/%s/sim/%s' % (n, t) for n in names for t in ('rtf', 'time_offset')]
+def odom_topic(n: str) -> str:
+    return '/%s/dlio/odom_node/odom' % n
 
 
-def parse_sim_time(out: str) -> Dict[str, Optional[float]]:
-    vals = {}  # type: Dict[str, Optional[float]]
+def scans_topic(n: str) -> str:
+    return '/%s/dlio/odom_node/pointcloud/deskewed' % n
+
+
+def status_specs(names: Sequence[str], stacks: Iterable[str]) -> List[str]:
+    """What `status` reads for the stacks that run: the bridges' sim/rtf and
+    sim/time_offset, DLIO's odom and deskewed scans, safety_node's mode."""
+    stacks = set(stacks)
+    out = []  # type: List[str]
+    for n in names:
+        if 'gazebo' in stacks:
+            out += ['f64:/%s/sim/rtf' % n, 'f64:/%s/sim/time_offset' % n]
+        if 'dlio' in stacks:
+            out += ['odom:' + odom_topic(n), 'count:' + scans_topic(n)]
+        if 'drive' in stacks:
+            out.append('str:/%s/mode' % n)
+    return out
+
+
+def parse_status(out: str) -> Dict[str, List[str]]:
+    """'@@ <topic> <fields...>' lines -> {topic: fields} ([] when nothing came)."""
+    vals = {}  # type: Dict[str, List[str]]
     for line in out.splitlines():
-        parts = line.split(None, 2)
+        parts = line.split()
         if len(parts) >= 2 and parts[0] == '@@':
-            try:
-                vals[parts[1]] = float(parts[2]) if len(parts) > 2 else None
-            except ValueError:
-                vals[parts[1]] = None
+            vals[parts[1]] = parts[2:]
     return vals
 
 
-def sim_time_values(names: Sequence[str], ctx: RunContext) -> Dict[str, Optional[float]]:
-    """One sample of each agent's sim/rtf and sim/time_offset, read in sim-gazebo off
-    gzserver's cores."""
-    inner = ' && '.join([setup_snippet(CONTAINERS['sim-gazebo']), pin_self('rest', ctx) + ' >/dev/null', _SIM_TIME_SH])
+def _num(vals: Dict[str, List[str]], topic: str, i: int = 0) -> Optional[float]:
     try:
-        p = dexec('sim-gazebo', ['bash', '-c', inner, 'status'] + sim_time_topics(names), check=False,
-                  timeout=ECHO_TIMEOUT_S + 20, env=(('SIM_STATUS_PY', _SIM_TIME_PY),))
+        return float(vals[topic][i])
+    except (KeyError, IndexError, ValueError):
+        return None
+
+
+def status_values(specs: Sequence[str]) -> Dict[str, List[str]]:
+    """One sample of every spec (status_specs), read by one rclpy process in sim-drive."""
+    inner = ' && '.join([setup_snippet(CONTAINERS[QUERY_CONTAINER]), _STATUS_SH])
+    try:
+        p = dexec(QUERY_CONTAINER, ['bash', '-c', inner, 'status'] + list(specs), check=False,
+                  timeout=ECHO_TIMEOUT_S + 20, env=(('SIM_STATUS_PY', _STATUS_PY),))
     except SimError as e:           # a hung query must not hide the violation check after it
-        warn('sim time query: %s' % e)
+        warn('status query: %s' % e)
         return {}
-    return parse_sim_time(p.stdout or '')
+    return parse_status(p.stdout or '')
 
 
-def sim_time_lines(names: Sequence[str], vals: Dict[str, Optional[float]]) -> List[str]:
+def sim_time_lines(names: Sequence[str], vals: Dict[str, List[str]]) -> List[str]:
     out = []
     for n in names:
-        rtf, off = vals.get('/%s/sim/rtf' % n), vals.get('/%s/sim/time_offset' % n)
+        rtf, off = _num(vals, '/%s/sim/rtf' % n), _num(vals, '/%s/sim/time_offset' % n)
         if rtf is None and off is None:
             out.append('%s  no sim/rtf or sim/time_offset in %d s (is livox_sim_bridge_%s running? '
                        'scripts/sim.py attach gazebo)' % (n, ECHO_TIMEOUT_S, n))
@@ -2582,6 +3054,315 @@ def sim_time_lines(names: Sequence[str], vals: Dict[str, Optional[float]]) -> Li
             n, '-' if rtf is None else '%.3f' % rtf, '  LOW' if rtf is not None and rtf < RTF_MIN else '',
             '-' if off is None else '%.3f s' % off))
     return out
+
+
+def agent_lines(names: Sequence[str], vals: Dict[str, List[str]], stacks: Iterable[str]) -> List[str]:
+    """Per agent: DLIO's odom rate and stamp age, its scan rate, safety_node's mode. DLIO
+    publishes odom from a 100 Hz timer from the start, stamped with the last IMU sample's
+    time (0 before the first one); deskewed scans only come once its IMU calibration is done
+    and it registers scans."""
+    stacks = set(stacks)
+    out = []
+    for n in names:
+        parts = []
+        if 'dlio' in stacks:
+            hz, age = _num(vals, odom_topic(n)), _num(vals, odom_topic(n), 1)
+            if hz is None:
+                parts.append('DLIO odom: none in %d s (scripts/sim.py attach dlio)' % ECHO_TIMEOUT_S)
+            elif age is None or math.isinf(age):
+                parts.append('DLIO odom %.0f Hz, unstamped: no IMU has reached DLIO' % hz)
+            else:
+                parts.append('DLIO odom %.0f Hz, stamp age %.3f s%s' % (hz, age, '  STALE' if age > ODOM_MAX_AGE_S else ''))
+            scans = _num(vals, scans_topic(n))
+            parts.append('scans %.1f Hz' % scans if scans else 'no scans (IMU calibration, seed pose or lidar)')
+        if 'drive' in stacks:
+            mode = (vals.get('/%s/mode' % n) or [None])[0]
+            parts.append('safety %s' % mode if mode else 'safety: no /%s/mode (scripts/sim.py attach drive)' % n)
+        out.append('%s  %s' % (n, ',  '.join(parts)))
+    return out
+
+
+# Arming. One rclpy process for every agent, in sim-drive next to the safety_nodes. For
+# auto_mode it waits, per agent, until DLIO is past its IMU calibration (fresh odom stamps
+# and at least one deskewed scan: DLIO registers scans only once calibrated), its odom sits
+# at the seed height (DLIO registers scans seeded or not, odom.cc:913-916, and a seed that
+# came too late leaves odom at z 0) and safety_node reports its mode; an agent already in
+# AUTO is left alone. Then it calls the Trigger and waits for safety_node to report the new
+# mode. disarm calls at once. A call with no answer is repeated: both services are
+# idempotent. Prints '[arm] ...' progress and one '@@ <ns> ok|refused|timeout mode=<mode>
+# <message>' per agent. The marker in the first line lets `stop_processes(match=...)` find
+# it: a killed docker exec client leaves its process running in the container.
+ARM_MARKER = 'rover_sim arm query'
+_ARM_PY = r"""# rover_sim arm query
+import sys, time
+import rclpy
+from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy
+from nav_msgs.msg import Odometry
+from sensor_msgs.msg import PointCloud2
+from std_msgs.msg import String
+from std_srvs.srv import Trigger
+service, gate, max_age, z_tol = sys.argv[1], sys.argv[2], float(sys.argv[4]), float(sys.argv[5])
+end = time.time() + float(sys.argv[3])
+height = dict((n, float(h)) for n, h in (a.split('=', 1) for a in sys.argv[6:]))
+names = list(height)
+WANT = {'auto_mode': 'AUTO', 'disarm': 'DISARMED'}[service]
+CALL_S, CONFIRM_S, REPORT_S = 5.0, 2.0, 15.0
+rclpy.init(args=[])
+node = Node('sim_arm_%d' % (time.time_ns() % 1000000))
+qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
+st = {}
+def setter(s, key, fn):
+    def cb(m):
+        s[key] = fn(s, m)
+    return cb
+for n in names:
+    s = st[n] = {'mode': None, 'odom': None, 'scans': 0, 'call': None, 'sent': 0.0, 'answer': None, 'why': 'starting'}
+    node.create_subscription(String, '/%s/mode' % n, setter(s, 'mode', lambda s, m: m.data), qos)
+    if gate == 'dlio':
+        node.create_subscription(Odometry, '/%s/dlio/odom_node/odom' % n, setter(
+            s, 'odom', lambda s, m: (m.header.stamp.sec + m.header.stamp.nanosec * 1e-9, m.pose.pose.position.z)), qos)
+        node.create_subscription(PointCloud2, '/%s/dlio/odom_node/pointcloud/deskewed' % n, setter(
+            s, 'scans', lambda s, m: s['scans'] + 1), qos, raw=True)
+    s['client'] = node.create_client(Trigger, '/%s/%s' % (n, service))
+def blocker(n, s, now):
+    if gate == 'dlio':
+        if s['odom'] is None:
+            return 'no /%s/dlio/odom_node/odom yet (DLIO not running?)' % n
+        stamp, z = s['odom']
+        if not stamp:
+            return 'DLIO odom unstamped: no IMU has reached DLIO yet'
+        if now - stamp > max_age:
+            return 'DLIO odom stamp %.1f s old: no IMU is reaching DLIO' % (now - stamp)
+        if not s['scans']:
+            return 'DLIO registers no scans yet (IMU calibration, seed pose or lidar)'
+        if abs(z - height[n]) > z_tol:
+            return ('DLIO odom z %.2f, expected %.2f: the seed pose came too late; restart its dlio pane '
+                    '(scripts/sim.py attach dlio: Ctrl-C, Up, Enter)' % (z, height[n]))
+    if service == 'auto_mode' and s['mode'] is None:
+        return 'no /%s/mode yet (safety_node not running?)' % n
+    if not s['client'].service_is_ready():
+        return '/%s/%s is not available yet' % (n, service)
+    return None
+pending, last_report = list(names), time.time()
+print('[arm] %s: /<ns>/%s%s, for up to %.0f s' % (' '.join(names), service,
+      ' once DLIO registers scans' if gate == 'dlio' else '', end - time.time()), flush=True)
+while pending and time.time() < end:
+    rclpy.spin_once(node, timeout_sec=0.05)
+    now = time.time()
+    for n in list(pending):
+        s = st[n]
+        if s['answer'] is not None:
+            ok, msg, t = s['answer']
+            if s['mode'] == WANT or now - t > CONFIRM_S:
+                print('@@ %s %s mode=%s %s' % (n, 'ok' if ok else 'refused', s['mode'], msg), flush=True)
+                pending.remove(n)
+        elif s['call'] is not None:
+            if s['call'].done():
+                r = s['call'].result()
+                s['answer'], s['mode'] = (r.success, r.message, now), None
+            elif now - s['sent'] > CALL_S:
+                s['call'] = None
+        elif service == 'auto_mode' and s['mode'] == 'AUTO':
+            print('@@ %s ok mode=AUTO already in AUTO: not called' % n, flush=True)
+            pending.remove(n)
+        else:
+            s['why'] = blocker(n, s, now)
+            if s['why'] is None:
+                s['call'], s['sent'] = s['client'].call_async(Trigger.Request()), now
+    if pending and now - last_report >= REPORT_S:
+        last_report = now
+        for n in pending:
+            print('[arm] %s: waiting: %s' % (n, st[n]['why'] or 'for the answer'), flush=True)
+for n in pending:
+    print('@@ %s timeout mode=%s %s' % (n, st[n]['mode'], st[n]['why'] or 'no answer'), flush=True)
+node.destroy_node()
+rclpy.try_shutdown()
+"""
+ARM_SERVICES = OrderedDict([('arm', 'auto_mode'), ('disarm', 'disarm')])   # CLI verb -> Trigger
+ARM_ENV = (('SIM_ARM_PY', _ARM_PY), ('RUST_LOG', 'zenoh=error'))
+ARM_TIMEOUT_UP_S = 180       # up's wait: gzserver, spawns, DLIO's start and its 3 s IMU calibration
+ARM_TIMEOUT_S = 60           # `sim.py arm`'s
+ARM_UNDO_S = 30              # the disarm after a Ctrl-C (ArmInterrupted)
+# Seeded odom sits at the lidar height (measured 0.359-0.361 JR, 0.398-0.403 RR); a missed seed
+# leaves it at 0. The worlds are flat, so a drive does not move it far either.
+ARM_Z_TOL_M = 0.1
+
+
+class ArmResult(NamedTuple):
+    name: str
+    status: str              # ok | refused | timeout | lost
+    mode: str                # safety_node's mode afterwards, as it reported it
+    message: str
+
+
+ALREADY_AUTO = 'already in AUTO: not called'
+ARM_STATE_UNKNOWN = 'interrupted: safety_node modes unknown (scripts/sim.py status; scripts/sim.py disarm)'
+
+
+class ArmInterrupted(KeyboardInterrupt):
+    """Ctrl-C during an arm query (arm_agents): what it had reported, and for auto_mode the
+    disarm that undid it (None when that was interrupted too)."""
+
+    def __init__(self, service: str, names: Sequence[str], seen: Dict[str, ArmResult],
+                 undo: Optional[Dict[str, ArmResult]]):
+        super().__init__()
+        self.service, self.names, self.seen, self.undo = service, list(names), seen, undo
+
+
+def parse_arm(out: str) -> Dict[str, ArmResult]:
+    res = OrderedDict()  # type: Dict[str, ArmResult]
+    for line in out.splitlines():
+        parts = line.split(None, 4)
+        if len(parts) >= 4 and parts[0] == '@@' and parts[3].startswith('mode='):
+            res[parts[1]] = ArmResult(parts[1], parts[2], parts[3][len('mode='):], parts[4] if len(parts) > 4 else '')
+    return res
+
+
+def lidar_height_of(name: str) -> float:
+    """The seed height of an agent, from its class prefix (validate_session checked it)."""
+    return next(ROBOT_CLASSES[c].lidar_height for c, p in CLASS_PREFIXES.items() if name.startswith(p))
+
+
+def arm_args(service: str, gate: str, timeout: float, names: Sequence[str]) -> List[str]:
+    """docker exec arguments of the arm query in sim-drive (the script itself goes in $SIM_ARM_PY):
+    each agent as <ns>=<seed height>."""
+    run = 'exec timeout -k 2 %d python3 -c "$SIM_ARM_PY" "$@"' % (int(timeout) + 6)
+    return (['bash', '-c', ' && '.join([setup_snippet(CONTAINERS[QUERY_CONTAINER]), run]), 'arm', service, gate,
+             '%g' % timeout, '%g' % ODOM_MAX_AGE_S, '%g' % ARM_Z_TOL_M]
+            + ['%s=%s' % (n, fmt_float(lidar_height_of(n))) for n in names])
+
+
+def dexec_lines(name: str, args: Sequence[str], timeout: float, env: Sequence[Tuple[str, str]],
+                on_line: Callable[[str], None]) -> int:
+    """docker exec, handing each output line (stdout and stderr) to on_line as it comes;
+    the client is killed after timeout. Returns the exit code."""
+    cmd = ['docker', 'exec']
+    for k, v in env:
+        cmd += ['-e', '%s=%s' % (k, v)]
+    with subprocess.Popen(cmd + [sim_only(name)] + list(args), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                          universal_newlines=True) as p:
+        timer = threading.Timer(timeout, p.kill)
+        timer.start()
+        try:
+            for line in p.stdout:
+                on_line(line.rstrip('\n'))
+            return p.wait()
+        finally:
+            timer.cancel()
+            if p.poll() is None:
+                p.kill()
+
+
+def log_line(path: Optional[Path], text: str) -> None:
+    if path is None:
+        return
+    try:
+        with open(str(path), 'a') as f:
+            f.write('%s %s\n' % (time.strftime('%Y-%m-%dT%H:%M:%S'), text))
+    except OSError as e:
+        warn('cannot log to %s: %s' % (path, e))
+
+
+def arm_agents(names: Sequence[str], service: str, gate: str, timeout: float,
+               log: Optional[Path] = None) -> Dict[str, ArmResult]:
+    """Calls /<ns>/<service> (std_srvs/Trigger) for each agent through the arm query; with
+    gate 'dlio', each once its DLIO is past the IMU calibration. The caller has checked
+    isolation. Every line goes to log. Ctrl-C stops the query inside the container too and
+    raises ArmInterrupted. An auto_mode query fails closed: it may have armed agents by then,
+    including some whose answer never reached this client (Ctrl-C ends the docker exec client
+    at once, the query only when stop_processes gets to it), so every agent it did not find
+    in AUTO already is disarmed again."""
+    lines = []  # type: List[str]
+
+    def on_line(line: str) -> None:
+        lines.append(line)
+        log_line(log, line)
+        if not line.startswith('@@ '):
+            info(line[len('[arm] '):] if line.startswith('[arm] ') else '  ' + line)
+
+    log_line(log, 'arm query: %s %s, gate %s, timeout %g s' % (service, ' '.join(names), gate, timeout))
+    try:
+        # Its stderr is shown (a traceback matters); zenoh's own start-up warnings are not.
+        rc = dexec_lines(QUERY_CONTAINER, arm_args(service, gate, timeout, names), timeout + 20,
+                         ARM_ENV, on_line)
+    except KeyboardInterrupt:
+        stop_processes(QUERY_CONTAINER, match=ARM_MARKER, grace_int=2, grace_term=2)
+        log_line(log, 'interrupted: the arm query was stopped')
+        seen = parse_arm('\n'.join(lines))
+        undo = None  # type: Optional[Dict[str, ArmResult]]
+        if service == 'auto_mode':
+            back = [n for n in names if n not in seen or seen[n].message != ALREADY_AUTO]
+            undo = OrderedDict()
+            if back:
+                info('interrupted: disarming %s again (the query may have armed them; Ctrl-C again to skip)'
+                     % ', '.join(back))
+                try:
+                    undo = arm_agents(back, 'disarm', 'none', ARM_UNDO_S, log)
+                except ArmInterrupted:
+                    undo = None
+        raise ArmInterrupted(service, names, seen, undo)
+    got = parse_arm('\n'.join(lines))
+    res = OrderedDict((n, got.get(n) or ArmResult(n, 'lost', '?', 'no result from the arm query (exit %d)' % rc))
+                      for n in names)
+    for r in res.values():
+        log_line(log, '%s: %s, mode %s: %s' % (r.name, r.status, r.mode, r.message))
+    return res
+
+
+def report_arm(res: Dict[str, ArmResult], service: str) -> bool:
+    """Prints one line per agent; True when every call took (or was not needed)."""
+    want = {'auto_mode': 'AUTO', 'disarm': 'DISARMED'}[service]
+    good = True
+    for r in res.values():
+        ok = r.status == 'ok' and r.mode == want
+        good = good and ok
+        (info if ok else warn)('%s %s: %s (safety_node mode %s)%s' % (
+            service, r.name, r.status, r.mode, ': ' + r.message if r.message else ''))
+    return good
+
+
+def report_interrupted(e: ArmInterrupted) -> None:
+    """What a Ctrl-C left each agent in, as far as the queries saw."""
+    if e.service == 'disarm':
+        done = [n for n in e.names if n in e.seen and e.seen[n].status == 'ok' and e.seen[n].mode == 'DISARMED']
+        rest = [n for n in e.names if n not in done]
+        warn('disarm interrupted: DISARMED %s; not confirmed: %s (scripts/sim.py status)'
+             % (', '.join(done) or 'none', ', '.join(rest) or 'none'))
+        return
+    kept = [n for n in e.names if n in e.seen and e.seen[n].message == ALREADY_AUTO]
+    kept_note = '; %s was already in AUTO and stays so' % ', '.join(kept) if kept else ''
+    if e.undo is None:
+        warn('arming interrupted, and so was the disarm that undoes it: %s may be in AUTO '
+             '(scripts/sim.py status; scripts/sim.py disarm)' % ', '.join(n for n in e.names if n not in kept))
+        return
+    bad = [n for n, r in e.undo.items() if not (r.status == 'ok' and r.mode == 'DISARMED')]
+    if bad:
+        warn('arming interrupted: %s did not confirm DISARMED and may be in AUTO: scripts/sim.py disarm %s%s'
+             % (', '.join(bad), ' '.join(bad), kept_note))
+    else:
+        warn('arming interrupted: %s DISARMED%s (scripts/sim.py arm)' % (', '.join(e.undo) or 'nothing', kept_note))
+
+
+def will_arm(session: Session, stacks: Sequence['Stack'], no_arm: bool = False) -> bool:
+    """`up` arms when the session asks for it and starts both the agents' DLIO and their
+    safety_nodes."""
+    return session.auto_arm and not no_arm and {'dlio', 'drive'} <= {s.name for s in stacks}
+
+
+def session_agents(run_dir: Path, requested: Sequence[str] = ()) -> List[str]:
+    """The running session's agents (<run>/session.json), or the requested ones, which must
+    be among them: these commands never call a service of a name the sim did not start."""
+    sf = run_dir / 'session.json'
+    try:
+        s = json.loads(sf.read_text())
+        names = [a['name'] for a in s['agents']]
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        raise SimError('no running session (%s: %s): scripts/sim.py up <session>' % (sf, e))
+    bad = [n for n in requested if n not in names]
+    if bad:
+        raise SimError('%s: not an agent of session %s (agents: %s)' % (', '.join(bad), s.get('name'), ', '.join(names)))
+    return [n for n in names if n in requested] if requested else names
 
 
 def rtf_violations(run_dir: Path) -> List[str]:
@@ -2612,6 +3393,10 @@ def cmd_loadtest(args: argparse.Namespace) -> int:
     images = compose_images(profiles, run_dir)
     # Test whatever stacks are built; only the router's image is required.
     have = [s for s, img in images.items() if docker_inspect('image', img) is not None]
+    problem = dlio_scripts_problem(read_pins())
+    if problem and any(s.startswith('sim-dlio-') for s in have):
+        warn(problem + ': testing without the DLIO containers')
+        have = [s for s in have if not s.startswith('sim-dlio-')]
     if ROUTER_CONTAINER not in have:
         check_images(images)
     if len(have) < len(images):
@@ -2691,12 +3476,21 @@ def build_parser() -> argparse.ArgumentParser:
     up.add_argument('session', help='config/sessions/<name>.yaml, or a path')
     up.add_argument('--stacks', type=_csv, help='comma-separated subset of the stacks (default: all ready)')
     up.add_argument('--partial', action='store_true', help='start only the containers those stacks use')
+    up.add_argument('--no-arm', action='store_true', help='leave every safety_node DISARMED (auto_arm off)')
     up.add_argument('--dry-run', action='store_true', help='print the panes and commands; touch nothing')
     down = sub.add_parser('down', help='stop every node and close the rsim-* tmux sessions')
     down.add_argument('--containers', action='store_true', help='also remove the containers and network')
     att = sub.add_parser('attach', help='attach to rsim-<stack>')
     att.add_argument('stack', nargs='?', choices=list(STACKS))
-    sub.add_parser('status', help='containers, isolation, router links, panes')
+    sub.add_parser('status', help='containers, isolation, router links, panes, sim time, DLIO, safety modes')
+    for verb, what in (('arm', 'put safety_nodes in AUTO (/<ns>/auto_mode) once their DLIO tracks'),
+                       ('disarm', 'put safety_nodes in DISARMED (/<ns>/disarm)')):
+        a = sub.add_parser(verb, help=what)
+        a.add_argument('agents', nargs='*', metavar='ns', help='agents of the running session (default: all)')
+        a.add_argument('--timeout', type=float, default=ARM_TIMEOUT_S, help='seconds (default %d)' % ARM_TIMEOUT_S)
+        if verb == 'arm':
+            a.add_argument('--now', action='store_true',
+                           help='do not wait for DLIO (the agent may then move during its IMU calibration)')
     lt = sub.add_parser('loadtest', help='zenoh discovery and link-count test with dummy agents')
     lt.add_argument('--agents', type=int, default=4, help='dummy agents JR81, RR82, ... (default 4)')
     lt.add_argument('--session', help='take the agents from this session instead')
@@ -2728,8 +3522,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if argv and argv[0] == 'compose':
             return cmd_compose(argv[1:])
         args = build_parser().parse_args(argv)
-        return {'up': cmd_up, 'down': cmd_down, 'attach': cmd_attach, 'status': cmd_status,
-                'loadtest': cmd_loadtest, 'cpus': cmd_cpus}[args.cmd](args)
+        return {'up': cmd_up, 'down': cmd_down, 'attach': cmd_attach, 'status': cmd_status, 'arm': cmd_arm,
+                'disarm': cmd_arm, 'loadtest': cmd_loadtest, 'cpus': cmd_cpus}[args.cmd](args)
     except SimError as e:
         print('[sim] ERROR: %s' % e, file=sys.stderr)
         return 1

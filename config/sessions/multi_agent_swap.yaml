@@ -1,5 +1,6 @@
 # Position swap: two P3-DX (JR) and two P3-AT (RR) on a circle of 8 m diameter in the
-# empty world, each facing the centre, each sent to the start of the agent opposite it.
+# arena (the empty world walled in: DLIO drifts on a bare floor), each facing the centre,
+# each sent to the start of the agent opposite it.
 # All four paths cross at the centre and the opposite pairs are cross-class, so this
 # exercises mighty's multi-agent avoidance over /trajs with ground-truth frame_align.
 #
@@ -7,7 +8,7 @@
 #
 # Poses are [x m, y m, yaw deg] in the world frame; goals [x, y] likewise.
 name: multi_agent_swap
-world: empty
+world: arena
 gui: false
 mapping: gpu
 rviz: false

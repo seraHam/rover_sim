@@ -76,8 +76,9 @@ def spawn(context):
     spawner = Node(
         package='gazebo_ros', executable='spawn_entity.py', name='spawn_entity', namespace=ns,
         output='screen',
-        # spawn_entity.py waits on the service's reply without a timeout of its own.
-        prefix='timeout 120',
+        # spawn_entity.py waits on the service's reply without a timeout of its own, and a
+        # SIGTERM'd rclpy process can hang in its shutdown: -k SIGKILLs it, so the pane fails.
+        prefix='timeout -k 5 120',
         parameters=[{'use_sim_time': False}],
         arguments=['-file', urdf_file, '-entity', ns, '-timeout', '60',
                    '-x', repr(x), '-y', repr(y), '-z', repr(SPAWN_Z), '-Y', repr(yaw)])
