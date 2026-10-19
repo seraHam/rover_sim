@@ -46,6 +46,31 @@ x-sim-volumes:
     target: /home/swarm/code/dlio_ws/scripts
     read_only: true
     bind: {create_host_path: false}
+  # The mapping configs, as on the robot: its mapping_ws compose bind-mounts the pinned checkout's
+  # config/mapping at /mapping_config. Here that is build_images.sh's checkout of MAPPING_SHA,
+  # read-only and never created when missing (sim.py: run scripts/build_images.sh mapping).
+  # rover_sim's own fallback overlays are config/mapping/ in this repo (/rover_sim/config).
+  - &vol-mapping-config
+    type: bind
+    source: ../.cache/src/mapping_ws@${MAPPING_SHA:?set in docker/stacks.env; pass --env-file docker/stacks.env}/config/mapping
+    target: /mapping_config
+    read_only: true
+    bind: {create_host_path: false}
+  # The Orin's elevation overlays and latched-delivery probe, where mapping_ws
+  # tools/install_orin.sh installs them (local_mapper_host_tmux.sh LM_OVERLAY_DIR and
+  # LM_ZENOH_READY), from the same checkout.
+  - &vol-elevation-overlays
+    type: bind
+    source: ../.cache/src/mapping_ws@${MAPPING_SHA:?set in docker/stacks.env; pass --env-file docker/stacks.env}/config/elevation
+    target: /usr/local/share/rover/elevation
+    read_only: true
+    bind: {create_host_path: false}
+  - &vol-orin-probe
+    type: bind
+    source: ../.cache/src/mapping_ws@${MAPPING_SHA:?set in docker/stacks.env; pass --env-file docker/stacks.env}/scripts/wait_zenoh_ready.py
+    target: /usr/local/lib/rover/wait_zenoh_ready.py
+    read_only: true
+    bind: {create_host_path: false}
 
 # CPU budget: each service's cpuset comes from sim.py (cpu_budget: cores 0-1 left to the
 # host and the fleet C2 stack, sim-gazebo's cores for it alone, the rest shared), or from
@@ -129,6 +154,7 @@ services:
     container_name: sim-mapping
     hostname: sim-mapping
     cpuset: ${ROVER_SIM_CPUSET_MAPPING:-}
+    volumes: [*vol-zenoh, *vol-scripts, *vol-config, *vol-run, *vol-mapping-config]
 
   # GPU elevation mapping (the robot runs it on its Orin). Behind the `gpu` profile so a
   # host without a GPU can still run `mapping: fallback` sessions: sim.py enables the
@@ -140,6 +166,7 @@ services:
     container_name: sim-elevation
     hostname: sim-elevation
     cpuset: ${ROVER_SIM_CPUSET_ELEVATION:-}
+    volumes: [*vol-zenoh, *vol-scripts, *vol-config, *vol-run, *vol-elevation-overlays, *vol-orin-probe]
     deploy:
       resources:
         reservations:

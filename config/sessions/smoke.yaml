@@ -1,9 +1,10 @@
 # Smoke session: the smallest two-class sim. One P3-DX (JR, calibrated from JR02) and
 # one P3-AT (RR, from RR08) face each other 4 m apart in the arena (the empty world walled
-# in: DLIO drifts on a bare floor), with the no-GPU fallback mapping and no RViz. Phases 2-3
-# bring up the router, Gazebo (spawns, sensor bridges, world-><ns>/map), each agent's DLIO,
-# teleop + safety_node (DISARMED until scripts/sim.py arm) and rover_description, and
-# frame_align; later phases add mapping and the planner.
+# in: DLIO drifts on a bare floor), with the no-GPU fallback mapping (NOT PARITY: global_mapper
+# on a sim config and scripts/grid_relay.py in place of the elevation mapper and map_fusion) and
+# no RViz. Phases 2-4 bring up the router, Gazebo (spawns, sensor bridges, world-><ns>/map),
+# each agent's DLIO, teleop + safety_node (DISARMED until scripts/sim.py arm) and
+# rover_description, frame_align, and the mapping stack; Phase 5 adds the planner.
 #
 #   scripts/sim.py up smoke        (make session S=smoke)
 #

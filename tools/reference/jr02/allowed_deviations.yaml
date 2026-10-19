@@ -28,7 +28,9 @@ all:
         each pane passes num_agents:=<highest agent id in the session>; JR02 runs the launch
         default 10, and a vehicle overlay cannot raise it (onboard_mighty.launch.py:181-185 vs :200)
     persistent_map_node:
-      save_dir: sim runs save_dir:=none; JR02 saves under /var/lib/rover/persistent_map/JR02
+      save_dir: >-
+        sim runs save_dir:=none (memory only), so no run resumes or adds to another's map; JR02
+        saves under /var/lib/rover/persistent_map/JR02
       corrected_path_topic: >-
         JR02-only MAD-SLAM block at the end of persistent_map.yaml (/madslam/estimate/robot_2,
         which had 0 publishers on JR02); sim agents get the '' default
@@ -73,25 +75,21 @@ all:
       mighty_node subscribes /frame_align/<ns>/<prefix><id> for ids 1..num_agents
       (mighty_node.cpp:199-216), so the list follows the session's num_agents
 
-class:
-  rr:
-    params:
-      map_fusion_node:
-        semseg_occ_topic: >-
-          no Orin terrain_projection water layer in the sim: '' instead of the red rovers'
-          semseg/occ_2d_topic
+# class: no entries. RR map_fusion runs map_fusion_red_rover.yaml unchanged: the sim has no
+# semantic segmentation, and with nothing on that input it fused without the layer (Phase 4 runs).
 
 mapping:
   fallback:
     # mapping: fallback is labelled "not parity": no GPU, so no elevation mapper and no
-    # map_fusion; global_mapper publishes the planner grids through a relay.
+    # map_fusion. global_mapper runs the robot's file plus config/mapping/
+    # global_mapper_fallback_<class>.yaml, and scripts/grid_relay.py publishes its grids as
+    # map_fusion's outputs (occ_2d_topic, live/occ_2d_topic, esdf_2d_topic), so
+    # persistent_map_node runs the robot's parameters unchanged.
     params:
       global_mapper_ros:
-        "*": fallback runs config/mapping/global_mapper_fallback_<class>.yaml (z_ground, esdf_enabled, truncation)
-      persistent_map_node:
-        window_topic: fallback overlay window_topic:=voxel/occ_2d_topic (no map_fusion contract output)
-      goal_selector:
-        exploration.persistent_map.enabled: fallback may turn the persistent map input off
+        z_ground: fallback 0.15, the floor band out of the 2D grid, which is the planner's here
+        distance_grid_2d.agent_height: fallback 0.55 (JR) / 0.90 (RR), the top of the projected band
+        distance_grid_2d.esdf_enabled: fallback true, the planner's ESDF (map_fusion makes it on the robot)
       mighty_node:
         plan_to_terminal_goal: fallback has no composite map to plan the terminal goal on
         max_window_m: fallback has no composite map window

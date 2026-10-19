@@ -11,6 +11,10 @@
 # auto_arm: the drives go through cmd_vel_auto, so every safety_node is put in AUTO once its
 # DLIO tracks.
 #
+# mapping: fallback, so the drives run with the mapping stack's load too (Phase 4: global_mapper,
+# grid_relay.py and persistent_map per agent; ATE unchanged from Phase 3). For odometry
+# alone, scripts/sim.py up odom_eval --stacks zenoh,gazebo,drive,frame_align,dlio.
+#
 # Poses are [x m, y m, yaw deg] in the world frame; goals [x, y] likewise.
 name: odom_eval
 world: arena
