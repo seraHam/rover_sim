@@ -605,7 +605,7 @@ class Isolation(unittest.TestCase):
         for src in ('/var/run/docker.sock', '/run/docker.sock', '/run/docker', '/var/run/docker/',
                     '/run/containerd/containerd.sock', '/home/u/.docker/run/docker.sock', '/', '/run', '/var/run'):
             self.assertTrue(sim.docker_socket_mount(src), src)
-        for src in ('/tmp/.X11-unix', '/home/blakete/repos/rover_sim/scripts', '../config', '/tmp/rover_sim-1/run'):
+        for src in ('/tmp/.X11-unix', '/home/user/rover_sim/scripts', '../config', '/tmp/rover_sim-1/run'):
             self.assertFalse(sim.docker_socket_mount(src), src)
 
     def test_ipv6_addresses(self):

@@ -16,7 +16,7 @@
 // --variant all` measures this against client mode, a loopback mesh per container,
 // and a full mesh over the container interfaces.
 //
-// Measured 2026-10-18 on alienware-02, 4 agents = 80 sessions in 7 containers
+// Measured 2026-10-18 on a 20-core dev host, 4 agents = 80 sessions in 7 containers
 // (loadtest --agents 4 --variant all, each variant started on an idle router;
 // discovery = all 80 hear every expected publisher):
 //   this file    2.9 s,   80 TCP links (all to the router),  delivery 1.01
