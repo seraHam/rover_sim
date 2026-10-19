@@ -12,11 +12,13 @@ Enter in a pane restarts that one node.
   scripts/sim.py status
   scripts/sim.py loadtest [--agents N] [--variant V|all ...]
   scripts/sim.py compose <docker compose args...>
+  scripts/sim.py cpus gz|rest            (inside sim-gazebo: its panes' CPU split)
 
 <session> is config/sessions/<name>.yaml, or a path to one:
 
   name: smoke
-  world: empty                  # Gazebo world
+  world: empty                  # src/rover_sim/worlds/<world>.world
+  gui: false                    # gzclient on $DISPLAY
   mapping: fallback             # gpu (parity) | fallback (no GPU, "not parity")
   rviz: false
   agents:                       # pose: world frame, [x m, y m, yaw deg]
@@ -24,21 +26,29 @@ Enter in a pane restarts that one node.
     - {name: RR83, class: rr, pose: [2.0, 0.0, 180.0]}
 
 Agent names are a class prefix (JR, RR) plus two digits. The digits must be unique
-across classes: mighty takes its agent id from them.
+across classes: mighty takes its agent id from them. Each class is calibrated from one
+real robot, the one its DLIO image is built for (docker/stacks.env DLIO_<CLASS>_ROBOT).
 
 Stacks are a registry (STACKS below). Each names its containers and builds its panes
-from the session. Phase 1 runs only `zenoh`, the router in sim-drive. The others are
-placeholders that later phases fill in.
+from the session. Phases 1-2 run `zenoh` (the router in sim-drive), `gazebo` (world,
+spawns, sensor bridges, world-><ns>/map), `drive` (rover_description per agent) and
+`frame_align` (ground-truth alignment for mighty). The others are placeholders that
+later phases fill in.
 
 Per-run generated files go to $ROVER_SIM_RUN (default /tmp/rover_sim-<uid>/run), which
 is mounted at /rover_sim/run in every container. It must be yours and writable by no one
 else: the containers run as root and write, chown and execute files there. Pane logs go
 to ~/.local/state/rover_sim/logs/<timestamp>/<stack>/<pane>.log.
 
+`status` exits 2 when a sensor bridge logged an RTF violation (real-time factor below
+0.95 for over 5 s) during the current run: such a run is invalid. It exits 3 when the
+isolation check fails, and then opens no ROS session to read the bridges' values.
+
 Host needs: python3 >= 3.8 with PyYAML, tmux, the docker CLI with compose v2.
 """
 
 import argparse
+import base64
 import copy
 import dataclasses
 import ipaddress
@@ -88,6 +98,16 @@ FLEET_PORTS = (7447,)                # host listeners the sim must never reach (
 RUN_DIR_DEFAULT = '/tmp/rover_sim-%d/run' % os.getuid()
 RUN_DIR_IN = '/rover_sim/run'        # the run dir inside every container
 SESSION_URI_IN = '/rover_sim/zenoh/session.json5'
+SCRIPTS_IN = '/rover_sim/scripts'    # this repo's scripts/ inside every container
+WORLDS_DIR = REPO / 'src' / 'rover_sim' / 'worlds'
+WORLD_BUDGETS = REPO / 'src' / 'rover_sim' / 'config' / 'worlds.yaml'   # MID-360 rays per world
+
+# Per-run files (in the run dir; contracts with the sim's own nodes).
+SPAWN_FILE = 'spawn.yaml'            # agents and spawn poses: sim_tf.py, the spawn pane
+CALIB_DIR = 'sensor_calib'           # <ns>_lidar_mount.yaml, <ns>_calib.npy
+URDF_DIR = 'urdf'                    # <ns>.urdf, as spawned (xacro output)
+FRAME_ALIGN_FILE = 'frame_align.yaml'
+RTF_LOG = 'rtf_violations.log'       # appended by livox_sim_bridge.py; any line = run invalid
 
 LOG_ROOT = Path.home() / '.local' / 'state' / 'rover_sim' / 'logs'
 LOG_KEEP = 20                        # newest pane-log dirs kept
@@ -161,10 +181,27 @@ def parallel(fn: Callable[[Any], Any], items: Sequence[Any]) -> List[Any]:
 # ---------------------------------------------------------------------------- sessions
 
 AGENT_NAME_RE = re.compile(r'^(?P<prefix>[A-Z]{2})(?P<num>[0-9]{2})$')
-CLASS_PREFIXES = OrderedDict([('jr', 'JR'), ('rr', 'RR')])  # class -> name prefix
+
+
+@dataclass(frozen=True)
+class RobotClass:
+    prefix: str                        # agent name prefix
+    chassis: str
+    reference_key: str                 # docker/stacks.env key: the real robot it is calibrated from
+    lidar_height: float                # m above the floor: base_link = lidar origin = DLIO's seed z
+
+
+# The reference robot is the one the class's DLIO image bakes the cfg_overlay of, so the
+# Gazebo lidar pose, rover_description's base_link->lidar and DLIO's extrinsics all come
+# from the same rover. Heights are the robots' DLIO_SEED_Z.
+ROBOT_CLASSES = OrderedDict([
+    ('jr', RobotClass('JR', 'Pioneer 3-DX, diff drive', 'DLIO_JR_ROBOT', 0.36)),
+    ('rr', RobotClass('RR', 'Pioneer 3-AT, skid steer', 'DLIO_RR_ROBOT', 0.40)),
+])
+CLASS_PREFIXES = OrderedDict((k, c.prefix) for k, c in ROBOT_CLASSES.items())  # class -> name prefix
 MAPPING_MODES = ('gpu', 'fallback')
 IDENT_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_.-]*$')
-SESSION_KEYS = ('name', 'world', 'mapping', 'rviz', 'agents')
+SESSION_KEYS = ('name', 'world', 'gui', 'mapping', 'rviz', 'agents')
 AGENT_KEYS = ('name', 'class', 'pose', 'goals')
 
 
@@ -182,6 +219,15 @@ class Agent:
         """mighty's agent id: the last two digits of the namespace (mighty_node.cpp:57-63)."""
         return int(self.name[2:])
 
+    @property
+    def prefix(self) -> str:
+        return self.name[:2]
+
+    @property
+    def yaw(self) -> float:
+        """Radians in [-pi, pi] (exact for a yaw_deg already in [-180, 180])."""
+        return math.remainder(math.radians(self.yaw_deg), 2 * math.pi)
+
 
 @dataclass(frozen=True)
 class Session:
@@ -191,6 +237,7 @@ class Session:
     rviz: bool
     agents: Tuple[Agent, ...]
     source: str = ''
+    gui: bool = False
 
     @property
     def num_agents(self) -> int:
@@ -202,7 +249,7 @@ class Session:
 
     def to_json(self) -> Dict[str, Any]:
         return OrderedDict([
-            ('name', self.name), ('world', self.world), ('mapping', self.mapping),
+            ('name', self.name), ('world', self.world), ('gui', self.gui), ('mapping', self.mapping),
             ('rviz', self.rviz), ('num_agents', self.num_agents), ('source', self.source),
             ('agents', [OrderedDict([('name', a.name), ('class', a.cls), ('id', a.id),
                                      ('pose', [a.x, a.y, a.yaw_deg]),
@@ -232,9 +279,11 @@ def validate_session(data: Any, source: str = '<session>') -> Session:
     mapping = data.get('mapping', 'gpu')
     if mapping not in MAPPING_MODES:
         errs.append('mapping: %r is not one of %s' % (mapping, ', '.join(MAPPING_MODES)))
-    rviz = data.get('rviz', False)
+    rviz, gui = data.get('rviz', False), data.get('gui', False)
     if not isinstance(rviz, bool):
         errs.append('rviz: %r is not true/false' % (rviz,))
+    if not isinstance(gui, bool):
+        errs.append('gui: %r is not true/false' % (gui,))
 
     agents = []  # type: List[Agent]
     raw = data.get('agents')
@@ -286,7 +335,7 @@ def validate_session(data: Any, source: str = '<session>') -> Session:
                                 tuple(tuple(float(v) for v in g) for g in goals)))
     if errs:
         raise SessionError('%s: invalid session:\n  - %s' % (source, '\n  - '.join(errs)))
-    return Session(name, world, mapping, rviz, tuple(agents), source)
+    return Session(name, world, mapping, rviz, tuple(agents), source, gui)
 
 
 def session_path(arg: str) -> Path:
@@ -311,6 +360,53 @@ def load_session(arg: str) -> Session:
     return validate_session(data, source)
 
 
+def world_problem(world: str, worlds_dir: Path = WORLDS_DIR) -> Optional[str]:
+    """world.launch.py loads share/rover_sim/worlds/<world>.world from the gazebo image,
+    which is built from this checkout's src/rover_sim: a world missing here is (or will
+    be, after the next `make images`) missing there too."""
+    if (worlds_dir / (world + '.world')).is_file():
+        return None
+    have = sorted(p.stem for p in worlds_dir.glob('*.world')) if worlds_dir.is_dir() else []
+    return 'world %r is not in %s (have: %s)' % (world, worlds_dir, ', '.join(have) or 'none')
+
+
+LIDAR_SAMPLES_DEFAULT = 500             # spawn_agent.launch.py's, for a world with no budget
+
+
+def world_lidar_samples(world: str, path: Path = WORLD_BUDGETS) -> int:
+    """MID-360 rays cast per scan in this world (spawn_agent.launch.py lidar_samples):
+    src/rover_sim/config/worlds.yaml lidar_samples_4_agents, what 4 agents can cast and keep
+    real time (each scan stalls physics while it casts). It is a per-scan cost, so fewer
+    agents get the same. The robot casts 20000."""
+    try:
+        budgets = (yaml.safe_load(path.read_text()) or {}).get('lidar_samples_4_agents') or {}
+    except (OSError, yaml.YAMLError) as e:
+        raise SimError('%s: %s' % (path, e))
+    n = budgets.get(world, LIDAR_SAMPLES_DEFAULT)
+    if not isinstance(n, int) or isinstance(n, bool) or not 1 <= n <= 20000:
+        raise SimError('%s: lidar_samples_4_agents.%s = %r is not 1..20000' % (path, world, n))
+    return n
+
+
+def read_pins(path: Path = STACKS_ENV) -> Dict[str, str]:
+    """docker/stacks.env: plain KEY=VALUE lines (see its header)."""
+    out = OrderedDict()  # type: Dict[str, str]
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if line and not line.startswith('#') and '=' in line:
+            k, v = line.split('=', 1)
+            out[k.strip()] = v.strip()
+    return out
+
+
+def reference_robot(cls: str, pins: Dict[str, str]) -> str:
+    rc = ROBOT_CLASSES[cls]
+    ref = pins.get(rc.reference_key, '')
+    if not AGENT_NAME_RE.match(ref) or ref[:2] != rc.prefix:
+        raise SimError('docker/stacks.env: %s=%r is not a %s robot' % (rc.reference_key, ref, rc.prefix))
+    return ref
+
+
 # ---------------------------------------------------------------------------- containers
 
 ROS_SETUP = '/opt/ros/humble/setup.bash'
@@ -330,8 +426,10 @@ class Container:
 
 
 CONTAINERS = OrderedDict((c.name, c) for c in (
-    Container('sim-gazebo', (ROS_SETUP, SIM_WS + '/install/setup.bash'),
-              overlays=('/usr/share/gazebo/setup.bash', '/opt/livox_ws/install/setup.bash'),
+    # Gazebo's own setup (GAZEBO_RESOURCE_PATH, plugin paths) for gzserver, livox_ws for
+    # the bridges' livox_ros_driver2 messages, the workspace last so its prefix wins.
+    Container('sim-gazebo', (ROS_SETUP, '/usr/share/gazebo/setup.bash', '/opt/livox_ws/install/setup.bash',
+                             SIM_WS + '/install/setup.bash'),
               probes=(SIM_WS + '/scripts/wait_zenoh_ready.py', SIM_PROBE),
               role='Gazebo, sensor bridges, sim TF, RViz'),
     Container('sim-drive', (ROS_SETUP, '/home/swarm/code/rover_ws/install/setup.bash'),
@@ -353,8 +451,14 @@ CONTAINERS = OrderedDict((c.name, c) for c in (
               role='elevation_mapping_cupy (GPU)'),
     # mighty-hw bakes no probe: its own mighty_hw.sh gates on the router port only.
     Container('sim-mighty', (ROS_SETUP, '/home/swarm/code/mighty_ws/install/setup.bash'),
-              role='mighty_node, convert_odom_to_state, mpc, goal_selector'),
+              role='mighty_node, convert_odom_to_state, mpc, goal_selector; frame_align'),
 ))
+
+# rover_description's share in the drive image (a merged colcon install): the pinned
+# sensor_calib files of the reference robots, and where state_publisher.launch.py looks
+# for <robot_name>_lidar_mount.yaml and <robot_name>_calib.npy.
+RD_SHARE = '/home/swarm/code/rover_ws/install/share/rover_description'
+DESCRIPTION_CONTAINER = 'sim-drive'
 
 
 def sim_only(name: str) -> str:
@@ -446,10 +550,15 @@ class RunContext:
     run_dir: Path                      # host side of /rover_sim/run
     log_dir: Optional[Path] = None     # this `up`'s pane logs
     rust_log: str = 'zenoh=info'
+    gz_spare_cpus: Optional[int] = None  # $ROVER_SIM_GZ_SPARE_CPUS: sim-gazebo cores kept off gzserver
 
 
 def _always(session: Session) -> bool:
     return True
+
+
+def _never(session: Session) -> bool:
+    return False
 
 
 @dataclass(frozen=True)
@@ -461,10 +570,11 @@ class Stack:
     panes: Callable[[Session, RunContext], List[Pane]]
     implemented: bool = False
     wanted: Callable[[Session], bool] = _always
-    # Writes this stack's per-run files under ctx.run_dir before its panes start.
-    generate: Optional[Callable[[Session, RunContext], None]] = None
+    # Steps that write per-run files under ctx.run_dir (or set up a container) before
+    # any pane starts. A step shared by several selected stacks runs once.
+    generate: Tuple[Callable[[Session, RunContext], None], ...] = ()
     # Opens windows on $DISPLAY: `up` then grants the containers' root X access.
-    needs_display: bool = False
+    needs_display: Callable[[Session], bool] = _never
 
 
 def zenoh_panes(session: Session, ctx: RunContext) -> List[Pane]:
@@ -484,22 +594,348 @@ def _not_yet(stack: str) -> SimError:
     return SimError('the %s stack lands in Phase %d (%s)' % (stack, s.phase, s.summary))
 
 
+def fmt_float(v: float, digits: int = 9) -> str:
+    """Fixed point, always with a decimal point: ROS reads `-p tx:=1` as an integer, which
+    a double parameter refuses. No exponent, no '-0.0'."""
+    s = ('%.*f' % (digits, v)).rstrip('0')
+    s = s + '0' if s.endswith('.') else s
+    return '0.0' if s == '-0.0' else s
+
+
+def run_path(*parts: str) -> str:
+    """A per-run file as the containers see it."""
+    return '/'.join((RUN_DIR_IN,) + parts)
+
+
+def calib_name(agent: Agent, kind: str) -> str:
+    return '%s_%s' % (agent.name, {'mount': 'lidar_mount.yaml', 'npy': 'calib.npy'}[kind])
+
+
+# gzserver gets most of sim-gazebo's cores (its own cpuset, cpu_budget) and everything else
+# in that container (bridges, sim_tf, spawn, status queries, later RViz) the rest, so a busy
+# bridge cannot preempt physics: an RTF below 0.95 fails the run. The split is made at run
+# time from the container's own affinity, by this script (`sim.py cpus`), which every
+# container mounts at /rover_sim/scripts.
+SIM_PY_IN = SCRIPTS_IN + '/sim.py'
+
+
+def split_cpus(cpus: Iterable[int], spare: Optional[int] = None) -> Tuple[List[int], List[int]]:
+    """(gzserver's cores, the rest's). The rest gets the top `spare` cores, by default a
+    quarter (at least one); gzserver keeps at least one. A single core is shared."""
+    c = sorted(set(cpus))
+    if len(c) < 2:
+        return c, c
+    k = min(spare if spare else max(1, len(c) // 4), len(c) - 1)
+    return c[:len(c) - k], c[len(c) - k:]
+
+
+def pin_self(part: str, ctx: RunContext) -> str:
+    """Pins the pane's container-side bash, and so all it starts, to gzserver's cores
+    ('gz') or the rest ('rest'). taskset prints the old and new affinity into the pane."""
+    spare = ' --spare %d' % ctx.gz_spare_cpus if ctx.gz_spare_cpus else ''
+    return 'taskset -cp "$(python3 %s cpus %s%s)" $$' % (SIM_PY_IN, part, spare)
+
+
+def spawn_agent_cmd(a: Agent, lidar_samples: int) -> str:
+    """rover_sim spawn_agent.launch.py: xacro to a file in the run dir (kept, for a look at
+    what was spawned), then spawn_entity -file at floor height; no robot_state_publisher,
+    so the Gazebo model publishes no TF. The lidar pose comes from the agent's generated
+    mount file, the one rover_description's base_link->lidar uses too."""
+    return ('ros2 launch rover_sim spawn_agent.launch.py namespace:=%s class:=%s x:=%s y:=%s yaw:=%s '
+            'lidar_mount_file:=%s lidar_height:=%s lidar_samples:=%d urdf_file:=%s'
+            % (a.name, a.cls, fmt_float(a.x), fmt_float(a.y), fmt_float(a.yaw),
+               run_path(CALIB_DIR, calib_name(a, 'mount')), fmt_float(ROBOT_CLASSES[a.cls].lidar_height),
+               lidar_samples, run_path(URDF_DIR, a.name + '.urdf')))
+
+
+def spawn_cmd(session: Session, ctx: RunContext) -> str:
+    """Into the paused world one by one, then unpause once, so no robot moves (or DLIO
+    calibrates on a falling IMU) before all are in. The pane then idles: `status` shows
+    it running when everything spawned, EXITED when a step failed."""
+    names = ' '.join(a.name for a in session.agents)
+    samples = world_lidar_samples(session.world)
+    return ' && '.join(
+        [pin_self('rest', ctx), 'echo "[rover_sim] waiting for /spawn_entity (gzserver)..."',
+         'until ros2 service list --no-daemon 2>/dev/null | grep -qx /spawn_entity; do sleep 2; done']
+        + [spawn_agent_cmd(a, samples) for a in session.agents]
+        + ['ros2 service call /unpause_physics std_srvs/srv/Empty',
+           'echo "[rover_sim] spawned %s; physics unpaused at $(date +%%T)"' % names,
+           'exec sleep infinity'])
+
+
 def gazebo_panes(session: Session, ctx: RunContext) -> List[Pane]:
-    """TODO(Phase 2), sim-gazebo. One gzserver on session.world (src/rover_sim
-    world.launch.py, real-time capped), spawning every agent paused and unpausing once.
-    Per agent: livox_sim_bridge.py (sim->wall stamps, sim/rtf) and sim_tf.py
-    (world-><ns>/map on /tf, frame_align pairs). Generates <run>/spawn.yaml. gzserver
-    gets its own cores out of sim-gazebo's cpuset (cpu_budget), e.g. with taskset, so
-    the bridges cannot slow physics. Set needs_display once gzclient runs here."""
-    raise _not_yet('gazebo')
+    """sim-gazebo. One gzserver on session.world (rover_sim world.launch.py, ODE at 1 ms,
+    real-time capped), started paused; the spawn pane adds every agent and unpauses once.
+    Per agent, livox_sim_bridge.py turns the plugins' sim-stamped sensor streams into the
+    robot's /<ns>/livox/{lidar,imu} on wall-clock stamps and reports sim/rtf and
+    sim/time_offset. sim_tf.py publishes world-><ns>/map for every agent from
+    <run>/spawn.yaml (write_agent_files). With session.gui, gzclient gets a pane of its own,
+    off gzserver's cores: the worlds' real-time budgets were measured without it."""
+    panes = [
+        Pane('gzserver %s' % session.world, 'gzserver', 'sim-gazebo', pin_self('gz', ctx)
+             + ' && ros2 launch rover_sim world.launch.py world:=%s gui:=false paused:=true' % session.world,
+             window='gazebo'),
+        Pane('spawn %s, then unpause' % ', '.join(a.name for a in session.agents), 'spawn', 'sim-gazebo',
+             spawn_cmd(session, ctx), window='gazebo'),
+        Pane('world -> <ns>/map (sim_tf)', 'sim-tf', 'sim-gazebo', pin_self('rest', ctx)
+             + ' && python3 %s/sim_tf.py --spawn %s' % (SCRIPTS_IN, run_path(SPAWN_FILE)), window='gazebo'),
+    ]
+    if session.gui:
+        panes.append(Pane('gzclient', 'gzclient', 'sim-gazebo', pin_self('rest', ctx)
+                          + ' && ros2 launch rover_sim world.launch.py server:=false gui:=true', window='gazebo'))
+    panes += [Pane('%s livox_sim_bridge' % a.name, 'bridge-' + a.name, 'sim-gazebo', pin_self('rest', ctx)
+                   + ' && python3 %s/livox_sim_bridge.py --ns %s' % (SCRIPTS_IN, a.name), window='bridges')
+              for a in session.agents]
+    return panes
+
+
+def robot_env(a: Agent) -> Tuple[Tuple[str, str], ...]:
+    """The identity a rover's /etc/rover/rover.env gives its drive container."""
+    return (('VEHTYPE', a.prefix), ('VEHNUM', '%02d' % a.id), ('ROBOT_NAME', a.name))
 
 
 def drive_panes(session: Session, ctx: RunContext) -> List[Pane]:
-    """TODO(Phase 2/3), sim-drive. Per agent: rover_description state_publisher.launch.py
-    robot_name:=<ns> ns_tf_frame_ids:=true (generated <run>/sensor_calib), then
-    rover_control teleop.launch.yaml with <run>/teleop_sim.yaml (safety_node). No
-    firmware driver: Gazebo's diff drive consumes /<ns>/cmd_vel."""
-    raise _not_yet('drive')
+    """sim-drive, the Phase 2 part: per agent the robot's 'description / TF' pane
+    (rover drive_host_tmux.sh), i.e. robot_state_publisher with <ns>/base_link -> <ns>/lidar
+    from the agent's generated mount file (link_calib) on /tf_static. Phase 3 adds
+    rover_control teleop.launch.yaml with <run>/teleop_sim.yaml (safety_node). No firmware
+    driver: Gazebo's diff drive consumes /<ns>/cmd_vel."""
+    return [Pane('%s description / TF' % a.name, 'description-tf-' + a.name, 'sim-drive',
+                 'ros2 launch rover_description state_publisher.launch.py robot_name:=%s ns_tf_frame_ids:=true'
+                 % a.name, env=robot_env(a), window='description')
+            for a in session.agents]
+
+
+FRAME_ALIGN_KEYS = ('tx', 'ty', 'tz', 'qx', 'qy', 'qz', 'qw')
+
+
+def frame_align_pairs(session: Session) -> List[Tuple[Agent, Agent]]:
+    """Every ordered (ego, other) pair: each mighty_node aligns each other agent itself."""
+    return [(e, o) for e in session.agents for o in session.agents if o.name != e.name]
+
+
+def frame_align_name(ego: Agent, other: Agent) -> str:
+    """The name ego's mighty_node subscribes under for `other`: EGO's prefix and the
+    other's id (mighty_node.cpp:199-216), so for JR81 the topic of RR83 is
+    /frame_align/JR81/JR83."""
+    return '%s%02d' % (ego.prefix, other.id)
+
+
+def frame_align_transform(ego: Agent, other: Agent) -> Tuple[float, ...]:
+    """(tx, ty, tz, qx, qy, qz, qw) of inverse(T_world_egomap) * T_world_othermap: it maps
+    points in other/map into ego/map, which is how mighty_node applies it to the other's
+    trajectories (mighty_node.cpp:1705-1735). Each <ns>/map is the spawn pose (x, y, 0, yaw)."""
+    c, s = math.cos(ego.yaw), math.sin(ego.yaw)
+    dx, dy = other.x - ego.x, other.y - ego.y
+    dyaw = math.atan2(math.sin(other.yaw - ego.yaw), math.cos(other.yaw - ego.yaw))  # qw >= 0
+    return (c * dx + s * dy, -s * dx + c * dy, 0.0, 0.0, 0.0, math.sin(dyaw / 2), math.cos(dyaw / 2))
+
+
+def frame_align_table(session: Session) -> Dict[str, Any]:
+    pairs = []
+    for e, o in frame_align_pairs(session):
+        row = {'ego': e.name, 'other': o.name, 'topic': '/frame_align/%s/%s' % (e.name, frame_align_name(e, o)),
+               'node': 'frame_align_%s_%s' % (e.name, o.name)}
+        row.update(zip(FRAME_ALIGN_KEYS, frame_align_transform(e, o)))
+        pairs.append(row)
+    return {'pairs': pairs}
+
+
+def frame_align_panes(session: Session, ctx: RunContext) -> List[Pane]:
+    """sim-mighty. mighty's own scripts/frame_align_publisher.py (installed in mighty-hw as
+    lib/mighty/frame_align_publisher.py), one process per ordered pair with a per-pair node
+    name, publishing the ground-truth alignment at 10 Hz. mighty_node (use_frame_alignment:
+    true) drops another agent's /trajs until it has that agent's alignment. On the robot
+    nothing publishes these yet. One window per ego."""
+    panes = []
+    for ego, other in frame_align_pairs(session):
+        name = frame_align_name(ego, other)
+        params = ' '.join('-p %s:=%s' % (k, fmt_float(v))
+                          for k, v in zip(FRAME_ALIGN_KEYS, frame_align_transform(ego, other)))
+        panes.append(Pane('/frame_align/%s/%s (%s)' % (ego.name, name, other.name),
+                          'frame-align-%s-%s' % (ego.name, other.name), 'sim-mighty',
+                          'ros2 run mighty frame_align_publisher.py --ros-args -r __node:=frame_align_%s_%s '
+                          '-p ego_name:=%s -p other_name:=%s %s' % (ego.name, other.name, ego.name, name, params),
+                          window='align-' + ego.name))
+    return panes
+
+
+# ---------------------------------------------------------------------------- per-run files
+
+def spawn_table(session: Session, pins: Dict[str, str]) -> Dict[str, Any]:
+    """<run>/spawn.yaml: what sim_tf.py and the spawn pane place every agent from."""
+    return {'agents': [{'name': a.name, 'class': a.cls, 'id': a.id, 'x': a.x, 'y': a.y, 'yaw': a.yaw,
+                        'yaw_deg': a.yaw_deg, 'lidar_height': ROBOT_CLASSES[a.cls].lidar_height,
+                        'reference_robot': reference_robot(a.cls, pins)} for a in session.agents]}
+
+
+def generated_yaml(session: Session, what: str, data: Dict[str, Any]) -> str:
+    return ('# %s for session %s (%s), generated by scripts/sim.py; rewritten on every `up`.\n'
+            % (what, session.name, session.source) + yaml.safe_dump(data, sort_keys=False, default_flow_style=False))
+
+
+def check_mount(data: bytes, where: str) -> None:
+    """What state_publisher.launch.py requires of a mount file, checked before anything
+    is spawned from it."""
+    try:
+        m = yaml.safe_load(data.decode('utf-8'))
+        xyz, rpy = [float(v) for v in m['xyz']], [float(v) for v in m['rpy']]
+    except (yaml.YAMLError, UnicodeDecodeError, KeyError, TypeError, ValueError) as e:
+        raise SimError('%s: not a lidar mount file (numeric xyz and rpy): %r' % (where, e))
+    if len(xyz) != 3 or len(rpy) != 3:
+        raise SimError('%s: xyz and rpy need 3 entries each' % where)
+
+
+def mount_header(agent: Agent, ref: str, pins: Dict[str, str]) -> bytes:
+    """One comment line on top of the reference robot's file, which follows verbatim."""
+    return ('# rover_sim: %s (class %s) uses %s\'s lidar mount; below is rover_description/sensor_calib/'
+            '%s_lidar_mount.yaml verbatim from %s (rover %s). Generated by scripts/sim.py, do not edit.\n'
+            % (agent.name, agent.cls, ref, ref, pins.get('DRIVE_IMAGE', '?'), pins.get('DRIVE_SHA', '?')[:7])
+            ).encode()
+
+
+# A regular file only: link_calib puts the run's own symlinks in the same directory.
+_READ_FILE_SH = '[ -f "$1" ] && [ ! -L "$1" ] && base64 -w0 "$1"'
+
+
+def read_container_file(name: str, path: str) -> bytes:
+    p = dexec(name, ['bash', '-c', _READ_FILE_SH, 'read', path], check=False, timeout=30)
+    if p.returncode != 0:
+        raise SimError('%s: cannot read %s (not a regular file in its image?)%s'
+                       % (name, path, ': ' + p.stderr.strip() if (p.stderr or '').strip() else ''))
+    return base64.b64decode(p.stdout.strip())
+
+
+def reference_calib(ref: str) -> Tuple[bytes, bytes]:
+    """The reference robot's mount file and camera calibration, from the pinned
+    rover_description the drive image installs (not from any local checkout)."""
+    d = RD_SHARE + '/' + CALIB_DIR + '/'
+    mount = read_container_file(DESCRIPTION_CONTAINER, d + ref + '_lidar_mount.yaml')
+    check_mount(mount, '%s:%s%s_lidar_mount.yaml' % (DESCRIPTION_CONTAINER, d, ref))
+    npy = read_container_file(DESCRIPTION_CONTAINER, d + ref + '_calib.npy')
+    if not npy.startswith(b'\x93NUMPY'):
+        raise SimError('%s:%s%s_calib.npy is not a .npy file' % (DESCRIPTION_CONTAINER, d, ref))
+    return mount, npy
+
+
+# Every sim container mounts the run dir read-write and runs as root, so any name in it
+# may have been replaced by a symlink to a host path. These never follow one.
+
+def open_own_dir(path: Path) -> int:
+    """An fd of the directory at path: a real directory (a symlink as its last component is
+    refused, the run dir's own path is check_run_dir's) owned by us."""
+    try:
+        fd = os.open(str(path), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as e:
+        raise SimError('%s is not a directory (%s): the run dir is writable from the containers; '
+                       'remove it, or set ROVER_SIM_RUN to a fresh dir' % (path, e.strerror))
+    uid = os.fstat(fd).st_uid
+    if uid != os.getuid():
+        os.close(fd)
+        raise SimError('%s is owned by uid %d, not you (a container made it?): remove it (sudo rm -r), '
+                       'or set ROVER_SIM_RUN to a fresh dir' % (path, uid))
+    return fd
+
+
+def write_file(path: Path, data: bytes) -> None:
+    """Atomically: a fresh temp file next to it (O_EXCL: created, never opened through a
+    link), renamed over the name (which replaces a link, never writes through it)."""
+    fd = open_own_dir(path.parent)
+    tmp = '.%s.tmp' % path.name
+    try:
+        try:
+            os.unlink(tmp, dir_fd=fd)
+        except FileNotFoundError:
+            pass
+        out = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644, dir_fd=fd)
+        with os.fdopen(out, 'wb') as f:
+            f.write(data)
+        os.replace(tmp, path.name, src_dir_fd=fd, dst_dir_fd=fd)
+    finally:
+        os.close(fd)
+
+
+def empty_own_dir(path: Path) -> None:
+    """path as an empty directory of ours: a symlink there is removed (not followed), a
+    missing one made, and every non-directory in it removed, root-owned xacro output too
+    (the directory is ours)."""
+    try:
+        if stat.S_ISLNK(os.lstat(str(path)).st_mode):
+            os.unlink(str(path))
+    except FileNotFoundError:
+        pass
+    try:
+        os.mkdir(str(path))
+    except FileExistsError:
+        pass
+    fd = open_own_dir(path)
+    try:
+        for name in os.listdir(fd):
+            if not stat.S_ISDIR(os.stat(name, dir_fd=fd, follow_symlinks=False).st_mode):
+                os.unlink(name, dir_fd=fd)
+    finally:
+        os.close(fd)
+
+
+def write_agent_files(session: Session, ctx: RunContext) -> None:
+    """Per-run files for the gazebo and drive stacks:
+      <run>/spawn.yaml                       agents and spawn poses (spawn_table)
+      <run>/sensor_calib/<ns>_lidar_mount.yaml  the reference robot's, plus a header line
+      <run>/sensor_calib/<ns>_calib.npy      the reference robot's, byte for byte
+      <run>/frame_align.yaml                 what the frame_align panes publish
+      <run>/urdf/                            the spawn pane's xacro output
+    Stale files of an earlier session go first: the containers read these by name."""
+    if not running(DESCRIPTION_CONTAINER):
+        raise SimError('the reference calibration is read from %s, which is not running '
+                       '(scripts/sim.py up without --partial starts it)' % DESCRIPTION_CONTAINER)
+    pins = read_pins()
+    refs = sorted({reference_robot(a.cls, pins) for a in session.agents})
+    calib = dict(zip(refs, parallel(reference_calib, refs)))
+    run_dir = ctx.run_dir
+    for sub in (CALIB_DIR, URDF_DIR):
+        empty_own_dir(run_dir / sub)
+    for a in session.agents:
+        ref = reference_robot(a.cls, pins)
+        mount, npy = calib[ref]
+        write_file(run_dir / CALIB_DIR / calib_name(a, 'mount'), mount_header(a, ref, pins) + mount)
+        write_file(run_dir / CALIB_DIR / calib_name(a, 'npy'), npy)
+    write_file(run_dir / SPAWN_FILE, generated_yaml(session, 'Agents and spawn poses (yaw in radians)',
+                                                    spawn_table(session, pins)).encode())
+    write_file(run_dir / FRAME_ALIGN_FILE, generated_yaml(
+        session, 'Ground-truth frame alignment, inverse(T_world_egomap) * T_world_othermap',
+        frame_align_table(session)).encode())
+    info('wrote %s, %s/ (%s) and %s' % (SPAWN_FILE, CALIB_DIR, ', '.join(
+        '%s from %s' % (a.name, reference_robot(a.cls, pins)) for a in session.agents), FRAME_ALIGN_FILE))
+
+
+# Links each agent's calib files into the share; refuses to shadow a file the image has.
+_LINK_CALIB_SH = r'''d=$1; src=$2; shift 2
+for n in "$@"; do
+  for f in "${n}_lidar_mount.yaml" "${n}_calib.npy"; do
+    [ -f "$src/$f" ] || { echo "$src/$f is missing" >&2; exit 1; }
+    if [ -e "$d/$f" ] && [ ! -L "$d/$f" ]; then
+      echo "$d/$f is the image's own file: $n is the name of a real robot" >&2; exit 3
+    fi
+    ln -sfn "$src/$f" "$d/$f" || exit 1
+  done
+done'''
+
+
+def link_calib(session: Session, ctx: RunContext) -> None:
+    """state_publisher.launch.py takes no path for these: it reads
+    sensor_calib/<robot_name>_lidar_mount.yaml from rover_description's share, and
+    <robot_name>_calib.npy relative to its own file, which is the same directory in this
+    install. So each agent's run-dir files are symlinked into sim-drive's copy of that
+    share. That is the container's writable layer, not the image; compose recreating
+    the container drops the links and every `up` makes them again. A real robot's own
+    file is never replaced."""
+    p = dexec(DESCRIPTION_CONTAINER, ['bash', '-c', _LINK_CALIB_SH, 'link', RD_SHARE + '/' + CALIB_DIR,
+                                      run_path(CALIB_DIR)] + [a.name for a in session.agents],
+              check=False, timeout=30)
+    if p.returncode != 0:
+        raise SimError('could not link the calibration into %s:%s/%s: %s%s' % (
+            DESCRIPTION_CONTAINER, RD_SHARE, CALIB_DIR, (p.stderr or '').strip(),
+            '\n  rename that agent: sim agents need names no real robot has (e.g. JR81)' if p.returncode == 3 else ''))
 
 
 def dlio_panes(session: Session, ctx: RunContext) -> List[Pane]:
@@ -532,15 +968,20 @@ def mighty_panes(session: Session, ctx: RunContext) -> List[Pane]:
 
 def rviz_panes(session: Session, ctx: RunContext) -> List[Pane]:
     """TODO(Phase 5), sim-gazebo. RViz from a config generated for the session's agents,
-    started last (zenoh late-join TF)."""
+    started last (zenoh late-join TF), off gzserver's cores (pin_self('rest', ctx))."""
     raise _not_yet('rviz')
 
 
 # Start order is registry order. Later phases flip `implemented` and fill in the builder.
 STACKS = OrderedDict((s.name, s) for s in (
     Stack('zenoh', 1, 'zenoh router in sim-drive', ('sim-drive',), zenoh_panes, implemented=True),
-    Stack('gazebo', 2, 'Gazebo world, spawns, sensor bridges, sim TF', ('sim-gazebo',), gazebo_panes),
-    Stack('drive', 2, 'rover_description and safety_node/teleop per agent', ('sim-drive',), drive_panes),
+    Stack('gazebo', 2, 'Gazebo world, spawns, sensor bridges, world-><ns>/map', ('sim-gazebo',), gazebo_panes,
+          implemented=True, generate=(write_agent_files,), needs_display=lambda s: s.gui),
+    # Phase 3 adds safety_node/teleop per agent.
+    Stack('drive', 2, 'rover_description per agent', ('sim-drive',), drive_panes, implemented=True,
+          generate=(write_agent_files, link_calib)),
+    Stack('frame_align', 2, 'ground-truth frame_align per ordered agent pair', ('sim-mighty',),
+          frame_align_panes, implemented=True, wanted=lambda s: len(s.agents) > 1),
     Stack('dlio', 3, 'DLIO, seed pose and map->odom per agent', ('sim-dlio-jr', 'sim-dlio-rr'), dlio_panes),
     Stack('mapping', 4, 'global_mapper, map_fusion, persistent_map per agent', ('sim-mapping',),
           mapping_panes),
@@ -549,7 +990,7 @@ STACKS = OrderedDict((s.name, s) for s in (
     Stack('mighty', 5, 'mighty_node, convert_odom_to_state, mpc, goal_selector per agent',
           ('sim-mighty',), mighty_panes),
     Stack('rviz', 5, 'RViz, started last', ('sim-gazebo',), rviz_panes, wanted=lambda s: s.rviz,
-          needs_display=True),
+          needs_display=_always),
 ))
 
 
@@ -563,9 +1004,17 @@ def select_stacks(session: Session, requested: Optional[Sequence[str]] = None) -
         if not s.implemented:
             raise _not_yet(name)
         if not s.wanted(session):
-            raise SimError('the %s stack does not apply to session %s (mapping: %s, rviz: %s)'
-                           % (name, session.name, session.mapping, session.rviz))
+            raise SimError('the %s stack does not apply to session %s (mapping: %s, rviz: %s, %d agent(s))'
+                           % (name, session.name, session.mapping, session.rviz, len(session.agents)))
     return [s for s in STACKS.values() if s.name in requested]
+
+
+def generate_steps(stacks: Sequence[Stack]) -> List[Callable[[Session, RunContext], None]]:
+    """The selected stacks' generate steps in start order, each once."""
+    out = []  # type: List[Callable[[Session, RunContext], None]]
+    for s in stacks:
+        out += [g for g in s.generate if g not in out]
+    return out
 
 
 def pending_stacks(session: Session) -> List[str]:
@@ -1000,9 +1449,7 @@ def write_session_file(session: Session, run_dir: Path) -> Path:
     data = session.to_json()
     data['started'] = time.strftime('%Y-%m-%dT%H:%M:%S%z')
     path = run_dir / 'session.json'
-    tmp = path.with_name(path.name + '.tmp')
-    tmp.write_text(json.dumps(data, indent=2) + '\n')
-    tmp.replace(path)
+    write_file(path, (json.dumps(data, indent=2) + '\n').encode())
     return path
 
 
@@ -1856,11 +2303,17 @@ def print_loadtest(summaries: Sequence[Dict[str, Any]], max_discovery: float) ->
 # ---------------------------------------------------------------------------- commands
 
 def print_plan(session: Session, plan: Sequence[Tuple[Stack, List[Pane]]]) -> None:
-    print('session %s (%s): world %s, mapping %s, rviz %s, num_agents %d' % (
-        session.name, session.source, session.world, session.mapping,
-        'on' if session.rviz else 'off', session.num_agents))
+    print('session %s (%s): world %s (MID-360 %d rays/scan), gui %s, mapping %s, rviz %s, num_agents %d' % (
+        session.name, session.source, session.world, world_lidar_samples(session.world),
+        'on' if session.gui else 'off', session.mapping, 'on' if session.rviz else 'off', session.num_agents))
+    pins = read_pins()
     for a in session.agents:
-        print('  %s  %s  id %02d  pose (%.2f, %.2f, %.1f deg)' % (a.name, a.cls, a.id, a.x, a.y, a.yaw_deg))
+        print('  %s  %s  id %02d  pose (%.2f, %.2f, %.1f deg)  calibrated from %s, lidar at %.2f m' % (
+            a.name, a.cls, a.id, a.x, a.y, a.yaw_deg, reference_robot(a.cls, pins),
+            ROBOT_CLASSES[a.cls].lidar_height))
+    steps = generate_steps([stack for stack, _ in plan])
+    if steps:
+        print('before the panes: %s' % ', '.join(g.__name__ for g in steps))
     for stack, panes in plan:
         print('stack %s -> tmux session %s%s' % (stack.name, TMUX_PREFIX, stack.name))
         for wname, wpanes in tmux_windows(panes):
@@ -1893,12 +2346,34 @@ def busy_containers(names: Sequence[str]) -> List[str]:
     return [n for n, f in zip(names, found) if f]
 
 
+def gz_spare_from_env() -> Optional[int]:
+    v = os.environ.get('ROVER_SIM_GZ_SPARE_CPUS', '').strip()
+    if not v:
+        return None
+    if not v.isdigit() or int(v) < 1:
+        raise SimError('ROVER_SIM_GZ_SPARE_CPUS=%r: expected a number of cores (>= 1)' % v)
+    return int(v)
+
+
+def rotate_rtf_log(run_dir: Path) -> None:
+    """A violation belongs to the run whose bridge logged it: each `up` starts a fresh log
+    (the previous run's stays as rtf_violations.prev.log)."""
+    log = run_dir / RTF_LOG
+    if log.exists() or log.is_symlink():
+        log.replace(log.with_name('rtf_violations.prev.log'))
+
+
 def cmd_up(args: argparse.Namespace) -> int:
     session = load_session(args.session)
     stacks = select_stacks(session, args.stacks)
     run_dir = run_dir_from_env()
-    ctx = RunContext(run_dir=run_dir, rust_log=os.environ.get('RUST_LOG_ZENOH', 'zenoh=info'))
+    ctx = RunContext(run_dir=run_dir, rust_log=os.environ.get('RUST_LOG_ZENOH', 'zenoh=info'),
+                     gz_spare_cpus=gz_spare_from_env())
     plan = [(s, s.panes(session, ctx)) for s in stacks]
+    if any(s.name == 'gazebo' for s in stacks):
+        problem = world_problem(session.world)
+        if problem:
+            warn(problem + ': gzserver will fail to load it')
     if args.dry_run:
         print_plan(session, plan)
         return 0
@@ -1910,7 +2385,9 @@ def cmd_up(args: argparse.Namespace) -> int:
         raise SimError('session %s has mapping: gpu but this host has no nvidia-smi; '
                        'use mapping: fallback' % session.name)
     images = compose_images(profiles, run_dir)
-    services = sorted({c for s in stacks for c in s.containers}) if args.partial else list(images)
+    # Every pane gates on the router, and write_agent_files reads from sim-drive.
+    services = (sorted({c for s in stacks for c in s.containers} | {ROUTER_CONTAINER}) if args.partial
+                else list(images))
     used = OrderedDict((k, v) for k, v in images.items() if k in services)
     check_images(used)
     for line in image_provenance(used):
@@ -1929,14 +2406,14 @@ def cmd_up(args: argparse.Namespace) -> int:
         raise SimError('REFUSING TO START NODES: the sim is not isolated from this host:\n  - '
                        + '\n  - '.join(problems) + '\n  (containers are idle; scripts/sim.py down --containers)')
     info('isolation OK: %s is internal and reaches nothing on this host' % NETWORK)
-    if any(s.needs_display for s in stacks):
+    if any(s.needs_display(session) for s in stacks):
         grant_x_access()
     write_session_file(session, run_dir)
+    rotate_rtf_log(run_dir)
     log_dir = make_log_dir()
     ctx = dataclasses.replace(ctx, log_dir=log_dir)
-    for s in stacks:
-        if s.generate:
-            s.generate(session, ctx)
+    for step in generate_steps(stacks):
+        step(session, ctx)
     for s, panes in plan:
         sess = start_stack(s, panes, log_dir)
         info('%-8s up: tmux attach -t %s   (scripts/sim.py attach %s)' % (s.name, sess, s.name))
@@ -1987,8 +2464,8 @@ def cmd_status(args: argparse.Namespace) -> int:
         print('  %-14s %-8s %-32s cpus %-6s %s' % (name, state, image, cpus, c.role))
     for line in image_provenance(images):
         print('  WARNING: ' + line)
+    problems = check_isolation() if up else []
     if up:
-        problems = check_isolation()
         print('isolation: %s' % ('OK' if not problems else 'BROKEN\n  - ' + '\n  - '.join(problems)))
     if ROUTER_CONTAINER in up:
         links = link_snapshot(up)
@@ -2004,15 +2481,125 @@ def cmd_status(args: argparse.Namespace) -> int:
         print('  %s:%s.%s  %-9s %s' % (sess, win, idx, 'running' if cmd == 'docker' else 'EXITED', title))
     run_dir = resolve_run_dir() if up else run_dir_from_env()
     sf = run_dir / 'session.json'
-    if sf.is_file():
-        s = json.loads(sf.read_text())
+    s = json.loads(sf.read_text()) if sf.is_file() else None
+    if s:
         print('session: %s (%s), world %s, mapping %s, agents %s' % (
             s['name'], s.get('source', ''), s['world'], s['mapping'], ', '.join(a['name'] for a in s['agents'])))
     print('run dir: %s' % run_dir)
     if (LOG_ROOT / 'latest').exists():
         print('logs:    %s' % (LOG_ROOT / 'latest').resolve())
-    print('RTF:     n/a until the gazebo stack (Phase 2) publishes sim/rtf')
-    return 0
+    if problems:
+        # The query opens a ROS session; `up` starts none on a broken network either.
+        print('sim time: not queried (isolation BROKEN)')
+    elif s and 'sim-gazebo' in up and TMUX_PREFIX + 'gazebo' in {r[0] for r in rows}:
+        names = [a['name'] for a in s['agents']]
+        vals = sim_time_values(names, RunContext(run_dir=run_dir, gz_spare_cpus=gz_spare_from_env()))
+        print('sim time (each agent\'s livox_sim_bridge; time_offset = wall - sim):')
+        for line in sim_time_lines(names, vals):
+            print('  ' + line)
+    else:
+        print('sim time: n/a (the gazebo stack is not running)')
+    bad = rtf_violations(run_dir)
+    if bad:
+        stalled = any(l.endswith('rtf=0.000') for l in bad)
+        print(red_banner(['RUN INVALID: the real-time factor was below %.2f for over 5 s (%d line(s) in %s):'
+                          % (RTF_MIN, len(bad), run_dir / RTF_LOG)] + ['  ' + l for l in bad[-5:]]
+                         + ['Physics was slower than the wall clock the stack runs on: results from this run '
+                            'do not count. Lighten the load (fewer agents, lidar_samples) and re-run.']
+                         + (['rtf=0.000: no IMU reached the bridge at all, so gzserver stalled or was paused, or '
+                             'the zenoh graph stalled (rsim-zenoh router.log: "Unable to push").'] if stalled else [])))
+    return 3 if problems else 2 if bad else 0
+
+
+# ---------------------------------------------------------------------------- sim time status
+
+RTF_MIN = 0.95                         # the bridges log a violation below this for > 5 s
+ECHO_TIMEOUT_S = 8                     # topics are 1 Hz; rclpy itself takes 1-2 s to start
+# One rclpy session reads every agent's values, rather than a `ros2 topic echo` per topic:
+# 8 CLI sessions starting at once on the bridges' one core joined so slowly that the
+# router blocked on them (5 s per undeliverable declaration) and stalled the whole sim
+# graph for 3 minutes. SIGKILL backs up the timeout: a session stuck in its close keeps
+# the router waiting until its socket closes. Prints '@@ <topic> <value or nothing>'.
+_SIM_TIME_PY = r"""
+import sys, time
+import rclpy
+from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy
+from std_msgs.msg import Float64
+end, topics = time.time() + float(sys.argv[1]), sys.argv[2:]
+rclpy.init(args=[])
+node = Node('sim_status_%d' % (time.time_ns() % 1000000))
+vals = {}
+qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
+subs = [node.create_subscription(Float64, t, lambda m, t=t: vals.setdefault(t, m.data), qos) for t in topics]
+while time.time() < end and len(vals) < len(topics):
+    rclpy.spin_once(node, timeout_sec=0.1)
+print(''.join('@@ %s %s\n' % (t, vals.get(t, '')) for t in topics), end='', flush=True)
+node.destroy_node()
+rclpy.try_shutdown()
+"""
+_SIM_TIME_SH = 'exec timeout -k 2 %d python3 -c "$SIM_STATUS_PY" %d "$@"' % (ECHO_TIMEOUT_S + 4, ECHO_TIMEOUT_S)
+
+
+def sim_time_topics(names: Sequence[str]) -> List[str]:
+    return ['/%s/sim/%s' % (n, t) for n in names for t in ('rtf', 'time_offset')]
+
+
+def parse_sim_time(out: str) -> Dict[str, Optional[float]]:
+    vals = {}  # type: Dict[str, Optional[float]]
+    for line in out.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) >= 2 and parts[0] == '@@':
+            try:
+                vals[parts[1]] = float(parts[2]) if len(parts) > 2 else None
+            except ValueError:
+                vals[parts[1]] = None
+    return vals
+
+
+def sim_time_values(names: Sequence[str], ctx: RunContext) -> Dict[str, Optional[float]]:
+    """One sample of each agent's sim/rtf and sim/time_offset, read in sim-gazebo off
+    gzserver's cores."""
+    inner = ' && '.join([setup_snippet(CONTAINERS['sim-gazebo']), pin_self('rest', ctx) + ' >/dev/null', _SIM_TIME_SH])
+    try:
+        p = dexec('sim-gazebo', ['bash', '-c', inner, 'status'] + sim_time_topics(names), check=False,
+                  timeout=ECHO_TIMEOUT_S + 20, env=(('SIM_STATUS_PY', _SIM_TIME_PY),))
+    except SimError as e:           # a hung query must not hide the violation check after it
+        warn('sim time query: %s' % e)
+        return {}
+    return parse_sim_time(p.stdout or '')
+
+
+def sim_time_lines(names: Sequence[str], vals: Dict[str, Optional[float]]) -> List[str]:
+    out = []
+    for n in names:
+        rtf, off = vals.get('/%s/sim/rtf' % n), vals.get('/%s/sim/time_offset' % n)
+        if rtf is None and off is None:
+            out.append('%s  no sim/rtf or sim/time_offset in %d s (is livox_sim_bridge_%s running? '
+                       'scripts/sim.py attach gazebo)' % (n, ECHO_TIMEOUT_S, n))
+            continue
+        out.append('%s  rtf %s%s  time_offset %s' % (
+            n, '-' if rtf is None else '%.3f' % rtf, '  LOW' if rtf is not None and rtf < RTF_MIN else '',
+            '-' if off is None else '%.3f s' % off))
+    return out
+
+
+def rtf_violations(run_dir: Path) -> List[str]:
+    """Lines the bridges appended this run (`up` rotates the log). An unreadable log
+    counts as a violation: it cannot show the run was valid."""
+    try:
+        text = (run_dir / RTF_LOG).read_text(errors='replace')
+    except FileNotFoundError:
+        return []
+    except OSError as e:
+        return ['(cannot read it: %s)' % e]
+    return [l for l in text.splitlines() if l.strip()]
+
+
+def red_banner(lines: Sequence[str]) -> str:
+    bar = '!' * 78
+    text = '\n'.join([bar] + ['!! ' + l for l in lines] + [bar])
+    return '\033[1;31m%s\033[0m' % text if sys.stdout.isatty() else text
 
 
 def cmd_loadtest(args: argparse.Namespace) -> int:
@@ -2065,6 +2652,13 @@ def cmd_loadtest(args: argparse.Namespace) -> int:
     print_loadtest(summaries, args.max_discovery)
     info('report: %s' % (lt_dir / 'report.json'))
     return 0 if summaries[0]['pass'] else 1
+
+
+def cmd_cpus(args: argparse.Namespace) -> int:
+    """Run inside sim-gazebo by pin_self: this process's affinity is the container's cpuset."""
+    gz, rest = split_cpus(os.sched_getaffinity(0), args.spare)
+    print(','.join(str(c) for c in (gz if args.part == 'gz' else rest)))
+    return 0
 
 
 def cmd_compose(argv: Sequence[str]) -> int:
@@ -2121,6 +2715,9 @@ def build_parser() -> argparse.ArgumentParser:
     lt.add_argument('--set', action='append', type=_key_value, default=[], metavar='KEY=VALUE',
                     help='override a session.json5 key in every variant, e.g. routing.interests.timeout=1000')
     sub.add_parser('compose', help='docker compose with the stack files: sim.py compose ps', add_help=False)
+    cpus = sub.add_parser('cpus', help='(run in sim-gazebo by its panes) print gzserver\'s cores or the rest\'s')
+    cpus.add_argument('part', choices=('gz', 'rest'))
+    cpus.add_argument('--spare', type=int, help='cores for the rest (default a quarter, at least 1)')
     return p
 
 
@@ -2132,7 +2729,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return cmd_compose(argv[1:])
         args = build_parser().parse_args(argv)
         return {'up': cmd_up, 'down': cmd_down, 'attach': cmd_attach, 'status': cmd_status,
-                'loadtest': cmd_loadtest}[args.cmd](args)
+                'loadtest': cmd_loadtest, 'cpus': cmd_cpus}[args.cmd](args)
     except SimError as e:
         print('[sim] ERROR: %s' % e, file=sys.stderr)
         return 1

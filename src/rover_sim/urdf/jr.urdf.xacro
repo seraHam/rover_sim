@@ -1,0 +1,143 @@
+<?xml version="1.0"?>
+<!-- JR class: Pioneer 3-DX, two driven wheels and a rear caster, with the MID-360 on a mast.
+     Physics model for the JR02-parity stack (launch/spawn_agent.launch.py): Gazebo's diff drive
+     takes /<ns>/cmd_vel, the sensors publish raw, and the model publishes no TF at all.
+     The root link 'chassis' sits on the floor under the drive-axle midpoint, the turning centre.
+     Geometry from the legacy pioneer3dx_body.urdf.xacro (gazebo_ros_pkgs' P3-DX meshes), with
+     the body raised to the real 0.0975 m wheels; collisions are boxes, cylinders, a sphere. -->
+<robot name="jr" xmlns:xacro="http://www.ros.org/wiki/xacro">
+
+  <xacro:arg name="namespace" default="JR81"/>
+  <xacro:arg name="lidar_mount_file" default="/rover_sim/run/sensor_calib/$(arg namespace)_lidar_mount.yaml"/>
+  <xacro:arg name="lidar_height" default="0.36"/>
+  <xacro:arg name="lidar_samples" default="500"/>   <!-- rays per scan: see spawn_agent.launch.py -->
+
+  <xacro:include filename="$(find rover_sim)/urdf/common_body.xacro"/>
+
+  <xacro:property name="ns" value="$(arg namespace)"/>
+  <xacro:property name="cfg" value="${xacro.load_yaml('$(find rover_sim)/config/classes.yaml')['jr']}"/>
+  <xacro:property name="meshes" value="package://rover_sim/meshes/p3dx"/>
+  <xacro:property name="r" value="${cfg['wheel_radius']}"/>
+  <xacro:property name="dz" value="${r - 0.091}"/>          <!-- the meshes' wheels are 0.091 -->
+  <xacro:property name="wheel_scale" value="${r / 0.091} 1 ${r / 0.091}"/>
+  <xacro:property name="caster_r" value="0.039"/>
+  <xacro:property name="plate_z" value="${0.234 + dz}"/>    <!-- top plate centre -->
+
+  <link name="chassis">
+    <!-- P3-DX 9 kg plus computer, battery and wiring; centre of mass behind the axle (the
+         battery sits aft) so the robot rests on its caster and pitches onto the wheels only
+         past ~3 m/s^2 of braking, as the real one lifts its caster near 2-2.3 m/s^2. -->
+    <xacro:box_inertial mass="11.0" x="0.40" y="0.30" z="0.20">
+      <origin xyz="-0.06 0 0.16" rpy="0 0 0"/>
+    </xacro:box_inertial>
+    <visual>
+      <origin xyz="-0.045 0 ${0.148 + dz}" rpy="0 0 0"/>
+      <geometry><mesh filename="${meshes}/chassis.stl"/></geometry>
+      <material name="chassis_red"><color rgba="0.851 0 0 1"/></material>
+    </visual>
+    <visual>
+      <origin xyz="-0.045 0 ${plate_z}" rpy="0 0 0"/>
+      <geometry><mesh filename="${meshes}/top.stl"/></geometry>
+      <material name="top_black"><color rgba="0.038 0.038 0.038 1"/></material>
+    </visual>
+    <visual>
+      <origin xyz="0.109 0 ${0.209 + dz}" rpy="0 0 0"/>
+      <geometry><mesh filename="${meshes}/front_sonar.stl"/></geometry>
+      <material name="sonar_yellow"><color rgba="0.715 0.583 0.210 1"/></material>
+    </visual>
+    <visual>
+      <origin xyz="-0.198 0 ${0.208 + dz}" rpy="0 0 0"/>
+      <geometry><mesh filename="${meshes}/back_sonar.stl"/></geometry>
+      <material name="sonar_yellow"><color rgba="0.715 0.583 0.210 1"/></material>
+    </visual>
+    <collision>
+      <origin xyz="-0.045 0 ${0.148 + dz}" rpy="0 0 0"/>
+      <geometry><box size="0.43 0.277 0.172"/></geometry>
+    </collision>
+    <collision>
+      <origin xyz="-0.045 0 ${plate_z}" rpy="0 0 0"/>
+      <geometry><box size="0.442 0.381 0.006"/></geometry>
+    </collision>
+  </link>
+  <gazebo reference="chassis">
+    <material>Gazebo/Red</material>
+  </gazebo>
+
+  <xacro:wheel name="left_wheel" parent="chassis" xyz="0 ${cfg['wheel_separation'] / 2} ${r}"
+               radius="${r}" width="0.041" mass="0.6" mesh="${meshes}/left_wheel.stl" mesh_scale="${wheel_scale}"
+               hub_mesh="${meshes}/left_hubcap.stl"/>
+  <xacro:wheel name="right_wheel" parent="chassis" xyz="0 ${-cfg['wheel_separation'] / 2} ${r}"
+               radius="${r}" width="0.041" mass="0.6" mesh="${meshes}/right_wheel.stl" mesh_scale="${wheel_scale}"
+               hub_mesh="${meshes}/right_hubcap.stl"/>
+
+  <!-- Caster: a frictionless sphere under the caster wheel, lumped into the chassis. It slides
+       any way the chassis goes, as the swivel lets the real one, without the two extra
+       bodies (swivel, wheel) a jointed caster would add to every JR. -->
+  <link name="caster">
+    <inertial>
+      <mass value="0.1"/>
+      <inertia ixx="${0.4 * 0.1 * caster_r**2}" ixy="0" ixz="0" iyy="${0.4 * 0.1 * caster_r**2}" iyz="0"
+               izz="${0.4 * 0.1 * caster_r**2}"/>
+    </inertial>
+    <visual>
+      <origin xyz="0.026 0 ${0.055 + dz - caster_r}" rpy="0 0 0"/>
+      <geometry><mesh filename="${meshes}/caster_swivel.stl"/></geometry>
+      <material name="caster_grey"><color rgba="0.5 0.5 0.5 1"/></material>
+    </visual>
+    <visual>
+      <geometry><mesh filename="${meshes}/caster_wheel.stl"/></geometry>
+      <material name="wheel_black"><color rgba="0.117 0.117 0.117 1"/></material>
+    </visual>
+    <collision>
+      <geometry><sphere radius="${caster_r}"/></geometry>
+    </collision>
+  </link>
+  <joint name="chassis_to_caster" type="fixed">
+    <parent link="chassis"/>
+    <child link="caster"/>
+    <origin xyz="-0.211 0 ${caster_r}" rpy="0 0 0"/>
+  </joint>
+  <gazebo reference="caster">
+    <material>Gazebo/Grey</material>
+    <mu1>0.0</mu1>
+    <mu2>0.0</mu2>
+    <maxContacts>1</maxContacts>
+  </gazebo>
+
+  <xacro:mast parent="chassis" bottom="${plate_z + 0.003}" top="${$(arg lidar_height) - 0.045}"/>
+
+  <xacro:sensor_head namespace="${ns}" parent="chassis" lidar_height="$(arg lidar_height)"
+                     mount_file="$(arg lidar_mount_file)" samples="$(arg lidar_samples)"/>
+
+  <gazebo>
+    <plugin name="diff_drive" filename="libgazebo_ros_diff_drive.so">
+      <ros>
+        <namespace>/${ns}</namespace>
+        <remapping>odom:=ground_truth/wheel_odom</remapping>
+      </ros>
+      <!-- The firmware's command handling (config/classes.yaml): clamp, v slew, timeout.
+           The slew moves v by a/update_rate per update, and the joints take each step at
+           once, so a higher rate makes a smoother ramp. -->
+      <update_rate>${cfg['drive_update_rate']}</update_rate>
+      <num_wheel_pairs>1</num_wheel_pairs>
+      <left_joint>left_wheel_joint</left_joint>
+      <right_joint>right_wheel_joint</right_joint>
+      <wheel_separation>${cfg['wheel_separation']}</wheel_separation>
+      <wheel_diameter>${2 * r}</wheel_diameter>
+      <max_linear_velocity>${cfg['v_max']}</max_linear_velocity>
+      <max_angular_velocity>${cfg['omega_max']}</max_angular_velocity>
+      <max_linear_acceleration>${cfg['linear_acceleration']}</max_linear_acceleration>
+      <max_linear_deceleration>${cfg['linear_acceleration']}</max_linear_deceleration>
+      <command_timeout>${cfg['command_timeout']}</command_timeout>
+      <max_wheel_torque>${cfg['max_wheel_torque']}</max_wheel_torque>
+      <!-- odometry_source 1: the model's world pose (truth, as the topic says), not encoders -->
+      <odometry_source>1</odometry_source>
+      <odometry_frame>world</odometry_frame>
+      <robot_base_frame>${ns}/chassis</robot_base_frame>
+      <publish_odom>true</publish_odom>
+      <publish_odom_tf>false</publish_odom_tf>
+      <publish_wheel_tf>false</publish_wheel_tf>
+    </plugin>
+  </gazebo>
+
+</robot>

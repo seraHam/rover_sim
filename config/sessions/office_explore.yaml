@@ -1,0 +1,20 @@
+# Office exploration: two P3-DX (JR) and two P3-AT (RR) start in the four corners of
+# ACL_office_simple and explore it (goal_selector picks frontiers; no fixed goals).
+#
+#   scripts/sim.py up office_explore
+#
+# Starts are the legacy launch/office_explore_demo.yaml ones, facing into the building,
+# except RR83's: the legacy (16.5, -17.0) is in a 1.5 m corridor, 0.62 m from a wall
+# corner, so it starts in the alcove at (13.0, -14.5) facing out of it. Clearance from
+# the nearest wall (2D, the world's box collisions): JR81 1.20 m, JR82 1.20 m,
+# RR83 1.19 m, RR84 1.10 m.
+name: office_explore
+world: ACL_office_simple
+gui: false
+mapping: gpu
+rviz: false
+agents:
+  - {name: JR81, class: jr, pose: [-4.5, 4.0, -45.0]}
+  - {name: JR82, class: jr, pose: [16.5, 4.0, -135.0]}
+  - {name: RR83, class: rr, pose: [13.0, -14.5, 90.0]}
+  - {name: RR84, class: rr, pose: [-4.8, -18.5, 45.0]}
