@@ -743,10 +743,11 @@ class RunFiles(unittest.TestCase):
         arena = sim.spawn_table(sim.validate_session(session(world='arena')), pins)
         self.assertEqual((list(arena), arena['walls']), (['world', 'walls', 'agents'], [-8.0, -8.0, 8.0, 8.0]))
         self.assertEqual([list(a) for a in t['agents']],
-                         [['name', 'class', 'id', 'x', 'y', 'yaw', 'yaw_deg', 'lidar_height', 'reference_robot']] * 2)
+                         [['name', 'class', 'id', 'x', 'y', 'yaw', 'yaw_deg', 'lidar_height', 'reference_robot',
+                           'odometry']] * 2)
         rr = t['agents'][1]
         self.assertEqual((rr['name'], rr['class'], rr['id'], rr['x'], rr['y'], rr['yaw_deg'], rr['lidar_height'],
-                          rr['reference_robot']), ('RR83', 'rr', 83, 2.0, 1.0, 90.0, 0.40, 'RR08'))
+                          rr['reference_robot'], rr['odometry']), ('RR83', 'rr', 83, 2.0, 1.0, 90.0, 0.40, 'RR08', 'dlio'))
         self.assertAlmostEqual(rr['yaw'], math.pi / 2)
         text = sim.generated_yaml(s, 'Agents', t)
         self.assertTrue(text.startswith('# Agents for session t'))
@@ -4751,6 +4752,207 @@ class VizCommand(unittest.TestCase):
                 self.assertTrue(v.endswith(':ro'), v)                       # zenoh, scripts, config, run
         grace = svc['stop_grace_period']
         self.assertTrue(grace.endswith('s') and float(grace[:-1]) >= sim.VIZ_STOP_GRACE_S)
+
+
+# ---------------------------------------------------------------------------- odometry: truth (NOT PARITY)
+
+class TruthOdometry(unittest.TestCase):
+    """The odometry source per agent: dlio (parity) or truth (truth_odom.py in DLIO's place)."""
+    ctx = sim.RunContext(run_dir=Path(sim.RUN_DIR_DEFAULT))
+
+    def test_defaults_and_validation(self):
+        s = sim.validate_session(session())
+        self.assertEqual((s.odometry, [a.odometry for a in s.agents], s.truth_agents), ('dlio', ['dlio', 'dlio'], []))
+        s = sim.validate_session(session(odometry='truth'))
+        self.assertEqual(([a.odometry for a in s.agents], s.truth_agents), (['truth', 'truth'], ['JR81', 'RR83']))
+        data = session(odometry='truth')
+        data['agents'][1]['odometry'] = 'dlio'                    # an agent's own wins over the default
+        s = sim.validate_session(data)
+        self.assertEqual((s.odometry, s.truth_agents), ('truth', ['JR81']))
+        self.assertIn("odometry: 'gps' is not one of dlio, truth", errors_of(session(odometry='gps')))
+        bad = session()
+        bad['agents'][0]['odometry'] = 'gps'
+        self.assertIn("agents[0] (JR81).odometry: 'gps' is not one of dlio, truth", errors_of(bad))
+        # A bad default is one error, not one per agent too.
+        self.assertEqual(errors_of(session(odometry='gps')).count('is not one of'), 1)
+
+    def test_round_trip(self):
+        data = session(odometry='dlio')
+        data['agents'][0]['odometry'] = 'truth'
+        s = sim.validate_session(data, 'test')
+        j = json.loads(json.dumps(s.to_json()))
+        self.assertEqual((j['odometry'], [a['odometry'] for a in j['agents']]), ('dlio', ['truth', 'dlio']))
+        self.assertEqual(sim.session_from_json(j), dataclasses.replace(s, source='test'))
+        # A session.json from before the key: every agent on DLIO.
+        old = {k: v for k, v in j.items() if k != 'odometry'}
+        old['agents'] = [{k: v for k, v in a.items() if k != 'odometry'} for a in j['agents']]
+        self.assertEqual([a.odometry for a in sim.session_from_json(old).agents], ['dlio', 'dlio'])
+        self.assertEqual(sim.json_odometry(old), OrderedDict([('JR81', 'dlio'), ('RR83', 'dlio')]))
+        self.assertEqual(sim.json_odometry(j), OrderedDict([('JR81', 'truth'), ('RR83', 'dlio')]))
+
+    def test_agents_env_keeps_odometry_by_name(self):
+        s = sim.apply_odometry(OFFICE, 'truth', ('JR82',))
+        # JR82 keeps its odometry though it takes JR81's place; a new agent takes the default.
+        env = sim.apply_agents_env(s, 'JR82:jr,RR85:rr')
+        self.assertEqual([(a.name, a.odometry) for a in env.agents], [('JR82', 'truth'), ('RR85', 'dlio')])
+        self.assertEqual((env.agents[0].x, env.agents[0].y), (OFFICE.agents[0].x, OFFICE.agents[0].y))
+        every = sim.apply_agents_env(sim.apply_odometry(OFFICE, 'truth'), 'JR81:jr,RR85:rr')
+        self.assertEqual([a.odometry for a in every.agents], ['truth', 'truth'])
+
+    def test_odometry_arg(self):
+        self.assertEqual(sim.parse_odometry_arg('truth'), ('truth', ()))
+        self.assertEqual(sim.parse_odometry_arg('truth:JR81, RR83'), ('truth', ('JR81', 'RR83')))
+        self.assertEqual(sim.parse_odometry_arg('dlio:JR81'), ('dlio', ('JR81',)))
+        import argparse
+        for bad in ('gps', 'truth:', 'truth:,', ''):
+            with self.assertRaises(argparse.ArgumentTypeError):
+                sim.parse_odometry_arg(bad)
+
+    def test_apply_odometry(self):
+        some = sim.apply_odometry(OFFICE, 'truth', ('JR81', 'RR84'))
+        self.assertEqual((some.odometry, some.truth_agents), ('dlio', ['JR81', 'RR84']))
+        self.assertEqual((some.source, some.name, some.agents[2].goals), (OFFICE.source, OFFICE.name, ()))
+        every = sim.apply_odometry(OFFICE, 'truth')
+        self.assertEqual((every.odometry, len(every.truth_agents)), ('truth', 4))
+        # --odometry dlio takes a truth session back to DLIO, every agent's own setting included.
+        back = sim.apply_odometry(every, 'dlio')
+        self.assertEqual((back.odometry, back.truth_agents), ('dlio', []))
+        self.assertEqual(dataclasses.replace(back, source=OFFICE.source), OFFICE)
+        env = sim.apply_agents_env(OFFICE, 'JR81:jr')
+        self.assertEqual(sim.apply_odometry(env, 'truth').agents_env, 'JR81:jr')
+        with self.assertRaises(sim.SessionError) as cm:
+            sim.apply_odometry(OFFICE, 'truth', ('JR99',))
+        self.assertIn('--odometry: JR99 not in session office_explore', str(cm.exception))
+
+    def test_spawn_table(self):
+        t = sim.spawn_table(sim.apply_odometry(SMOKE, 'truth', ('RR83',)), {'DLIO_JR_ROBOT': 'JR02',
+                                                                          'DLIO_RR_ROBOT': 'RR08'})
+        self.assertEqual([(a['name'], a['odometry']) for a in t['agents']], [('JR81', 'dlio'), ('RR83', 'truth')])
+
+    def test_graph_check_expects_truth_odom(self):
+        s = sim.apply_odometry(SMOKE, 'truth', ('JR81',))
+        edges = sim.graph_edges(s, ['gazebo', 'dlio'])
+        self.assertEqual(edges, [('/JR81/livox/lidar', '/JR81/truth_odom_JR81'),
+                                 ('/RR83/livox/lidar', '/RR83/dlio_odom_node')])
+        spec = importlib.util.spec_from_file_location('truth_odom', str(REPO / 'scripts' / 'truth_odom.py'))
+        to = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(to)
+        self.assertEqual(edges[0][1], '/JR81/' + to.node_name('JR81'))
+
+    def test_dlio_panes_truth(self):
+        s = sim.apply_odometry(SWAP, 'truth', ('JR81', 'RR83'))
+        panes = sim.dlio_panes(s, self.ctx)
+        windows = dict((w, [p.slug for p in ps]) for w, ps in sim.tmux_windows(panes))
+        self.assertEqual(windows['JR81'], ['truth-odom-JR81', 'map-odom-tf-JR81'])
+        self.assertEqual(windows['RR83'], ['truth-odom-RR83', 'map-odom-tf-RR83'])
+        self.assertEqual(windows['JR82'], ['dlio-JR82', 'seed-JR82', 'map-odom-tf-JR82'])
+        # The DLIO agents' panes are the plain session's.
+        plain = dict((p.slug, p) for p in sim.dlio_panes(SWAP, self.ctx))
+        for p in panes:
+            if p.slug in plain:
+                self.assertEqual(p, plain[p.slug])
+        by = {p.slug: p for p in panes}
+        t = by['truth-odom-RR83']
+        self.assertIn('TRUTH: not parity', t.title)
+        self.assertEqual((t.container, t.env, t.window, t.gate), ('sim-dlio-rr', sim.robot_env(s.agents[2]), 'RR83',
+                                                                  True))
+        self.assertEqual(t.cmd, 'python3 /rover_sim/scripts/truth_odom.py RR83 --spawn /rover_sim/run/spawn.yaml '
+                                '--dlio-cfg %s' % sim.DLIO_CFG_IN)
+        self.assertEqual(t.waits, t.cmd + ' --check')
+        inner = inner_of(t)
+        self.assertNotIn(sim.WAIT_FOR_SEED, inner)
+        self.assertLess(inner.index('wait_zenoh_ready.py'), inner.index('--check'))
+        self.assertTrue(inner.endswith(t.waits + ' && ' + sim.node_marker() + ' && ' + t.cmd))
+        subprocess.run(['bash', '-n', '-c', inner], check=True)
+        self.assertTrue((REPO / 'scripts' / sim.TRUTH_ODOM).is_file())
+        self.assertEqual(by['map-odom-tf-RR83'], plain['map-odom-tf-RR83'])
+
+    def test_labels(self):
+        od = OrderedDict
+        self.assertEqual(sim.odometry_label(od([('JR81', 'dlio')])), 'dlio (parity: DLIO per agent)')
+        self.assertTrue(sim.odometry_label(od([('JR81', 'truth'), ('RR83', 'truth')])).startswith(
+            'truth (NOT PARITY: ground truth as DLIO'))
+        mixed = sim.odometry_label(od([('JR81', 'truth'), ('RR83', 'dlio')]))
+        self.assertTrue(mixed.startswith('mixed (NOT PARITY for JR81: ground truth as DLIO'), mixed)
+        self.assertTrue(mixed.endswith('; DLIO for RR83)'), mixed)
+        self.assertEqual(sim.odometry_label(od([('JR81', 'truth')]), False, 'not started'),
+                         'not started (session odometry: truth)')
+        self.assertEqual(sim.odometry_word([]), 'dlio')
+
+    def test_agent_lines(self):
+        vals = sim.parse_status('@@ /JR81/dlio/odom_node/odom 100.0 0.004\n'
+                                '@@ /JR81/dlio/odom_node/pointcloud/deskewed 10.0\n'
+                                '@@ /RR83/dlio/odom_node/odom 100.0 0.006\n')
+        jr, rr = sim.agent_lines(['JR81', 'RR83'], vals, {'dlio'}, truth=['JR81'])
+        self.assertEqual(jr, 'JR81  truth odom (NOT PARITY) 100 Hz, stamp age 0.004 s,  scans 10.0 Hz')
+        self.assertTrue(rr.startswith('RR83  DLIO odom 100 Hz, stamp age 0.006 s'), rr)
+        paused = sim.agent_lines(['JR81'], {}, {'dlio'}, truth=['JR81'])[0]
+        self.assertIn('none yet (ground truth flows only while physics runs', paused)
+        # Without the truth argument, as before.
+        self.assertEqual(sim.agent_lines(['JR81'], vals, {'dlio'})[0].split(',')[0], 'JR81  DLIO odom 100 Hz')
+
+    def test_status(self):
+        class Panes:
+            returncode = 0
+            stdout = 'rsim-dlio\tJR81\t0\tJR81 truth odometry\tdocker\nrsim-drive\tteleop\t0\tx\tdocker\n'
+
+        with tempfile.TemporaryDirectory() as d:
+            run = Path(d)
+            (run / 'session.json').write_text(json.dumps(sim.apply_odometry(SMOKE, 'truth', ('JR81',)).to_json()))
+            patches = [mock.patch.object(sim, 'running_sim_containers', lambda: ['sim-drive']),
+                       mock.patch.object(sim, 'docker_inspect', lambda kind, name: None),
+                       mock.patch.object(sim, 'resolve_run_dir', lambda: run),
+                       mock.patch.object(sim, 'check_isolation', lambda: []),
+                       mock.patch.object(sim, 'link_snapshot', lambda up: {'router': 1, 'p2p': 0, 'listen': 1,
+                                                                           'syn_sent': 0}),
+                       mock.patch.object(sim, 'router_up', lambda: True),
+                       mock.patch.object(sim, 'tmux', lambda *a, **k: Panes()),
+                       mock.patch.object(sim, 'status_values', lambda specs: sim.parse_status(
+                           '@@ /JR81/dlio/odom_node/odom 100.0 0.004\n'))]
+            for p in patches:
+                p.start()
+            try:
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    self.assertEqual(sim.cmd_status(sim.build_parser().parse_args(['status'])), 0)
+            finally:
+                for p in patches:
+                    p.stop()
+        text = out.getvalue()
+        self.assertIn('odometry: mixed (NOT PARITY for JR81: ground truth as DLIO', text)
+        self.assertIn('; odometry from ground truth for JR81, NOT PARITY)', text)
+        self.assertIn('JR81  truth odom (NOT PARITY) 100 Hz', text)
+        self.assertIn('RR83  DLIO odom: none in', text)
+
+    def dry(self, name, *extra, check=True):
+        env = dict(os.environ)
+        env.pop('ROVER_SIM_AGENTS', None)
+        return subprocess.run([sys.executable, str(REPO / 'scripts' / 'sim.py'), 'up', name, '--dry-run'] + list(extra),
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, check=check,
+                              env=env)
+
+    def test_dry_runs(self):
+        plain = self.dry('office_explore').stdout
+        self.assertIn('odometry: dlio (parity: DLIO per agent)', plain)
+        self.assertNotIn('truth', plain.lower().replace('ground-truth', '').replace('ground truth', ''))
+        some = self.dry('office_explore', '--odometry', 'truth:JR81').stdout
+        self.assertIn('odometry: mixed (NOT PARITY for JR81: ground truth as DLIO', some)
+        self.assertRegex(some, r'  JR81  jr  id 81  pose .*  odometry: truth \(NOT PARITY\)\n')
+        self.assertNotRegex(some, r'  JR82  jr  id 82  pose .*NOT PARITY')
+        self.assertIn('[truth-odom-JR81] JR81 truth odometry (ground truth as DLIO), TRUTH: not parity', some)
+        self.assertNotIn('[seed-JR81]', some)
+        self.assertNotIn('[dlio-JR81]', some)
+        for ns in ('JR82', 'RR83', 'RR84'):
+            self.assertIn('[dlio-%s]' % ns, some)
+            self.assertIn('[seed-%s]' % ns, some)
+        every = self.dry('office_explore', '--odometry', 'truth').stdout
+        self.assertIn('odometry: truth (NOT PARITY: ground truth as DLIO', every)
+        self.assertEqual(every.count('[truth-odom-'), 4)
+        self.assertNotIn('[dlio-', every)
+        bad = self.dry('office_explore', '--odometry', 'truth:JR99', check=False)
+        self.assertNotEqual(bad.returncode, 0)
+        self.assertIn('--odometry: JR99 not in session office_explore', bad.stderr)
+        self.assertNotEqual(self.dry('office_explore', '--odometry', 'gps', check=False).returncode, 0)
 
 
 if __name__ == '__main__':

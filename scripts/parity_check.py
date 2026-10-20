@@ -2,6 +2,7 @@
 """Diffs one sim agent's ROS params and graph edges against a robot reference.
 
 Usage: parity_check.py <ns> [--ref JR02] [--nodes mighty_node,mpc,...] [--mapping gpu|fallback]
+                       [--odometry dlio|truth]
        parity_check.py <ns> --show-ref <node>   print the reference params, renamed to <ns>
        parity_check.py <ns> --selftest          check the checker on the fixtures alone (no docker)
        parity_check.py <ns> --local             query from this process (inside a sim container)
@@ -23,7 +24,9 @@ after one run). It is still one more session on the graph: run it before or afte
 that is being graded, not during one.
 
 --mapping defaults to the running session's (<run>/session.json, scripts/sim.py's run dir:
-$ROVER_SIM_RUN or /tmp/rover_sim-<uid>/run), else $ROVER_SIM_MAPPING, else gpu.
+$ROVER_SIM_RUN or /tmp/rover_sim-<uid>/run), else $ROVER_SIM_MAPPING, else gpu. --odometry
+defaults to the agent's there, else dlio: with truth (NOT PARITY, scripts/truth_odom.py in DLIO's
+place) DLIO's nodes are absent and truth_odom is sim-only (allowed_deviations.yaml odometry.truth).
 
 Nodes that are not running (or whose container is down) are reported as NOT RUNNING and do
 not fail the check unless --require-running is given, so it can be run while the stacks are
@@ -80,6 +83,7 @@ GRAPH_TOPICS_IGNORED = ('/parameter_events', '/rosout')
 QUERY_IN = '/rover_sim/scripts/parity_check.py'
 QUERY_MARK = '@@PARITY@@ '
 LEAVE_GAP_S, LEAVE_PAUSE_S = 0.5, 0.5
+ODOMETRY_MODES = ('dlio', 'truth')   # scripts/sim.py's
 DEFAULT_QUERY_CONTAINER = 'sim-drive'
 SIM_SESSION_URI = '/rover_sim/zenoh/session.json5'     # config/sim.env
 RUN_DIR_DEFAULT = '/tmp/rover_sim-%d/run' % os.getuid()  # scripts/sim.py's
@@ -257,7 +261,7 @@ def fetch_external(spec):
 class Reference:
     """tools/reference/<ref>/ (manifest, captures, whitelist), renamed to one sim agent."""
 
-    def __init__(self, ref, ns, mapping):
+    def __init__(self, ref, ns, mapping, odometry='dlio'):
         self.dir = os.path.join(REPO, 'tools', 'reference', ref.lower())
         self.external = {}
         if not os.path.isfile(self.path('manifest.yaml')):
@@ -269,13 +273,15 @@ class Reference:
         self.manifest = load_yaml_file(self.path('manifest.yaml'))
         self.external = self.manifest.get('external') or {}
         allowed = load_yaml_file(self.path('allowed_deviations.yaml')) or {}
-        self.ns, self.mapping = ns, mapping
+        self.ns, self.mapping, self.odometry = ns, mapping, odometry
         self.cls = self.manifest['classes'].get(m.group(1))
         if self.cls is None:
             die('no class for prefix %s (known: %s)' % (m.group(1), ', '.join(self.manifest['classes'])))
         tokens = self.manifest['reference_robots'][self.cls]
         self._token_rx = re.compile(r'(?<![A-Za-z0-9])(?:%s)(?![0-9])' % '|'.join(map(re.escape, tokens)))
         self.renames = {k: self.fmt(v) for k, v in (allowed.get('rename') or {}).items()}
+        self.absent_by = [(label, [self.fmt(p) for p in (layer or {}).get('absent') or []])
+                          for label, layer in self._layers(allowed)]
         self.patterns = {k: [self.fmt(p) for p in self._layered(allowed, k) or []]
                          for k in ('ignore', 'absent', 'sim_only')}
         self.param_rules = self._layered(allowed, 'params') or {}
@@ -325,13 +331,19 @@ class Reference:
             return {self.norm(k): self.norm(v) for k, v in obj.items()}
         return obj
 
+    def _layers(self, section):
+        """(label, layer): 'all', then this class's, this mapping mode's, this agent's odometry's."""
+        return [('all agents', section.get('all')), ('class %s' % self.cls, (section.get('class') or {}).get(self.cls)),
+                ('%s mapping' % self.mapping, (section.get('mapping') or {}).get(self.mapping)),
+                ('odometry: %s' % self.odometry, (section.get('odometry') or {}).get(self.odometry))]
+
     def _layered(self, section, key):
-        """section[key] from the 'all' layer, then this class's, then this mapping mode's.
+        """section[key] from the 'all' layer, then this class's, this mapping mode's, then this
+        agent's odometry's.
 
         Lists concatenate; dicts merge, one level deeper for dict values (node -> {glob: reason})."""
         out = None
-        for layer in (section.get('all'), (section.get('class') or {}).get(self.cls),
-                      (section.get('mapping') or {}).get(self.mapping)):
+        for _, layer in self._layers(section):
             v = (layer or {}).get(key)
             if not v:
                 continue
@@ -405,6 +417,13 @@ class Reference:
         for kind in ('ignore', 'absent', 'sim_only'):
             if any(fnmatch.fnmatchcase(fqn, p) for p in self.patterns[kind]):
                 return kind
+        return None
+
+    def absent_reason(self, fqn):
+        """Which layer has the sim not run node fqn ('fallback mapping', 'odometry: truth'), or None."""
+        for label, patterns in self.absent_by:
+            if any(fnmatch.fnmatchcase(fqn, p) for p in patterns):
+                return label
         return None
 
     def mine(self, fqn):
@@ -785,7 +804,7 @@ def run_checks(ref, sim, selected, args):
         e = nodes[name]
         if e['sim_fqn'] not in running:
             absent = ref.node_class(e['sim_fqn']) == 'absent'
-            why = ('not run in the sim (%s mapping)' % ref.mapping if absent else
+            why = ('not run in the sim (%s)' % ref.absent_reason(e['sim_fqn']) if absent else
                    'container %s is down' % e['container'] if not sim.running(e['container']) else
                    '%s not in the graph' % e['sim_fqn'] if graph_ok else 'unknown: no node list')
             results.append(Result('nodes', name, ALLOWED if absent else NOT_RUNNING, why))
@@ -883,6 +902,25 @@ def session_mapping(ns, run_dir=None):
     return mode, note
 
 
+def session_odometry(ns, run_dir=None):
+    """(odometry mode, note) of agent ns in the running session (sim.py's <run>/session.json: the
+    agent's entry, else the session's default; a file from before the key is dlio), or (None, why)."""
+    run_dir = run_dir or os.environ.get('ROVER_SIM_RUN') or RUN_DIR_DEFAULT
+    path = os.path.join(run_dir, 'session.json')
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except (OSError, ValueError) as exc:
+        return None, 'no session.json (%s)' % exc
+    entry = next((a for a in data.get('agents') or [] if isinstance(a, dict) and a.get('name') == ns), None)
+    if entry is None:
+        return None, '%s is not an agent of session %s (%s)' % (ns, data.get('name'), path)
+    mode = entry.get('odometry', data.get('odometry', 'dlio'))
+    if mode not in ODOMETRY_MODES:
+        return None, '%s: %s has odometry %r' % (path, ns, mode)
+    return mode, 'session %s (%s)' % (data.get('name'), path)
+
+
 def query_main(arg):
     """--query: run query() on the JSON spec and print its answer (inside a sim container)."""
     require_sim_session()
@@ -904,6 +942,9 @@ def main(argv=None):
     p.add_argument('--mapping', choices=('gpu', 'fallback'), default=None,
                    help="the session's mapping mode; fallback allows its documented non-parity keys (default: the "
                         "running session's, else $ROVER_SIM_MAPPING, else gpu)")
+    p.add_argument('--odometry', choices=ODOMETRY_MODES, default=None,
+                   help="the agent's odometry; truth (ground truth as DLIO, truth_odom.py) allows DLIO's nodes "
+                        "to be absent (default: the agent's in the running session, else dlio)")
     p.add_argument('--run-dir', help='scripts/sim.py\'s run dir (default $ROVER_SIM_RUN or %s)' % RUN_DIR_DEFAULT)
     p.add_argument('--no-params', dest='params', action='store_false', help='skip the param dumps')
     p.add_argument('--no-graph', dest='graph', action='store_false', help='skip the graph edges')
@@ -927,7 +968,12 @@ def main(argv=None):
             env = os.environ.get('ROVER_SIM_MAPPING')
             args.mapping = env if env in ('gpu', 'fallback') else 'gpu'
             mapping_note += '; %s' % ('$ROVER_SIM_MAPPING' if env in ('gpu', 'fallback') else 'default')
-    ref = Reference(args.ref, args.ns, args.mapping)
+    odometry_note = 'given'
+    if args.odometry is None:
+        args.odometry, odometry_note = session_odometry(args.ns, args.run_dir)
+        if args.odometry is None:
+            args.odometry, odometry_note = 'dlio', odometry_note + '; default'
+    ref = Reference(args.ref, args.ns, args.mapping, args.odometry)
     nodes = ref.nodes()
     if args.show_ref:
         e = nodes.get(args.show_ref)
@@ -955,8 +1001,9 @@ def main(argv=None):
     if args.selftest:
         return selftest(ref, selected, args)
 
-    print('parity_check: %s (class %s, %s mapping: %s) vs %s (%s)'
-          % (args.ns, ref.cls, args.mapping, mapping_note, args.ref, os.path.relpath(ref.dir, REPO)))
+    print('parity_check: %s (class %s, %s mapping: %s; odometry %s%s: %s) vs %s (%s)'
+          % (args.ns, ref.cls, args.mapping, mapping_note, args.odometry,
+             ', NOT PARITY' if args.odometry == 'truth' else '', odometry_note, args.ref, os.path.relpath(ref.dir, REPO)))
     hdr, results = run_checks(ref, Sim(args.timeout, args.spin_time, args.save, local=args.local), selected, args)
     for line in hdr:
         print('  ' + line)

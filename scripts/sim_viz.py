@@ -621,9 +621,10 @@ def grid_labels(msg):
 class AgentPanel:
     """One agent's received state (callbacks only store here) and its panel's drawing."""
 
-    def __init__(self, spawn, cls, color, layers):
+    def __init__(self, spawn, cls, color, layers, odometry='dlio'):
         self.name, self.cls, self.color, self.spawn = spawn.name, cls, color, spawn
         self.layers = layers
+        self.odometry = odometry          # spawn.yaml's: truth (NOT PARITY) is tagged in the header
         self.msgs = {}                    # grid and pose layers: the newest message
         self.rates = dict((k, Rate()) for k in LAYERS)
         self.labels = {}                  # grid layer -> (msg, labels): converted once per message
@@ -830,7 +831,8 @@ def draw_header(a, w, shown, follow, zoom, follow_m, view, now, invalid=0):
     head = np.full((HEADER_ROWS * ROW_H + 8, w, 3), HEAD_BG, np.uint8)
     cv2.rectangle(head, (0, 0), (8, head.shape[0]), a.color, -1)
     mode = ('follow %.0f m across (zoom x%.2g)' % (follow_m / zoom, zoom) if follow else 'world view')
-    put(head, '%s (%s)' % (a.name, a.cls.upper()), (16, ROW_H), (255, 255, 255), 0.6, 2)
+    put(head, '%s (%s%s)' % (a.name, a.cls.upper(), ', TRUTH odom: not parity' if a.odometry == 'truth' else ''),
+        (16, ROW_H), (255, 255, 255), 0.6, 2)
     put(head, '%s, %g m grid' % (mode, grid_spacing(view.res)), (150, ROW_H), TEXT_ON)
     items = []
     for i, (k, lay) in enumerate(LAYERS.items()):
@@ -1179,8 +1181,9 @@ def main(argv=None):
     snap = bool(args.snapshot)
     store, frames = MarkerStore(), frame_table(spawns)
     classes = dict((a.get('name'), a.get('class', '?')) for a in data['agents'])
-    panels = [AgentPanel(p, classes.get(p.name, '?'), PANEL_COLORS[i % len(PANEL_COLORS)], layers)
-              for i, p in enumerate(agents)]
+    odometry = dict((a.get('name'), a.get('odometry', 'dlio')) for a in data['agents'])
+    panels = [AgentPanel(p, classes.get(p.name, '?'), PANEL_COLORS[i % len(PANEL_COLORS)], layers,
+                         odometry.get(p.name, 'dlio')) for i, p in enumerate(agents)]
     # Only the spawn poses' view grows: --bounds and the walls are the world.
     viewer = Viewer(panels, frames, store, bounds, args.size, args.follow, args.follow_m, layers,
                     grow=not args.bounds and not data.get('walls'))

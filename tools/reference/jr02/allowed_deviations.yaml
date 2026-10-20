@@ -3,7 +3,8 @@
 # fails the check. Add an entry only together with the change that needs it, and say why.
 #
 # Layers: 'all' always applies, then class.<jr|rr>, then mapping.<gpu|fallback> (the session's
-# mapping mode, parity_check --mapping). Lists add up; params merge per node.
+# mapping mode, parity_check --mapping), then odometry.<dlio|truth> (the agent's odometry,
+# parity_check --odometry). Lists add up; params merge per node.
 # {ns} = the agent namespace, {class} = jr | rr. Patterns are shell globs (fnmatch).
 #   params:   node -> {param name: reason}. robot_state_publisher's URDF is compared per joint,
 #             as robot_description:<joint name>.
@@ -96,3 +97,16 @@ mapping:
       - /{ns}/elevation_mapping_node
     sim_only:
       - /{ns}/*relay*
+
+odometry:
+  truth:
+    # odometry: truth is labelled "not parity": a control, not the robot. scripts/truth_odom.py
+    # publishes Gazebo's ground truth under DLIO's names (odom, pose, deskewed cloud, odom ->
+    # base_link and base_link -> imu on /tf, dlio/session) in place of DLIO's launch, which
+    # runs dlio_odom_node, dlio_map_node and dlio_session. map_odom_tf_broadcaster still runs.
+    absent:
+      - /{ns}/dlio_odom_node
+      - /dlio_map_node_{ns}
+      - /{ns}/dlio_session
+    sim_only:
+      - /{ns}/truth_odom_{ns}

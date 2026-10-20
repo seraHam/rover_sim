@@ -6,7 +6,7 @@ script brings them up and runs every node as a `docker exec` from a host tmux se
 per stack (rsim-<stack>), the way the robot's *_host_tmux.sh units do, so Ctrl-C / Up /
 Enter in a pane restarts that one node.
 
-  scripts/sim.py up <session> [--stacks a,b] [--partial] [--no-arm] [--rviz] [--dry-run]
+  scripts/sim.py up <session> [--stacks a,b] [--partial] [--no-arm] [--rviz] [--odometry MODE[:NS,...]] [--dry-run]
   scripts/sim.py down [--containers]
   scripts/sim.py attach [<stack>]
   scripts/sim.py status [--maps]
@@ -26,13 +26,14 @@ Enter in a pane restarts that one node.
                                 # metres on a bare floor (src/rover_sim/config/worlds.yaml)
   gui: false                    # gzclient on $DISPLAY
   mapping: fallback             # gpu (parity) | fallback (no GPU, "not parity")
+  odometry: dlio                # dlio (parity) | truth (ground truth as DLIO, "not parity"); per agent too
   rviz: false                   # RViz on $DISPLAY (<run>/rviz/session.rviz)
   planner: true                 # mighty_hw.sh's panes per agent (default true)
   demo: swap                    # none | swap (start <-> goals, repeatedly) | explore
   auto_arm: true                # true: put each safety_node in AUTO once its DLIO tracks
   agents:                       # pose: world frame, [x m, y m, yaw deg]; goals [x, y] likewise
     - {name: JR81, class: jr, pose: [-2.0, 0.0, 0.0], goals: [[2.0, 0.0]]}
-    - {name: RR83, class: rr, pose: [2.0, 0.0, 180.0], goals: [[-2.0, 0.0]]}
+    - {name: RR83, class: rr, pose: [2.0, 0.0, 180.0], goals: [[-2.0, 0.0]], odometry: truth}
 
 Agent names are a class prefix (JR, RR) plus two digits. The digits must be unique
 across classes: mighty takes its agent id from them. Each class is calibrated from one
@@ -47,13 +48,19 @@ Stacks are a registry (STACKS below). Each names its containers and builds its p
 from the session: `zenoh` (the router in sim-drive), `gazebo` (world, spawns, sensor
 bridges, world-><ns>/map), `drive` (teleop + safety_node, rover_description per agent),
 `frame_align` (ground-truth alignment for mighty), `dlio` (DLIO, its seed pose and
-map->odom per agent), `mapping` (global_mapper, map_fusion, persistent_map per agent), for
+map->odom per agent; truth_odom.py and map->odom for odometry: truth), `mapping` (global_mapper, map_fusion, persistent_map per agent), for
 `mapping: gpu` `elevation` (the Orin's elevation mapper per agent), `mighty` (mighty_hw.sh's
 mighty_node, convert_odom_to_state, mpc and goal_selector per agent), with rviz `rviz`, and
 for every planner session `goals` (scripts/goal_relay.py: each agent's first drive, the session's
 goals, and RViz's SetGoal on /sim/goal, to each agent's term_goal_rviz in its own <ns>/map).
 `mapping: fallback` is NOT PARITY: no GPU, so no elevation and no map_fusion; global_mapper
 runs a sim config and grid_relay.py puts its grids on the planner's names.
+`odometry: truth` is NOT PARITY too, and a control: scripts/truth_odom.py publishes Gazebo's
+ground truth under DLIO's names (odom, pose, deskewed cloud, TF, dlio/session) from the image's
+own DLIO cfg, so what the maps and the planner still do wrong is not DLIO's drift. It is per
+agent (an agent's odometry: wins over the session's), and `up --odometry truth[:NS,...]` sets it
+for one run (apply_odometry; session.json and spawn.yaml record each agent's). parity_check.py,
+demo_eval.py, odom_eval.py and sim_viz.py read it there.
 
 `up` starts them in waves into a paused world (Stack.wave): first the router and Gazebo,
 whose spawn pane spawns every agent while nothing else is on the graph (wait_spawned; it
@@ -288,13 +295,17 @@ ROBOT_CLASSES = OrderedDict([
 ])
 CLASS_PREFIXES = OrderedDict((k, c.prefix) for k, c in ROBOT_CLASSES.items())  # class -> name prefix
 MAPPING_MODES = ('gpu', 'fallback')
+# Where an agent's odometry comes from: dlio, the robot's DLIO; truth (NOT PARITY), Gazebo's
+# ground truth published under DLIO's names by scripts/truth_odom.py, to tell what DLIO's drift
+# does from what the mapping and the planner do. Per agent, with the session's as the default.
+ODOMETRY_MODES = ('dlio', 'truth')
 # What the goals stack does with the planner (goal_relay.py --mode): swap drives each agent
 # between its start and its goals, over and over; explore leaves the goals to goal_selector's
 # exploration (hw_goal_selector.yaml has it on), as on the robot; none sends nothing.
 DEMOS = ('none', 'swap', 'explore')
 IDENT_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_.-]*$')
-SESSION_KEYS = ('name', 'world', 'gui', 'mapping', 'rviz', 'auto_arm', 'planner', 'demo', 'agents')
-AGENT_KEYS = ('name', 'class', 'pose', 'goals')
+SESSION_KEYS = ('name', 'world', 'gui', 'mapping', 'odometry', 'rviz', 'auto_arm', 'planner', 'demo', 'agents')
+AGENT_KEYS = ('name', 'class', 'pose', 'goals', 'odometry')
 
 
 @dataclass(frozen=True)
@@ -305,6 +316,7 @@ class Agent:
     y: float
     yaw_deg: float
     goals: Tuple[Tuple[float, ...], ...] = ()
+    odometry: str = 'dlio'             # ODOMETRY_MODES: this agent's, the session's default unless it sets one
 
     @property
     def id(self) -> int:
@@ -333,6 +345,7 @@ class Session:
     auto_arm: bool = False             # the planner sessions arm; see the module docstring
     planner: bool = True
     demo: str = 'none'
+    odometry: str = 'dlio'             # the default for agents that set none (Agent.odometry is each one's)
     agents_env: str = ''               # the ROVER_SIM_AGENTS this `up` took its agents from
 
     @property
@@ -343,22 +356,34 @@ class Session:
     def by_class(self, cls: str) -> List[Agent]:
         return [a for a in self.agents if a.cls == cls]
 
+    @property
+    def truth_agents(self) -> List[str]:
+        """The agents on ground-truth odometry (odometry: truth, NOT PARITY)."""
+        return [a.name for a in self.agents if a.odometry == 'truth']
+
     def settings(self) -> 'OrderedDict[str, Any]':
         """The session's own keys, as its YAML spells them (agents aside)."""
         return OrderedDict([('name', self.name), ('world', self.world), ('gui', self.gui), ('mapping', self.mapping),
-                            ('rviz', self.rviz), ('auto_arm', self.auto_arm), ('planner', self.planner),
-                            ('demo', self.demo)])
+                            ('odometry', self.odometry), ('rviz', self.rviz), ('auto_arm', self.auto_arm),
+                            ('planner', self.planner), ('demo', self.demo)])
 
     def to_json(self) -> Dict[str, Any]:
         out = self.settings()
         out.update([('num_agents', self.num_agents), ('source', self.source)])
         if self.agents_env:
             out['agents_override'] = self.agents_env
-        out['agents'] = [OrderedDict([('name', a.name), ('class', a.cls), ('id', a.id),
-                                      ('pose', [a.x, a.y, a.yaw_deg]),
-                                      ('goals', [list(g) for g in a.goals])])
-                         for a in self.agents]
+        out['agents'] = [agent_entry(a, with_id=True) for a in self.agents]
         return out
+
+
+def agent_entry(a: Agent, with_id: bool = False) -> 'OrderedDict[str, Any]':
+    """An agent as a session file spells it (validate_session takes it back), with its
+    effective odometry; with_id adds mighty's id, as session.json carries it."""
+    out = OrderedDict([('name', a.name), ('class', a.cls)])  # type: OrderedDict[str, Any]
+    if with_id:
+        out['id'] = a.id
+    out.update([('pose', [a.x, a.y, a.yaw_deg]), ('goals', [list(g) for g in a.goals]), ('odometry', a.odometry)])
+    return out
 
 
 def _is_num(v: Any) -> bool:
@@ -382,6 +407,9 @@ def validate_session(data: Any, source: str = '<session>') -> Session:
     mapping = data.get('mapping', 'gpu')
     if mapping not in MAPPING_MODES:
         errs.append('mapping: %r is not one of %s' % (mapping, ', '.join(MAPPING_MODES)))
+    odometry = data.get('odometry', 'dlio')
+    if odometry not in ODOMETRY_MODES:
+        errs.append('odometry: %r is not one of %s' % (odometry, ', '.join(ODOMETRY_MODES)))
     flags = OrderedDict((k, data.get(k, d)) for k, d in (('rviz', False), ('gui', False), ('auto_arm', False),
                                                          ('planner', True)))
     for k, v in flags.items():
@@ -438,9 +466,12 @@ def validate_session(data: Any, source: str = '<session>') -> Session:
         if not (isinstance(goals, list) and all(
                 isinstance(g, list) and len(g) in (2, 3) and all(_is_num(v) for v in g) for g in goals)):
             errs.append('%s.goals: %r is not a list of [x, y] or [x, y, yaw_deg]' % (where, goals))
+        odo = a.get('odometry', odometry if odometry in ODOMETRY_MODES else 'dlio')
+        if odo not in ODOMETRY_MODES:
+            errs.append('%s.odometry: %r is not one of %s' % (where, odo, ', '.join(ODOMETRY_MODES)))
         if len(errs) == before:
             agents.append(Agent(an, cls, float(pose[0]), float(pose[1]), float(pose[2]),
-                                tuple(tuple(float(v) for v in g) for g in goals)))
+                                tuple(tuple(float(v) for v in g) for g in goals), odo))
     # goal_relay.py swaps each agent between its start and its goals; an agent without goals
     # stays put (an obstacle to the others). Exploration picks its own goals.
     if demo == 'swap' and agents and not any(a.goals for a in agents):
@@ -451,7 +482,7 @@ def validate_session(data: Any, source: str = '<session>') -> Session:
     if errs:
         raise SessionError('%s: invalid session:\n  - %s' % (source, '\n  - '.join(errs)))
     return Session(name, world, mapping, flags['rviz'], tuple(agents), source, flags['gui'], flags['auto_arm'],
-                   flags['planner'], demo)
+                   flags['planner'], demo, odometry)
 
 
 def session_path(arg: str) -> Path:
@@ -566,9 +597,11 @@ def apply_agents_env(session: Session, text: str) -> Session:
     wins (and has no goals). Otherwise, with as many agents as the session places or fewer,
     agent i takes the session's place i and its goals; with more, every one goes on the world's
     circle (circle_layout; swap goals past the far side: circle_goal), and in a world without one the extra
-    agents need a pose."""
+    agents need a pose. Odometry goes by name, not by place: an agent the session names keeps
+    its odometry, any other takes the session's default."""
     entries = parse_agents_env(text)
     slots, n = session.agents, len(entries)
+    odometry = dict((a.name, a.odometry) for a in slots)
     circle = circle_layout(session.world, n) if n > len(slots) else None
     raw = []
     for i, (name, cls, pose) in enumerate(entries):
@@ -585,10 +618,39 @@ def apply_agents_env(session: Session, text: str) -> Session:
                                % (AGENTS_ENV, name, session.name, len(slots), session.world, n,
                                   ', '.join(sorted(AGENT_CIRCLES)), CIRCLE_MAX_AGENTS, name, cls))
         raw.append({'name': name, 'class': cls, 'pose': list(pose), 'goals': goals})
+        if name in odometry:
+            raw[-1]['odometry'] = odometry[name]
     data = session.settings()
     data['agents'] = raw
     s = validate_session(data, '%s with %s=%s' % (session.source, AGENTS_ENV, text))
     return dataclasses.replace(s, source=session.source, agents_env=text)
+
+
+def parse_odometry_arg(text: str) -> Tuple[str, Tuple[str, ...]]:
+    """up --odometry MODE[:NS[,NS...]]: (mode, names); no names means every agent."""
+    mode, sep, rest = text.partition(':')
+    names = tuple(n.strip() for n in rest.split(',') if n.strip())
+    if mode not in ODOMETRY_MODES or (sep and not names):
+        raise argparse.ArgumentTypeError('%r is not MODE or MODE:NS[,NS...] with MODE one of %s (e.g. truth:JR81)'
+                                         % (text, ', '.join(ODOMETRY_MODES)))
+    return mode, names
+
+
+def apply_odometry(session: Session, mode: str, names: Sequence[str] = ()) -> Session:
+    """The session with `mode` odometry for the named agents, or, with no names, for every
+    agent and as the default (so --odometry dlio also takes a truth session back to DLIO)."""
+    unknown = sorted(set(names) - set(a.name for a in session.agents))
+    if unknown:
+        raise SessionError('--odometry: %s not in session %s (agents: %s)' % (
+            ', '.join(unknown), session.name, ', '.join(a.name for a in session.agents)))
+    data = session.settings()
+    if not names:
+        data['odometry'] = mode
+    data['agents'] = [agent_entry(dataclasses.replace(a, odometry=mode) if not names or a.name in names else a)
+                      for a in session.agents]
+    s = validate_session(data, '%s with --odometry %s%s' % (session.source, mode,
+                                                             ':' + ','.join(names) if names else ''))
+    return dataclasses.replace(s, source=session.source, agents_env=session.agents_env)
 
 
 def world_problem(world: str, worlds_dir: Path = WORLDS_DIR) -> Optional[str]:
@@ -720,6 +782,10 @@ TELEOP_SRC = '/home/swarm/code/rover_ws/install/share/rover_control/config/teleo
 # checkout of DLIO_SHA there, read-only.
 DLIO_WS = '/home/swarm/code/dlio_ws'
 DLIO_SCRIPTS = ('dlio_with_session.launch.py', 'dlio_session.py', 'map_odom_tf.py', 'wait_zenoh_ready.py')
+# The cfg DLIO loads in each class's image (dlio.launch.py: cfg/dlio.yaml, then cfg/params.yaml):
+# truth_odom.py takes the extrinsics, the crop box and the calibration time from it too.
+DLIO_CFG_IN = DLIO_WS + '/install/share/direct_lidar_inertial_odometry/cfg'
+TRUTH_ODOM = 'truth_odom.py'         # this repo's scripts/, mounted at SCRIPTS_IN
 
 
 def sim_only(name: str) -> str:
@@ -1105,14 +1171,17 @@ def frame_align_panes(session: Session, ctx: RunContext) -> List[Pane]:
 
 def spawn_table(session: Session, pins: Dict[str, str]) -> Dict[str, Any]:
     """<run>/spawn.yaml: what sim_tf.py and the spawn pane place every agent from, and the
-    world's walls (world_walls) for drive_pattern.py."""
+    world's walls (world_walls) for drive_pattern.py. Each agent's odometry is there too, for the
+    tools in the containers (truth_odom.py, demo_eval.py, odom_eval.py, sim_viz.py), which read
+    this file and not session.json (drive_pattern.spawn_odometry: no key is dlio)."""
     out = {'world': session.world}  # type: Dict[str, Any]
     walls = world_walls(session.world)
     if walls:
         out['walls'] = walls
     out['agents'] = [{'name': a.name, 'class': a.cls, 'id': a.id, 'x': a.x, 'y': a.y, 'yaw': a.yaw,
                       'yaw_deg': a.yaw_deg, 'lidar_height': ROBOT_CLASSES[a.cls].lidar_height,
-                      'reference_robot': reference_robot(a.cls, pins)} for a in session.agents]
+                      'reference_robot': reference_robot(a.cls, pins), 'odometry': a.odometry}
+                     for a in session.agents]
     return out
 
 
@@ -1472,20 +1541,35 @@ def map_odom_tf_cmd(a: Agent) -> str:
             % (DLIO_WS, a.name, a.name))
 
 
+def truth_odom_cmd(a: Agent, check: bool = False) -> str:
+    """odometry: truth (NOT PARITY): truth_odom.py publishes ground truth under DLIO's names, from
+    the image's DLIO cfg (DLIO_CFG_IN) and <run>/spawn.yaml. With check, the pane's gate: it
+    validates both, and refuses an agent that spawn.yaml does not mark truth."""
+    return 'python3 %s/%s %s --spawn %s --dlio-cfg %s%s' % (SCRIPTS_IN, TRUTH_ODOM, a.name, run_path(SPAWN_FILE),
+                                                         DLIO_CFG_IN, ' --check' if check else '')
+
+
 def dlio_panes(session: Session, ctx: RunContext) -> List[Pane]:
     """sim-dlio-<class> (dlio_container): per agent one window with dlio_host_tmux.sh's three
     panes, the class's image baking its reference robot's cfg_overlay. DLIO calibrates its
     IMU for 3 s after the first sample: safety_node holds the agent still (DISARMED) until
-    arm_agents. The kernel balances the DLIO processes within the container's cpuset."""
+    arm_agents. The kernel balances the DLIO processes within the container's cpuset.
+    An agent with odometry: truth (NOT PARITY) gets truth_odom.py in DLIO's place, and no seed
+    pose (only DLIO reads it); map->odom is the same."""
     panes = []
     for a in session.agents:
         c = dlio_container(a)
-        panes += [Pane('%s dlio odometry' % a.name, 'dlio-' + a.name, c, dlio_launch_cmd(a), env=robot_env(a),
-                       window=a.name, waits=seed_wait(a)),
-                  Pane('%s seed pose' % a.name, 'seed-' + a.name, c, seed_pose_cmd(a), env=robot_env(a),
-                       window=a.name),
-                  Pane('%s tf map->odom' % a.name, 'map-odom-tf-' + a.name, c, map_odom_tf_cmd(a), env=robot_env(a),
-                       window=a.name)]
+        if a.odometry == 'truth':
+            panes.append(Pane('%s truth odometry (ground truth as DLIO), TRUTH: not parity' % a.name,
+                              'truth-odom-' + a.name, c, truth_odom_cmd(a), env=robot_env(a), window=a.name,
+                              waits=truth_odom_cmd(a, check=True)))
+        else:
+            panes += [Pane('%s dlio odometry' % a.name, 'dlio-' + a.name, c, dlio_launch_cmd(a), env=robot_env(a),
+                           window=a.name, waits=seed_wait(a)),
+                      Pane('%s seed pose' % a.name, 'seed-' + a.name, c, seed_pose_cmd(a), env=robot_env(a),
+                           window=a.name)]
+        panes.append(Pane('%s tf map->odom' % a.name, 'map-odom-tf-' + a.name, c, map_odom_tf_cmd(a),
+                          env=robot_env(a), window=a.name))
     return panes
 
 
@@ -2034,7 +2118,8 @@ STACKS = OrderedDict((s.name, s) for s in (
           implemented=True, generate=(write_agent_files, link_calib, write_teleop_file), wave=1),
     Stack('frame_align', 2, 'ground-truth frame_align per ordered agent pair', ('sim-mighty',),
           frame_align_panes, implemented=True, wanted=lambda s: len(s.agents) > 1, wave=1),
-    Stack('dlio', 3, 'DLIO, seed pose and map->odom per agent', ('sim-dlio-jr', 'sim-dlio-rr'), dlio_panes,
+    Stack('dlio', 3, 'DLIO (truth_odom.py for odometry: truth), seed pose and map->odom per agent',
+          ('sim-dlio-jr', 'sim-dlio-rr'), dlio_panes,
           implemented=True, generate=(write_dlio_launch,), wave=1),
     Stack('mapping', 4, 'global_mapper, map_fusion, persistent_map per agent', ('sim-mapping',),
           mapping_panes, implemented=True, generate=(write_mapping_files,), wave=2),
@@ -2155,6 +2240,39 @@ def mapping_label(mode: str, runs: bool = True, absent: str = 'not running') -> 
         return ('fallback (NOT PARITY: no elevation map, no map_fusion; global_mapper on the sim\'s fallback '
                 'config, grid_relay.py; parity_check.py --mapping fallback)')
     return 'gpu (parity: global_mapper, elevation_mapping_cupy, map_fusion, persistent_map)'
+
+
+def odometry_word(modes: Sequence[str]) -> str:
+    """dlio, truth, or mixed: the agents' odometry in one word."""
+    have = set(modes)
+    return 'mixed' if len(have) > 1 else (have.pop() if have else 'dlio')
+
+
+def odometry_label(modes: 'OrderedDict[str, str]', runs: bool = True, absent: str = 'not running') -> str:
+    """How `up`, its dry run and `status` name the agents' odometry ({agent: mode}); as with
+    mapping_label, only what runs gets the label (`up --stacks` without dlio runs none)."""
+    word = odometry_word(modes.values())
+    if not runs:
+        return '%s (session odometry: %s)' % (absent, word)
+    truth = [n for n, m in modes.items() if m == 'truth']
+    if not truth:
+        return 'dlio (parity: DLIO per agent)'
+    what = 'ground truth as DLIO (truth_odom.py; parity_check.py takes it from session.json)'
+    if word == 'truth':
+        return 'truth (NOT PARITY: %s for every agent)' % what
+    return 'mixed (NOT PARITY for %s: %s; DLIO for %s)' % (
+        ', '.join(truth), what, ', '.join(n for n, m in modes.items() if m != 'truth'))
+
+
+def session_odometry(session: Session) -> 'OrderedDict[str, str]':
+    return OrderedDict((a.name, a.odometry) for a in session.agents)
+
+
+def json_odometry(data: Dict[str, Any]) -> 'OrderedDict[str, str]':
+    """{agent: mode} from a raw session.json; one written before the key existed is all dlio."""
+    default = data.get('odometry', 'dlio')
+    return OrderedDict((a.get('name'), a.get('odometry', default)) for a in data.get('agents', ())
+                       if isinstance(a, dict))
 
 
 # ---------------------------------------------------------------------------- tmux
@@ -3521,14 +3639,16 @@ def print_plan(session: Session, plan: Sequence[Tuple[Stack, List[Pane]]], arm: 
                              'on' if session.planner else 'off', session.demo, session.num_agents))
     names = {stack.name for stack, _ in plan}
     print('mapping: ' + mapping_label(session.mapping, 'mapping' in names, 'not started'))
+    print('odometry: ' + odometry_label(session_odometry(session), 'dlio' in names, 'not started'))
     pins = read_pins()
     if session.agents_env:
         print('agents from %s=%s (apply_agents_env)' % (AGENTS_ENV, session.agents_env))
     for a in session.agents:
-        print('  %s  %s  id %02d  pose (%.2f, %.2f, %.1f deg)  calibrated from %s, lidar at %.2f m%s' % (
+        print('  %s  %s  id %02d  pose (%.2f, %.2f, %.1f deg)  calibrated from %s, lidar at %.2f m%s%s' % (
             a.name, a.cls, a.id, a.x, a.y, a.yaw_deg, reference_robot(a.cls, pins),
             ROBOT_CLASSES[a.cls].lidar_height,
-            '  goals %s' % ' '.join('(%s)' % ', '.join('%.2f' % v for v in g) for g in a.goals) if a.goals else ''))
+            '  goals %s' % ' '.join('(%s)' % ', '.join('%.2f' % v for v in g) for g in a.goals) if a.goals else '',
+            '  odometry: truth (NOT PARITY)' if a.odometry == 'truth' else ''))
     steps = generate_steps([stack for stack, _ in plan])
     if steps:
         print('before the panes: %s' % ', '.join(g.__name__ for g in steps))
@@ -4008,11 +4128,18 @@ GRAPH_CHECK_S = 30            # discovery: entries that are late come within sec
 
 
 def graph_edges(session: Session, stacks: Iterable[str]) -> List[Tuple[str, str]]:
-    """(topic, subscriber FQN) of every GRAPH_EDGES edge the running stacks make, per agent."""
+    """(topic, subscriber FQN) of every GRAPH_EDGES edge the running stacks make, per agent. An agent
+    on odometry: truth has truth_odom.py in DLIO's place: it reads the lidar, and publishes DLIO's
+    topics under DLIO's names, so only that one subscriber differs."""
     names = set(stacks)
-    return [('/%s/%s' % (a.name, topic), '/%s/%s' % (a.name, node)) for a in session.agents
-            for topic, node, need, mode in GRAPH_EDGES
-            if set(need) <= names and mode in (None, session.mapping)]
+    out = []
+    for a in session.agents:
+        for topic, node, need, mode in GRAPH_EDGES:
+            if set(need) <= names and mode in (None, session.mapping):
+                if node == 'dlio_odom_node' and a.odometry == 'truth':
+                    node = 'truth_odom_' + a.name               # truth_odom.node_name
+                out.append(('/%s/%s' % (a.name, topic), '/%s/%s' % (a.name, node)))
+    return out
 
 
 # One rclpy node with no publisher or subscription of its own (only the graph cache): leaving costs
@@ -4082,6 +4209,8 @@ def cmd_up(args: argparse.Namespace) -> int:
     session = load_up_session(args.session)
     if args.rviz:
         session = dataclasses.replace(session, rviz=True)       # this run only; session.json says so
+    if args.odometry:
+        session = apply_odometry(session, *args.odometry)       # this run only; session.json says so
     stacks = select_stacks(session, args.stacks)
     run_dir = run_dir_from_env()
     ctx = RunContext(run_dir=run_dir, rust_log=os.environ.get('RUST_LOG_ZENOH', 'zenoh=info'),
@@ -4147,6 +4276,8 @@ def cmd_up(args: argparse.Namespace) -> int:
                                ' (%s=%s)' % (AGENTS_ENV, session.agents_env) if session.agents_env else ''))
     if any(s.name == 'mapping' for s in stacks):
         (warn if session.mapping == 'fallback' else info)('mapping: ' + mapping_label(session.mapping))
+    if any(s.name == 'dlio' for s in stacks):
+        (warn if session.truth_agents else info)('odometry: ' + odometry_label(session_odometry(session)))
     if any(s.name == 'rviz' for s in stacks) and len(session.agents) > 2:
         # 2026-10-20, multi_agent_swap with RViz: demo_eval's probe joining (29 subscriptions) stalled
         # delivery for 29 s, then 58 s, and every DLIO diverged; without RViz the same probe is harmless.
@@ -4461,6 +4592,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         print('session: %s (%s), world %s, agents %s' % (
             s['name'], s.get('source', ''), s['world'], ', '.join(a['name'] for a in s['agents'])))
         print('mapping: %s' % mapping_label(s.get('mapping', 'gpu'), 'mapping' in stacks))
+        print('odometry: %s' % odometry_label(json_odometry(s), 'dlio' in stacks))
     print('run dir: %s' % run_dir)
     if (LOG_ROOT / 'latest').exists():
         print('logs:    %s' % (LOG_ROOT / 'latest').resolve())
@@ -4479,12 +4611,14 @@ def cmd_status(args: argparse.Namespace) -> int:
             print('sim time: n/a (the gazebo stack is not running)')
         if stacks & {'dlio', 'drive', 'mapping', 'mighty'}:
             fallback = s.get('mapping') == 'fallback' and 'mapping' in stacks
-            print('agents (DLIO%s over %g s; safety_node mode%s%s%s%s):' % (
+            truth = [n for n, m in json_odometry(s).items() if m == 'truth'] if 'dlio' in stacks else []
+            print('agents (DLIO%s over %g s; safety_node mode%s%s%s%s%s):' % (
                 ' and maps' if maps else '', RATE_WINDOW_S, '' if s.get('auto_arm', False) else '; auto_arm off',
                 '; planner: mpc\'s cmd_vel_auto, mighty_node\'s map_hold' if 'mighty' in stacks else '',
                 '; maps not read (status --maps)' if 'mapping' in stacks and not maps else '',
-                '; maps from the fallback, NOT PARITY' if fallback else ''))
-            for line in agent_lines(names, vals, stacks, maps):
+                '; maps from the fallback, NOT PARITY' if fallback else '',
+                '; odometry from ground truth for %s, NOT PARITY' % ', '.join(truth) if truth else ''))
+            for line in agent_lines(names, vals, stacks, maps, truth):
                 print('  ' + line)
     else:
         print('sim time: n/a (the gazebo stack is not running)')
@@ -4725,16 +4859,28 @@ def sim_time_lines(names: Sequence[str], vals: Dict[str, List[str]]) -> List[str
 
 
 def agent_lines(names: Sequence[str], vals: Dict[str, List[str]], stacks: Iterable[str],
-                maps: bool = False) -> List[str]:
+                maps: bool = False, truth: Iterable[str] = ()) -> List[str]:
     """Per agent: DLIO's odom rate and stamp age, its scan rate, safety_node's mode, with maps
     the planner's grids (map_part). DLIO publishes odom from a 100 Hz timer from the start, stamped
     with the last IMU sample's time (0 before the first one); deskewed scans only come once its
-    IMU calibration is done and it registers scans."""
-    stacks = set(stacks)
+    IMU calibration is done and it registers scans. The agents in truth (odometry: truth, NOT
+    PARITY) have truth_odom.py on the same topics, which publishes only once ground truth flows."""
+    stacks, truth = set(stacks), set(truth)
     out = []
     for n in names:
         parts = []
-        if 'dlio' in stacks:
+        if 'dlio' in stacks and n in truth:
+            hz, age = _num(vals, odom_topic(n)), _num(vals, odom_topic(n), 1)
+            if hz is None:
+                parts.append('truth odom (NOT PARITY): none yet (ground truth flows only while physics runs; '
+                             'scripts/sim.py attach dlio)')
+            else:
+                parts.append('truth odom (NOT PARITY) %.0f Hz, stamp age %s' % (
+                    hz, 'n/a' if age is None or math.isinf(age) else '%.3f s%s' % (
+                        age, '  STALE' if age > ODOM_MAX_AGE_S else '')))
+            scans = _num(vals, scans_topic(n))
+            parts.append('scans %.1f Hz' % scans if scans else 'no scans (IMU calibration time, or the lidar)')
+        elif 'dlio' in stacks:
             hz, age = _num(vals, odom_topic(n)), _num(vals, odom_topic(n), 1)
             if hz is None:
                 parts.append('DLIO odom: none in %d s (scripts/sim.py attach dlio)' % ECHO_TIMEOUT_S)
@@ -5331,6 +5477,10 @@ def build_parser() -> argparse.ArgumentParser:
     up.add_argument('--no-arm', action='store_true', help='leave every safety_node DISARMED (auto_arm off)')
     up.add_argument('--rviz', action='store_true',
                     help="also start RViz on $DISPLAY (as the session's rviz: true), in the last paused wave")
+    up.add_argument('--odometry', type=parse_odometry_arg, metavar='MODE[:NS,...]',
+                    help="this run's odometry (%s): MODE for every agent, or MODE:JR81,RR83 for those only; "
+                         "truth (NOT PARITY) is ground truth under DLIO's names (truth_odom.py)"
+                         % '|'.join(ODOMETRY_MODES))
     up.add_argument('--dry-run', action='store_true', help='print the panes and commands; touch nothing')
     down = sub.add_parser('down', help='stop every node and close the rsim-* tmux sessions')
     down.add_argument('--containers', action='store_true', help='also remove the containers and network')

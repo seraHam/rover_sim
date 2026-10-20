@@ -42,7 +42,8 @@ logs:  ; $(COMPOSE) logs -f
 # make stack-up    the sim-* containers, idle (sessions docker-exec their nodes into them);
 #                  GPU=1 adds sim-elevation (compose profile gpu)
 # make stack-down  stop the session's nodes, then remove the containers of every profile
-# make session S=<name>  run config/sessions/<name>.yaml (scripts/sim.py up)
+# make session S=<name>  run config/sessions/<name>.yaml (scripts/sim.py up); ODOMETRY=truth
+#                  or ODOMETRY=truth:JR81,RR83 puts those agents on ground truth (NOT PARITY)
 # Compose goes through `sim.py compose`: it adds the pin file, the run dir it has checked and
 # the CPU budget, and skips a compose.local.yaml written for the legacy service. X access
 # for the containers (xhost +SI:localuser:root, never +local: on this shared host) is
@@ -53,4 +54,4 @@ images:     ; scripts/build_images.sh $(STACKS) $(if $(FORCE),--force) $(foreach
                 $(foreach s,$(SRC),--src $(s)) $(if $(JOBS),--jobs $(JOBS)) $(if $(PARALLEL),--parallel $(PARALLEL))
 stack-up:   ; python3 scripts/sim.py compose $(if $(GPU),--profile gpu) up -d
 stack-down: ; python3 scripts/sim.py down --containers
-session:    ; $(if $(S),python3 scripts/sim.py up $(S),$(error usage: make session S=<name>, for config/sessions/<name>.yaml))
+session:    ; $(if $(S),python3 scripts/sim.py up $(S)$(if $(ODOMETRY), --odometry $(ODOMETRY)),$(error usage: make session S=<name>, for config/sessions/<name>.yaml))

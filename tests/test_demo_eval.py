@@ -433,6 +433,48 @@ class GradeTest(unittest.TestCase):
         self.assertTrue(r['criteria'][1]['pass'], r['criteria'][1])
         self.assertIn('n/a (one agent)', r['criteria'][1]['summary'])
 
+    def test_truth_agents_are_not_graded(self):
+        # odometry: truth (NOT PARITY): the estimate is the truth; with DLIO's drift on it, a truth
+        # agent would fail, so the drift below shows the criterion does not grade it.
+        rec = swap_recording(gap=0.4)
+        rec['est']['JR81'] = [(t, x + 1.0, y) for t, x, y in rec['est']['JR81']]
+        for a in rec['spawn']['agents']:
+            a['odometry'] = 'truth'
+        r = de.grade(rec, empty_logs(legs=legs_for(rec)), self.BOX, opts())
+        odo = r['criteria'][6]
+        self.assertEqual((odo['name'], odo['pass'], odo.get('na')), ('odometry', True, True))
+        self.assertTrue(odo['summary'].startswith('n/a: odometry: truth (NOT PARITY), not graded: '), odo['summary'])
+        self.assertEqual(odo['detail']['truth_check']['JR81']['max_m'], 1.0)    # reported, not graded
+        self.assertEqual(odo['detail']['truth_check']['RR83']['max_m'], 0.0)
+        self.assertTrue(r['pass'])
+        self.assertEqual(r['odometry'], {'JR81': 'truth', 'RR83': 'truth'})
+        lines = de.report_lines(r)
+        self.assertTrue(lines[6].startswith('N/A   odometry'), lines[6])
+        self.assertEqual(lines[-1], 'PASS: swap demo of multi_agent_swap, 60 s, 7 criteria (1 n/a); '
+                                    'NOT PARITY: odometry truth for JR81, RR83')
+
+    def test_mixed_grades_only_dlio(self):
+        rec = swap_recording(gap=0.4)
+        rec['spawn']['agents'][0]['odometry'] = 'truth'                    # JR81 truth, RR83 DLIO
+        rec['est']['JR81'] = [(t, x + 1.0, y) for t, x, y in rec['est']['JR81']]
+        r = de.grade(rec, empty_logs(legs=legs_for(rec)), self.BOX, opts())
+        odo = r['criteria'][6]
+        self.assertTrue(odo['pass'])
+        self.assertNotIn('na', odo)
+        self.assertIn('RR83 max 0.0 m', odo['summary'])
+        self.assertIn('not graded: JR81 residual max 1.0 m', odo['summary'])
+        self.assertEqual(sorted(odo['detail']), ['RR83', 'truth_check'])
+        rec['est']['RR83'] = [(t, x + 1.0, y) for t, x, y in rec['est']['RR83']]
+        r = de.grade(rec, empty_logs(legs=legs_for(rec)), self.BOX, opts())
+        self.assertFalse(r['criteria'][6]['pass'])                         # RR83's DLIO still grades
+        self.assertTrue(de.report_lines(r)[-1].endswith('7 criteria; NOT PARITY: odometry truth for JR81'))
+
+    def test_odometry_modes(self):
+        spawn = {'agents': [{'name': 'JR81', 'odometry': 'truth'}, {'name': 'RR83'}]}
+        self.assertEqual(de.odometry_modes(spawn, ['JR81', 'RR83', 'JR82']),
+                         {'JR81': 'truth', 'RR83': 'dlio', 'JR82': 'dlio'})
+        self.assertEqual(de.odometry_modes({}, ['JR81']), {'JR81': 'dlio'})
+
     def test_rtf_rule_is_the_bridges(self):
         # livox_sim_bridge.RtfMonitor: more than hold_s since the first sample below; NaN (the bridge
         # has under 1 s of on-time IMU) neither starts nor ends a run and is not in min or mean.
