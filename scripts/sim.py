@@ -1258,7 +1258,7 @@ def dlio_panes(session: Session, ctx: RunContext) -> List[Pane]:
 # As on the robot, whose mapping_ws compose bind-mounts the pinned checkout's config/mapping at
 # /mapping_config (docker/compose.mapping.yaml): compose.stack.yaml mounts build_images.sh's
 # checkout of MAPPING_SHA there, read-only, and that checkout's config/elevation where the Orin
-# has it (tools/install_orin.sh; local_mapper_host_tmux.sh LM_OVERLAY_DIR).
+# has it (tools/install_orin.sh; elevation_mapper_host_tmux.sh EM_OVERLAY_DIR).
 MAPPING_CONFIG_IN = '/mapping_config'
 ELEVATION_OVERLAY_IN = '/usr/local/share/rover/elevation'
 WAIT_FOR_TF = MAPPING_WS + '/install/share/rover_bringup/scripts/wait_for_tf.py'
@@ -1518,7 +1518,7 @@ def mapping_panes(session: Session, ctx: RunContext) -> List[Pane]:
     return panes
 
 
-# local_mapper_host_tmux.sh's grid arguments: ALWAYS elev/* (map_fusion owns the canonical
+# elevation_mapper_host_tmux.sh's grid arguments: ALWAYS elev/* (map_fusion owns the canonical
 # names), last on the line so nothing moves them back.
 ELEVATION_TOPIC_ARGS = ('occupancy_grid_topic:=elev/occ_2d_topic',
                         'planning_occupancy_grid_topic:=elev/planning_occ_2d_topic',
@@ -1526,17 +1526,17 @@ ELEVATION_TOPIC_ARGS = ('occupancy_grid_topic:=elev/occ_2d_topic',
 
 
 def elevation_overlays(a: Agent, pins: Dict[str, str]) -> List[str]:
-    """The param overlays the Orin passes (local_mapper_host_tmux.sh:86-91), as container paths:
-    types/<VEHTYPE>.yaml, then vehicles/<robot>.yaml, those in the pinned checkout. The robot is
-    the class's reference robot, which the agent stands in for, not the agent. mapping_ws c1233f7
-    has none for JR or RR (only types/JK.yaml)."""
+    """The param overlays the Orin passes (elevation_mapper_host_tmux.sh's OVERLAY_DIR loop), as
+    container paths: types/<VEHTYPE>.yaml, then vehicles/<robot>.yaml, those in the pinned
+    checkout. The robot is the class's reference robot, which the agent stands in for, not the
+    agent. mapping_ws c1233f7 has none for JR or RR (only types/JK.yaml)."""
     d = mapping_checkout(pins) / 'config' / 'elevation'
     rel = ['types/%s.yaml' % a.prefix, 'vehicles/%s.yaml' % reference_robot(a.cls, pins)]
     return ['%s/%s' % (ELEVATION_OVERLAY_IN, r) for r in rel if (d / r).is_file()]
 
 
 def elevation_cmd(a: Agent, overlays: Sequence[str]) -> str:
-    """local_mapper_host_tmux.sh's launch line. Its elevation_mapping_cupy takes param_overlays,
+    """elevation_mapper_host_tmux.sh's launch line. Its elevation_mapping_cupy takes param_overlays,
     so the line has extra_cloud_exclude:=livox/* (quoted: a glob) and the overlays, if any."""
     args = ['quad:=' + a.name, "'extra_cloud_exclude:=livox/*'"]
     if overlays:
@@ -1545,7 +1545,7 @@ def elevation_cmd(a: Agent, overlays: Sequence[str]) -> str:
         args + list(ELEVATION_TOPIC_ARGS))
 
 
-# local_mapper_host_tmux.sh finds the launch file the same way and greps it for these arguments.
+# elevation_mapper_host_tmux.sh finds the launch file the same way and greps it for these arguments.
 _ELEVATION_LAUNCH_SH = r'''f=$(find -L "$1/install" -name elevation_mapping_dlio.launch.py -print -quit 2>/dev/null)
 [ -n "$f" ] || { echo "no elevation_mapping_dlio.launch.py under $1/install"; exit 1; }
 for a in param_overlays occupancy_grid_topic; do

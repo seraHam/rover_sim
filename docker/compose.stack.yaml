@@ -57,8 +57,8 @@ x-sim-volumes:
     read_only: true
     bind: {create_host_path: false}
   # The Orin's elevation overlays and latched-delivery probe, where mapping_ws
-  # tools/install_orin.sh installs them (local_mapper_host_tmux.sh LM_OVERLAY_DIR and
-  # LM_ZENOH_READY), from the same checkout.
+  # tools/install_orin.sh installs them (elevation_mapper_host_tmux.sh EM_OVERLAY_DIR and
+  # EM_ZENOH_READY), from the same checkout.
   - &vol-elevation-overlays
     type: bind
     source: ../.cache/src/mapping_ws@${MAPPING_SHA:?set in docker/stacks.env; pass --env-file docker/stacks.env}/config/elevation
