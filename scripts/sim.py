@@ -9,7 +9,7 @@ Enter in a pane restarts that one node.
   scripts/sim.py up <session> [--stacks a,b] [--partial] [--no-arm] [--dry-run]
   scripts/sim.py down [--containers]
   scripts/sim.py attach [<stack>]
-  scripts/sim.py status
+  scripts/sim.py status [--maps]
   scripts/sim.py arm [<ns>...] [--now] [--timeout S]     (safety_node AUTO)
   scripts/sim.py disarm [<ns>...]
   scripts/sim.py loadtest [--agents N] [--variant V|all ...]
@@ -34,12 +34,25 @@ across classes: mighty takes its agent id from them. Each class is calibrated fr
 real robot, the one its DLIO image is built for (docker/stacks.env DLIO_<CLASS>_ROBOT).
 
 Stacks are a registry (STACKS below). Each names its containers and builds its panes
-from the session. Phases 1-3 run `zenoh` (the router in sim-drive), `gazebo` (world,
+from the session. Phases 1-4 run `zenoh` (the router in sim-drive), `gazebo` (world,
 spawns, sensor bridges, world-><ns>/map), `drive` (teleop + safety_node, rover_description
-per agent), `frame_align` (ground-truth alignment for mighty) and `dlio` (DLIO, its seed
-pose and map->odom per agent). The others are placeholders that later phases fill in.
-`up` starts them all at once, in registry order, then waits until every agent is spawned
-and physics runs (wait_spawned), and fails if the spawn pane does.
+per agent), `frame_align` (ground-truth alignment for mighty), `dlio` (DLIO, its seed
+pose and map->odom per agent), `mapping` (global_mapper, map_fusion, persistent_map per
+agent) and, for `mapping: gpu`, `elevation` (the Orin's elevation mapper per agent).
+`mapping: fallback` is NOT PARITY: no GPU, so no elevation and no map_fusion; global_mapper
+runs a sim config and grid_relay.py puts its grids on the planner's names. The others are
+placeholders that later phases fill in.
+
+`up` starts them in waves into a paused world (Stack.wave): first the router and Gazebo,
+whose spawn pane spawns every agent while nothing else is on the graph (wait_spawned; it
+fails if the pane does); then drive, frame_align and DLIO; then mapping; then elevation.
+Each wave waits until its panes have started their nodes and the containers are idle
+(settle_wave) before the next one starts; a pane that ends before its node starts stops `up`
+there, with the world still paused. Then `up` unpauses physics once, over gazebo
+transport (unpause_physics). A start-up burst in the first seconds of physics costs real
+time, and session joins on a loaded graph stall zenoh delivery for everyone; both made DLIO
+diverge in the Phase 3 and 4 runs, so nothing joins once physics runs. DLIO calibrates its
+IMU only then: there is no IMU while paused.
 
 safety_node starts DISARMED, holding the agent still (zero cmd_vel) while DLIO calibrates
 its IMU, and stays so, as on the robot, until `arm` calls its /<ns>/auto_mode once DLIO
@@ -56,7 +69,12 @@ to ~/.local/state/rover_sim/logs/<timestamp>/<stack>/<pane>.log.
 
 `status` exits 2 when a sensor bridge logged an RTF violation (real-time factor below
 0.95 for over 5 s) during the current run: such a run is invalid. It exits 3 when the
-isolation check fails, and then opens no ROS session to read the bridges' values.
+isolation check fails, and then opens no ROS session to read the bridges' values. With
+rmw_zenoh 0.1.9, a ROS session that leaves the loaded 4-agent mapping graph all at once stalls
+zenoh delivery for everyone for 1-3 s (Phase 4: parity_check's, a probe's, status's own before
+it left one subscription at a time, STATUS_LEAVE_GAP_S): run such tools before or after a
+window that is being graded. `status --maps` also reads the planner's grids, the multi-MB
+persistent map among them.
 
 Host needs: python3 >= 3.8 with PyYAML, tmux, the docker CLI with compose v2.
 """
@@ -116,6 +134,9 @@ SCRIPTS_IN = '/rover_sim/scripts'    # this repo's scripts/ inside every contain
 WORLDS_DIR = REPO / 'src' / 'rover_sim' / 'worlds'
 WORLD_BUDGETS = REPO / 'src' / 'rover_sim' / 'config' / 'worlds.yaml'   # MID-360 rays per world
 CLASSES_YAML = REPO / 'src' / 'rover_sim' / 'config' / 'classes.yaml'
+# rover_sim's own mapping overlays (the fallback's), mounted with config/ at /rover_sim/config.
+SIM_MAPPING_DIR = REPO / 'config' / 'mapping'
+SIM_MAPPING_IN = '/rover_sim/config/mapping'
 
 # Per-run files (in the run dir; contracts with the sim's own nodes).
 SPAWN_FILE = 'spawn.yaml'            # agents and spawn poses: sim_tf.py, the spawn pane
@@ -125,7 +146,9 @@ FRAME_ALIGN_FILE = 'frame_align.yaml'
 CLASSES_FILE = 'classes.yaml'        # the checkout's classes.yaml: drive_pattern.py's limits
 TELEOP_FILE = 'teleop_sim.yaml'      # rover_control's teleop file + the sim agents' blocks
 DLIO_LAUNCH_FILE = 'dlio_sim.launch.py'   # the robot's DLIO launch with a per-agent map node name
+MAPPING_RUN_DIR = 'mapping'          # the fallback's param files: robot file + rover_sim overlay
 ARM_LOG = 'arm.log'                  # in the pane-log dir: every auto_mode / disarm call
+BRINGUP_LOG = 'bringup.log'          # in the pane-log dir: bring_up's waves, load samples, unpause
 RTF_LOG = 'rtf_violations.log'       # appended by livox_sim_bridge.py; any line = run invalid
 
 LOG_ROOT = Path.home() / '.local' / 'state' / 'rover_sim' / 'logs'
@@ -450,6 +473,10 @@ def reference_robot(cls: str, pins: Dict[str, str]) -> str:
 ROS_SETUP = '/opt/ros/humble/setup.bash'
 SIM_WS = '/home/swarm/code/rover_sim_ws'          # rover_sim's own images (gazebo, elevation)
 SIM_PROBE = '/rover_sim/scripts/wait_zenoh_ready.py'
+MAPPING_WS = '/home/swarm/code/mapping_ws'         # mapping_ws docker/Dockerfile.mapping ARG WS
+# On the Orin, mapping_ws tools/install_orin.sh installs scripts/wait_zenoh_ready.py here and
+# config/elevation/ under ELEVATION_OVERLAY_IN; compose.stack.yaml mounts the pinned checkout's.
+ORIN_PROBE = '/usr/local/lib/rover/wait_zenoh_ready.py'
 
 
 @dataclass(frozen=True)
@@ -480,12 +507,11 @@ CONTAINERS = OrderedDict((c.name, c) for c in (
     Container('sim-dlio-rr', (ROS_SETUP, '/home/swarm/code/dlio_ws/install/setup.bash'),
               probes=('/home/swarm/code/dlio_ws/scripts/wait_zenoh_ready.py', SIM_PROBE),
               role='DLIO with the RR08 overlay'),
-    Container('sim-mapping', (ROS_SETUP, '/home/swarm/code/mapping_ws/install/setup.bash'),
-              probes=('/home/swarm/code/mapping_ws/install/share/rover_bringup/scripts/wait_zenoh_ready.py',
-                      SIM_PROBE),
+    Container('sim-mapping', (ROS_SETUP, MAPPING_WS + '/install/setup.bash'),
+              probes=(MAPPING_WS + '/install/share/rover_bringup/scripts/wait_zenoh_ready.py', SIM_PROBE),
               role='global_mapper, map_fusion, persistent_map'),
     Container('sim-elevation', (ROS_SETUP, SIM_WS + '/install/setup.bash'),
-              probes=(SIM_WS + '/scripts/wait_zenoh_ready.py', SIM_PROBE),
+              probes=(ORIN_PROBE, SIM_WS + '/scripts/wait_zenoh_ready.py', SIM_PROBE),
               role='elevation_mapping_cupy (GPU)'),
     # mighty-hw bakes no probe: its own mighty_hw.sh gates on the router port only.
     Container('sim-mighty', (ROS_SETUP, '/home/swarm/code/mighty_ws/install/setup.bash'),
@@ -530,6 +556,7 @@ class Pane:
     gate: bool = True                  # wait for the router and latched delivery first
     env: Tuple[Tuple[str, str], ...] = ()
     window: str = 'main'
+    waits: str = ''                    # the pane's own gates (a TF, another pane), after the router's
 
 
 def require_readable(var: str) -> str:
@@ -567,12 +594,28 @@ def router_gate(c: Container) -> str:
     return ' && '.join([require_readable('ZENOH_SESSION_CONFIG_URI'), tcp_wait(), probe])
 
 
+# Printed by every pane once its gates have passed, right before its node starts: `up` waits for
+# it in every pane log before it unpauses physics (wait_nodes_started). The command line in the
+# log has $(date ...) where the pane's output has the time. The containers' clock is UTC and the
+# host's lines (bringup.log, arm.log, `up`) are local: both carry their offset.
+PANE_TIME = '$(date +%FT%T%z)'
+PANE_TIME_RE = r'\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d[+-]\d{4}'
+HOST_TIME_FMT = '%Y-%m-%dT%H:%M:%S%z'
+NODE_STARTED_RE = re.compile(r'\[rover_sim\] node starting at ' + PANE_TIME_RE)
+
+
+def node_marker() -> str:
+    return 'echo "[rover_sim] node starting at %s"' % PANE_TIME
+
+
 def pane_inner(p: Pane) -> str:
     c = CONTAINERS[p.container]
     steps = [setup_snippet(c)]
     if p.gate:
         steps.append(router_gate(c))
-    steps.append(p.cmd)
+    if p.waits:
+        steps.append(p.waits)
+    steps += [node_marker(), p.cmd]
     return ' && '.join(steps)
 
 
@@ -621,6 +664,9 @@ class Stack:
     generate: Tuple[Callable[[Session, RunContext], None], ...] = ()
     # Opens windows on $DISPLAY: `up` then grants the containers' root X access.
     needs_display: Callable[[Session], bool] = _never
+    # `up` starts the stacks wave by wave, each wave once the one before has settled
+    # (settle_wave): stacks of one wave start together.
+    wave: int = 0
 
 
 def zenoh_panes(session: Session, ctx: RunContext) -> List[Pane]:
@@ -695,25 +741,25 @@ def spawn_agent_cmd(a: Agent, lidar_samples: int) -> str:
 
 
 def spawn_cmd(session: Session, ctx: RunContext) -> str:
-    """Into the paused world one by one, then unpause once, so no robot moves (or DLIO
-    calibrates on a falling IMU) before all are in. The pane then idles: `status` shows
-    it running when everything spawned, EXITED when a step failed. Each CLI has a SIGKILL
-    backstop: gzserver has stopped answering ROS services after start-up (1 in 10
-    bring-ups), and a call that never returns would leave the pane waiting forever."""
+    """Into the paused world one by one. The world stays paused until `up` has every stack
+    running and unpauses it (bring_up), so no robot moves (or DLIO calibrates on a
+    falling IMU) before all are in. The pane then idles: `status` shows it running when
+    everything spawned, EXITED when a step failed. Each CLI has a SIGKILL backstop: gzserver
+    has stopped answering ROS services after start-up (1 in 10 bring-ups), and a call that
+    never returns would leave the pane waiting forever."""
     names = ' '.join(a.name for a in session.agents)
     samples = world_lidar_samples(session.world)
     return ' && '.join(
         [pin_self('rest', ctx), 'echo "[rover_sim] waiting for /spawn_entity (gzserver)..."',
          'until timeout -k 2 15 ros2 service list --no-daemon 2>/dev/null | grep -qx /spawn_entity; do sleep 2; done']
         + [spawn_agent_cmd(a, samples) for a in session.agents]
-        + ['timeout -k 2 30 ros2 service call /unpause_physics std_srvs/srv/Empty',
-           'echo "[rover_sim] spawned %s; physics unpaused at $(date +%%T)"' % names,
-           'exec sleep infinity'])
+        + ['echo "[rover_sim] spawned %s into the paused world at %s; scripts/sim.py up unpauses it"'
+           % (names, PANE_TIME), 'exec sleep infinity'])
 
 
 def gazebo_panes(session: Session, ctx: RunContext) -> List[Pane]:
     """sim-gazebo. One gzserver on session.world (rover_sim world.launch.py, ODE at 1 ms,
-    real-time capped), started paused; the spawn pane adds every agent and unpauses once.
+    real-time capped), started paused; the spawn pane adds every agent, and `up` unpauses it.
     Per agent, livox_sim_bridge.py turns the plugins' sim-stamped sensor streams into the
     robot's /<ns>/livox/{lidar,imu} on wall-clock stamps and reports sim/rtf and
     sim/time_offset. sim_tf.py publishes world-><ns>/map for every agent from
@@ -723,7 +769,7 @@ def gazebo_panes(session: Session, ctx: RunContext) -> List[Pane]:
         Pane('gzserver %s' % session.world, 'gzserver', 'sim-gazebo', pin_self('gz', ctx)
              + ' && ros2 launch rover_sim world.launch.py world:=%s gui:=false paused:=true' % session.world,
              window='gazebo'),
-        Pane('spawn %s, then unpause' % ', '.join(a.name for a in session.agents), 'spawn', 'sim-gazebo',
+        Pane('spawn %s (paused)' % ', '.join(a.name for a in session.agents), 'spawn', 'sim-gazebo',
              spawn_cmd(session, ctx), window='gazebo'),
         Pane('world -> <ns>/map (sim_tf)', 'sim-tf', 'sim-gazebo', pin_self('rest', ctx)
              + ' && python3 %s/sim_tf.py --spawn %s' % (SCRIPTS_IN, run_path(SPAWN_FILE)), window='gazebo'),
@@ -1025,9 +1071,9 @@ def _unique_mapping(loader: yaml.SafeLoader, node: yaml.Node, deep: bool = False
 _UniqueKeyLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _unique_mapping)
 
 
-def teleop_blocks(text: str, where: str) -> Dict[str, Any]:
-    """The node blocks of a teleop file: flat, fully qualified keys ('/**/joy_teleop/joy_node',
-    '/JR02/safety_node'), each with only ros__parameters."""
+def param_blocks(text: str, where: str) -> Dict[str, Any]:
+    """The node blocks of a ROS param file: flat, fully qualified keys ('/**/joy_teleop/joy_node',
+    '/JR02/safety_node', '/**'), each with only ros__parameters."""
     try:
         doc = yaml.load(text, Loader=_UniqueKeyLoader)
     except yaml.YAMLError as e:
@@ -1048,7 +1094,7 @@ def teleop_sim_yaml(base: str, session: Session, pins: Dict[str, str], source: s
     copies stay flat, fully qualified keys: the file's own note explains that nesting them
     under a namespace key makes rcl drop siblings. Launch reads the file with allow_substs,
     so nothing generated may contain '$('."""
-    blocks = teleop_blocks(base, source)
+    blocks = param_blocks(base, source)
     out = ['# rover_sim: %s for session %s, generated by scripts/sim.py; rewritten on every `up`.' % (
         TELEOP_FILE, session.name),
         '# Below: %s verbatim, then each sim agent\'s copy of its reference robot\'s blocks.' % source, '', '']
@@ -1073,7 +1119,7 @@ def teleop_sim_yaml(base: str, session: Session, pins: Dict[str, str], source: s
         raise SimError('BUG: generated teleop blocks contain a launch substitution')
     want = OrderedDict(blocks)
     want.update(added)
-    if teleop_blocks(text, TELEOP_FILE) != want:
+    if param_blocks(text, TELEOP_FILE) != want:
         raise SimError('BUG: %s does not parse back to the base file plus the agents\' blocks' % TELEOP_FILE)
     return text
 
@@ -1170,10 +1216,10 @@ def seed_wait(a: Agent) -> str:
 
 
 def dlio_launch_cmd(a: Agent) -> str:
-    """dlio_host_tmux.sh pane 0 (JR02 runs two_d_only false), through the wrapper, once the
-    seed pose is being published (seed_wait)."""
-    return ('%s && ros2 launch %s namespace:=%s initial_pose_topic:=world two_d_only:=false'
-            % (seed_wait(a), run_path(DLIO_LAUNCH_FILE), a.name))
+    """dlio_host_tmux.sh pane 0 (JR02 runs two_d_only false), through the wrapper. Its pane
+    waits for the seed pose first (seed_wait)."""
+    return ('ros2 launch %s namespace:=%s initial_pose_topic:=world two_d_only:=false'
+            % (run_path(DLIO_LAUNCH_FILE), a.name))
 
 
 def seed_pose_cmd(a: Agent) -> str:
@@ -1199,7 +1245,7 @@ def dlio_panes(session: Session, ctx: RunContext) -> List[Pane]:
     for a in session.agents:
         c = dlio_container(a)
         panes += [Pane('%s dlio odometry' % a.name, 'dlio-' + a.name, c, dlio_launch_cmd(a), env=robot_env(a),
-                       window=a.name),
+                       window=a.name, waits=seed_wait(a)),
                   Pane('%s seed pose' % a.name, 'seed-' + a.name, c, seed_pose_cmd(a), env=robot_env(a),
                        window=a.name),
                   Pane('%s tf map->odom' % a.name, 'map-odom-tf-' + a.name, c, map_odom_tf_cmd(a), env=robot_env(a),
@@ -1207,17 +1253,329 @@ def dlio_panes(session: Session, ctx: RunContext) -> List[Pane]:
     return panes
 
 
+# ---------------------------------------------------------------------------- mapping
+
+# As on the robot, whose mapping_ws compose bind-mounts the pinned checkout's config/mapping at
+# /mapping_config (docker/compose.mapping.yaml): compose.stack.yaml mounts build_images.sh's
+# checkout of MAPPING_SHA there, read-only, and that checkout's config/elevation where the Orin
+# has it (tools/install_orin.sh; local_mapper_host_tmux.sh LM_OVERLAY_DIR).
+MAPPING_CONFIG_IN = '/mapping_config'
+ELEVATION_OVERLAY_IN = '/usr/local/share/rover/elevation'
+WAIT_FOR_TF = MAPPING_WS + '/install/share/rover_bringup/scripts/wait_for_tf.py'
+PERSISTENT_MAP_PARAMS = 'persistent_map.yaml'
+# What compose.stack.yaml binds from that checkout, per container. Compose refuses to start a
+# container whose bind source is missing (never created: it would be root's).
+MAPPING_MOUNTS = (('sim-mapping', 'config/mapping'), ('sim-elevation', 'config/elevation'),
+                  ('sim-elevation', 'scripts/wait_zenoh_ready.py'))
+
+
+def mapping_checkout(pins: Dict[str, str]) -> Path:
+    """build_images.sh's checkout of the mapping_ws pin (.cache/src/mapping_ws@<MAPPING_SHA>)."""
+    return REPO / '.cache' / 'src' / ('mapping_ws@' + pins.get('MAPPING_SHA', ''))
+
+
+def mapping_mounts_problem(pins: Dict[str, str], services: Iterable[str]) -> Optional[str]:
+    d, services = mapping_checkout(pins), set(services)
+    missing = [rel for c, rel in MAPPING_MOUNTS if c in services and not (d / rel).exists()]
+    if not missing:
+        return None
+    return ('the pinned mapping_ws checkout the mapping containers mount is missing (%s in %s): '
+            'run scripts/build_images.sh mapping' % (', '.join(sorted(set(missing))), d))
+
+
+@dataclass(frozen=True)
+class MapperSettings:
+    """A class's mapping_host_tmux.sh settings: its reference robot's MAPPER_* values from
+    /etc/rover/rover.env, else that script's VEHTYPE defaults. MAPPER_FRAME is DLIO's <ns>/odom
+    for both (the frame of its deskewed cloud, and of the elevation map), MAPPER_D455 false
+    (no D455 in the sim)."""
+    gm_params: str                     # MAPPER_PARAM_FILE, in config/mapping/
+    mf_params: str                     # MAP_FUSION_PARAM_FILE
+    source: str
+    cloud: str = 'dlio/odom_node/pointcloud/deskewed'     # MAPPER_CLOUD_TOPIC
+    pose: str = 'dlio/odom_node/pose'                      # MAPPER_POSE_TOPIC
+    tracker: bool = False                                  # MAPPER_OBSTACLE_TRACKER
+    persistent_map: bool = True                            # MAPPER_PERSISTENT_MAP
+
+
+MAPPER_SETTINGS = OrderedDict([
+    # tools/reference/jr02/rover.env: MAPPER_FRAME=JR02/odom, MAPPER_CLOUD_TOPIC and
+    # MAPPER_PARAM_FILE as here, D455 and OBSTACLE_TRACKER false, PERSISTENT_MAP true; no
+    # MAP_FUSION_PARAM_FILE, so the JR default.
+    ('jr', MapperSettings('global_mapper_junior_dlio.yaml', 'map_fusion_junior.yaml', "JR02's rover.env")),
+    # RR08's rover.env was not captured: the RR defaults, except the persistent map, which is
+    # off by default and on here, as on JR02 (goal_selector explores on persistent_map/grid).
+    ('rr', MapperSettings('global_mapper_red_rover.yaml', 'map_fusion_red_rover.yaml',
+                          'the RR defaults, with the persistent map on')),
+])
+
+# mapping: fallback (NOT PARITY). On the robot global_mapper's 2D grids only feed map_fusion,
+# which makes the planner's grids with the elevation map; the robot files are set for that, so
+# without the elevation map and map_fusion the planner would get no usable grid. Each fallback
+# param file is the robot's file verbatim with rover_sim's overlay from config/mapping/ appended
+# (append_overlay): the robot's launch files take one param_file. persistent_map needs none:
+# grid_relay.py publishes map_fusion's live/occ_2d_topic, so it runs the robot's file (pointing
+# its window_topic at voxel/occ_2d_topic was tried live: it opened an epoch while paused and
+# never saw a dead DLIO).
+#   (node, robot file in config/mapping/ (None: the class's global_mapper file), overlay)
+FALLBACK_OVERLAYS = (
+    ('global_mapper_ros', None, 'global_mapper_fallback_{cls}.yaml'),
+)
+
+
+def fallback_files(a: Agent) -> List[Tuple[str, str, str, str]]:
+    """(node, robot file, rover_sim overlay, generated file in <run>/mapping/) of an agent's
+    fallback parameters. An overlay's block is for every node of that name, so agents of a
+    class share each file."""
+    m = MAPPER_SETTINGS[a.cls]
+    out = []
+    for node, base, overlay in FALLBACK_OVERLAYS:
+        overlay = overlay.format(cls=a.cls)
+        out.append((node, base or m.gm_params, overlay, overlay))
+    return out
+
+
+def flat_params(d: Dict[str, Any], prefix: str = '') -> 'OrderedDict[str, Any]':
+    """Dotted parameter names -> values, as rcl reads a ros__parameters mapping."""
+    out = OrderedDict()  # type: OrderedDict[str, Any]
+    for k, v in d.items():
+        if isinstance(v, dict):
+            out.update(flat_params(v, '%s%s.' % (prefix, k)))
+        else:
+            out['%s%s' % (prefix, k)] = v
+    return out
+
+
+def param_kind(v: Any) -> str:
+    """The parameter type rcl gives a YAML value. A node refuses an override of another type
+    than it declared, an integer for a double too."""
+    for t, name in ((bool, 'bool'), (int, 'integer'), (float, 'double'), (str, 'string')):
+        if isinstance(v, t):
+            return name
+    if isinstance(v, list):
+        return 'array of %s' % (param_kind(v[0]) if v else '?')
+    return type(v).__name__
+
+
+def append_overlay(base_text: str, base_src: str, overlay_text: str, overlay_src: str, node: str) -> str:
+    """The robot's param file verbatim, then the overlay verbatim: one /**/<node> block of only
+    the keys the sim must change (the robot files are private: none is copied into this repo).
+    It comes after the robot's /** block, so it wins for every node of that name: rclpy 3.3.21
+    and rclcpp 16.0.19 (this pin's) apply /**, then /**/<node>, then a /<ns>/<node> block
+    (checked in throwaway containers). Refused: another block, a key the robot file does not
+    set (a typo would change nothing), another type than the robot's (the node would refuse it)."""
+    base = param_blocks(base_text, base_src)
+    over = param_blocks(overlay_text, overlay_src)
+    key = '/**/' + node
+    if list(over) != [key]:
+        raise SimError('%s: an overlay is one %s block, not %s' % (overlay_src, key, ', '.join(over)))
+    if key in base:
+        raise SimError('%s has a %s block of its own: the overlay would repeat it' % (base_src, key))
+    params = flat_params(over[key]['ros__parameters'] or {})
+    if not params:
+        raise SimError('%s sets no parameters' % overlay_src)
+    have = flat_params((base.get('/**') or {}).get('ros__parameters') or {})
+    bad = []
+    for k, v in params.items():
+        if k not in have:
+            bad.append('%s: not in the /** block of %s' % (k, base_src))
+        elif v is None or (isinstance(v, float) and not math.isfinite(v)):
+            bad.append('%s: %r is not a parameter value' % (k, v))
+        elif param_kind(have[k]) != param_kind(v):
+            bad.append('%s: %s in %s, %s in the overlay' % (k, param_kind(have[k]), base_src, param_kind(v)))
+    if bad:
+        raise SimError('%s: refused:\n  - %s' % (overlay_src, '\n  - '.join(bad)))
+    text = ('# rover_sim: generated by scripts/sim.py (mapping: fallback, NOT PARITY); rewritten on every `up`.\n'
+            '# Below: %s verbatim, then %s verbatim.\n\n' % (base_src, overlay_src)
+            + base_text.rstrip('\n') + '\n\n# ' + '-' * 75 + '\n# rover_sim overlay %s\n' % overlay_src
+            + overlay_text.rstrip('\n') + '\n')
+    want = OrderedDict(base)
+    want.update(over)
+    if param_blocks(text, 'the file generated from %s' % overlay_src) != want:
+        raise SimError('BUG: %s + %s does not parse back to both' % (base_src, overlay_src))
+    return text
+
+
+def mapping_config_problem(session: Session, pins: Dict[str, str]) -> Optional[str]:
+    """What the session's mapping panes read and is missing: the robot's files in the pinned
+    checkout, and for the fallback rover_sim's overlays."""
+    d = mapping_checkout(pins) / 'config' / 'mapping'
+    need = set()  # type: set
+    for a in session.agents:
+        m = MAPPER_SETTINGS[a.cls]
+        need |= {m.gm_params} | ({PERSISTENT_MAP_PARAMS} if m.persistent_map else set())
+        if session.mapping == 'gpu':
+            need.add(m.mf_params)
+    missing = sorted(f for f in need if not (d / f).is_file())
+    if missing:
+        return ('the pinned mapping_ws config the mapping panes read is missing (%s in %s): '
+                'run scripts/build_images.sh mapping' % (', '.join(missing), d))
+    if session.mapping == 'fallback':
+        over = sorted({o for a in session.agents for _, _, o, _ in fallback_files(a)})
+        missing = [o for o in over if not (SIM_MAPPING_DIR / o).is_file()]
+        if missing:
+            return 'mapping: fallback needs the overlay(s) %s in %s' % (', '.join(missing), SIM_MAPPING_DIR)
+    return None
+
+
+def write_mapping_files(session: Session, ctx: RunContext) -> None:
+    """<run>/mapping/<overlay> for mapping: fallback (append_overlay); the parity panes read the
+    robot's files from /mapping_config as they are. Stale files go first."""
+    pins = read_pins()
+    problem = mapping_config_problem(session, pins)
+    if problem:
+        raise SimError(problem)
+    out_dir = ctx.run_dir / MAPPING_RUN_DIR
+    empty_own_dir(out_dir)
+    if session.mapping != 'fallback':
+        return
+    src = mapping_checkout(pins) / 'config' / 'mapping'
+    rel = 'mapping_ws@%s:config/mapping/' % pins.get('MAPPING_SHA', '?')[:7]
+    done = OrderedDict()  # type: OrderedDict[str, str]
+    for a in session.agents:
+        for node, base, overlay, out in fallback_files(a):
+            if out not in done:
+                write_file(out_dir / out, append_overlay((src / base).read_text(), rel + base,
+                                                         (SIM_MAPPING_DIR / overlay).read_text(),
+                                                         'rover_sim config/mapping/' + overlay, node).encode())
+                done[out] = base
+    info('wrote %s/ (mapping: fallback, NOT PARITY): %s' % (
+        MAPPING_RUN_DIR, ', '.join('%s (%s + overlay)' % kv for kv in done.items())))
+
+
+def global_mapper_cmd(a: Agent, param_file: str) -> str:
+    """mapping_host_tmux.sh's global_mapper pane, every output under voxel/."""
+    m = MAPPER_SETTINGS[a.cls]
+    return ('ros2 launch global_mapper_ros global_mapper_node.launch.py hardware:=true ground_robot:=true quad:=%s '
+            'global_frame:=%s/odom param_file:=%s use_obstacle_tracker:=%s depth_pointcloud_topic:=%s pose_topic:=%s '
+            'occupancy_grid_topic:=voxel/occupancy_grid unknown_grid_topic:=voxel/unknown_grid '
+            'frontier_grid_topic:=voxel/frontier_grid occ_2d_topic:=voxel/occ_2d_topic '
+            'esdf_2d_topic:=voxel/esdf_2d_topic'
+            % (a.name, a.name, param_file, 'true' if m.tracker else 'false', m.cloud, m.pose))
+
+
+def tf_gate(a: Agent) -> str:
+    """The robot's global_mapper gate: DLIO's odometry, <frame> -> <ns>/base_link. It never
+    passed while the world was paused (every Phase 4 bring-up: DLIO has had no IMU sample yet
+    and stamps its transform 0), so in `up` it waits out its 60 s timeout and proceeds
+    "degraded", still paused. global_mapper then starts with rover_description's base_link ->
+    lidar, as on the robot, and DLIO's odometry follows once physics runs. Kept as the robot's;
+    the cost is 60 s of `up`."""
+    return 'python3 %s %s/odom %s/base_link' % (WAIT_FOR_TF, a.name, a.name)
+
+
+def map_fusion_cmd(a: Agent) -> str:
+    """mapping_host_tmux.sh's map_fusion pane: elev/* + voxel/* -> the planner's grids."""
+    return ('ros2 launch map_fusion_ros map_fusion.launch.py quad:=%s output_prefix:=none elev_prefix:=elev/ '
+            'param_file:=%s/%s' % (a.name, MAPPING_CONFIG_IN, MAPPER_SETTINGS[a.cls].mf_params))
+
+
+def persistent_map_cmd(a: Agent) -> str:
+    """mapping_host_tmux.sh's persistent_map pane (MAPPER_PERSISTENT_MAP), in both modes: the
+    robot's file, but save_dir:=none (the launch file's own default: memory only) where JR02
+    passes its save directory. So a run never resumes or adds to another run's map, and nothing
+    accumulates in sim-mapping's writable layer; a restarted pane starts an empty map
+    (allowed_deviations.yaml: persistent_map_node save_dir)."""
+    return ('ros2 launch map_fusion_ros persistent_map.launch.py quad:=%s param_file:=%s/%s save_dir:=none'
+            % (a.name, MAPPING_CONFIG_IN, PERSISTENT_MAP_PARAMS))
+
+
+def grid_relay_cmd(a: Agent) -> str:
+    """The fallback's stand-in for map_fusion's outputs: scripts/grid_relay.py, node
+    /<ns>/grid_relay_<ns> (a *relay* node: allowed_deviations.yaml mapping.fallback sim_only).
+    voxel/occ_2d_topic -> occ_2d_topic and live/occ_2d_topic, voxel/esdf_2d_topic ->
+    esdf_2d_topic, at map_fusion's 5 Hz, stamped with the newest DLIO cloud's time, nothing
+    before the first cloud. mighty_node reads occ_2d_topic and esdf_2d_topic, goal_selector
+    occ_2d_topic, persistent_map live/occ_2d_topic; nothing reads planning_occ_2d_topic."""
+    return 'python3 %s/grid_relay.py %s' % (SCRIPTS_IN, a.name)
+
+
 def mapping_panes(session: Session, ctx: RunContext) -> List[Pane]:
-    """TODO(Phase 4), sim-mapping. Per agent, as mapping_host_tmux.sh: global_mapper
-    (voxel/*), map_fusion, persistent_map. session.mapping == 'fallback' switches to
-    config/mapping/global_mapper_fallback_<class>.yaml plus the relay."""
-    raise _not_yet('mapping')
+    """sim-mapping: per agent one window with mapping_host_tmux.sh's panes, the class's settings
+    (MAPPER_SETTINGS). mapping: gpu runs the robot's: global_mapper (voxel/*, gated on DLIO's
+    odometry), map_fusion (owns <ns>/{occ_2d,planning_occ_2d,esdf_2d}_topic, from elev/* and
+    voxel/*) and persistent_map. mapping: fallback (NOT PARITY) runs global_mapper on its
+    fallback file and grid_relay.py in place of map_fusion; persistent_map stays the robot's."""
+    panes = []
+    for a in session.agents:
+        m, env, w = MAPPER_SETTINGS[a.cls], robot_env(a), a.name
+        if session.mapping == 'gpu':
+            panes += [Pane('%s global_mapper (voxel/*)' % a.name, 'global-mapper-' + a.name, 'sim-mapping',
+                           global_mapper_cmd(a, '%s/%s' % (MAPPING_CONFIG_IN, m.gm_params)), env=env, window=w,
+                           waits=tf_gate(a)),
+                      Pane('%s map_fusion (elev/* -> grids)' % a.name, 'map-fusion-' + a.name, 'sim-mapping',
+                           map_fusion_cmd(a), env=env, window=w)]
+        else:
+            files = dict((node, run_path(MAPPING_RUN_DIR, out)) for node, _, _, out in fallback_files(a))
+            panes += [Pane('%s global_mapper (voxel/*), FALLBACK: not parity' % a.name, 'global-mapper-' + a.name,
+                           'sim-mapping', global_mapper_cmd(a, files['global_mapper_ros']), env=env, window=w,
+                           waits=tf_gate(a)),
+                      Pane('%s grid_relay (voxel/* -> grids)' % a.name, 'grid-relay-' + a.name, 'sim-mapping',
+                           grid_relay_cmd(a), env=env, window=w)]
+        if m.persistent_map:
+            panes.append(Pane('%s persistent_map (in memory)' % a.name, 'persistent-map-' + a.name, 'sim-mapping',
+                              persistent_map_cmd(a), env=env, window=w))
+    return panes
+
+
+# local_mapper_host_tmux.sh's grid arguments: ALWAYS elev/* (map_fusion owns the canonical
+# names), last on the line so nothing moves them back.
+ELEVATION_TOPIC_ARGS = ('occupancy_grid_topic:=elev/occ_2d_topic',
+                        'planning_occupancy_grid_topic:=elev/planning_occ_2d_topic',
+                        'esdf_grid_topic:=elev/esdf_2d_topic')
+
+
+def elevation_overlays(a: Agent, pins: Dict[str, str]) -> List[str]:
+    """The param overlays the Orin passes (local_mapper_host_tmux.sh:86-91), as container paths:
+    types/<VEHTYPE>.yaml, then vehicles/<robot>.yaml, those in the pinned checkout. The robot is
+    the class's reference robot, which the agent stands in for, not the agent. mapping_ws c1233f7
+    has none for JR or RR (only types/JK.yaml)."""
+    d = mapping_checkout(pins) / 'config' / 'elevation'
+    rel = ['types/%s.yaml' % a.prefix, 'vehicles/%s.yaml' % reference_robot(a.cls, pins)]
+    return ['%s/%s' % (ELEVATION_OVERLAY_IN, r) for r in rel if (d / r).is_file()]
+
+
+def elevation_cmd(a: Agent, overlays: Sequence[str]) -> str:
+    """local_mapper_host_tmux.sh's launch line. Its elevation_mapping_cupy takes param_overlays,
+    so the line has extra_cloud_exclude:=livox/* (quoted: a glob) and the overlays, if any."""
+    args = ['quad:=' + a.name, "'extra_cloud_exclude:=livox/*'"]
+    if overlays:
+        args.append('param_overlays:=' + ','.join(overlays))
+    return 'ros2 launch elevation_mapping_cupy elevation_mapping_dlio.launch.py ' + ' '.join(
+        args + list(ELEVATION_TOPIC_ARGS))
+
+
+# local_mapper_host_tmux.sh finds the launch file the same way and greps it for these arguments.
+_ELEVATION_LAUNCH_SH = r'''f=$(find -L "$1/install" -name elevation_mapping_dlio.launch.py -print -quit 2>/dev/null)
+[ -n "$f" ] || { echo "no elevation_mapping_dlio.launch.py under $1/install"; exit 1; }
+for a in param_overlays occupancy_grid_topic; do
+  grep -qE "[\"']$a[\"']" "$f" || { echo "$f declares no $a argument"; exit 1; }
+done
+echo "$f"'''
+
+
+def check_elevation_launch(session: Session, ctx: RunContext) -> None:
+    """Before the elevation panes: does the image's launch file take what elevation_cmd passes?
+    The Orin's script passes extra_cloud_exclude (and overlays) only when the launch file
+    declares param_overlays, and the elev/* names only when it declares occupancy_grid_topic;
+    elevation_cmd always passes both, which is the Orin's line only for such a launch file."""
+    p = dexec('sim-elevation', ['bash', '-c', _ELEVATION_LAUNCH_SH, 'check', SIM_WS], check=False, timeout=30)
+    out = (p.stdout or '').strip() or (p.stderr or '').strip()
+    if p.returncode != 0:
+        raise SimError('sim-elevation: %s: the Orin would not pass extra_cloud_exclude:=livox/* and the elev/* '
+                       'grid names to this elevation_mapping_cupy; rebuild its image at the pin '
+                       '(scripts/build_images.sh elevation)' % (out or 'exit %d' % p.returncode))
+    info('elevation launch file takes param_overlays and the grid topic arguments: %s' % out)
 
 
 def elevation_panes(session: Session, ctx: RunContext) -> List[Pane]:
-    """TODO(Phase 4), sim-elevation. Per agent: elevation_mapping_dlio.launch.py
-    quad:=<ns> with the elev/* remaps (orin/local_mapper_host_tmux.sh)."""
-    raise _not_yet('elevation')
+    """sim-elevation (on the robot, natively on its Orin): per agent one window with the elevation
+    mapper on DLIO's deskewed cloud, its grids on <ns>/elev/* for map_fusion. Gated on the router
+    and latched delivery like the Orin's pane (ORIN_PROBE); no TF gate, as there."""
+    pins = read_pins()
+    return [Pane('%s elevation_mapping_cupy -> elev/*' % a.name, 'elevation-' + a.name, 'sim-elevation',
+                 elevation_cmd(a, elevation_overlays(a, pins)), env=robot_env(a), window=a.name)
+            for a in session.agents]
 
 
 def mighty_panes(session: Session, ctx: RunContext) -> List[Pane]:
@@ -1235,24 +1593,27 @@ def rviz_panes(session: Session, ctx: RunContext) -> List[Pane]:
 
 
 # Start order is registry order. Later phases flip `implemented` and fill in the builder.
+# Waves (Stack.wave): 0 the router and Gazebo, so the spawns run on a quiet graph (gzserver's
+# ROS services have hung under a storm of graph events); 1 what DLIO needs before it can run;
+# 2 mapping, which reads DLIO; 3 elevation, the heaviest start (cupy on the GPU).
 STACKS = OrderedDict((s.name, s) for s in (
     Stack('zenoh', 1, 'zenoh router in sim-drive', ('sim-drive',), zenoh_panes, implemented=True),
     Stack('gazebo', 2, 'Gazebo world, spawns, sensor bridges, world-><ns>/map', ('sim-gazebo',), gazebo_panes,
           implemented=True, generate=(write_agent_files,), needs_display=lambda s: s.gui),
     Stack('drive', 2, 'teleop + safety_node and rover_description per agent', ('sim-drive',), drive_panes,
-          implemented=True, generate=(write_agent_files, link_calib, write_teleop_file)),
+          implemented=True, generate=(write_agent_files, link_calib, write_teleop_file), wave=1),
     Stack('frame_align', 2, 'ground-truth frame_align per ordered agent pair', ('sim-mighty',),
-          frame_align_panes, implemented=True, wanted=lambda s: len(s.agents) > 1),
+          frame_align_panes, implemented=True, wanted=lambda s: len(s.agents) > 1, wave=1),
     Stack('dlio', 3, 'DLIO, seed pose and map->odom per agent', ('sim-dlio-jr', 'sim-dlio-rr'), dlio_panes,
-          implemented=True, generate=(write_dlio_launch,)),
+          implemented=True, generate=(write_dlio_launch,), wave=1),
     Stack('mapping', 4, 'global_mapper, map_fusion, persistent_map per agent', ('sim-mapping',),
-          mapping_panes),
+          mapping_panes, implemented=True, generate=(write_mapping_files,), wave=2),
     Stack('elevation', 4, 'GPU elevation mapping per agent', ('sim-elevation',), elevation_panes,
-          wanted=lambda s: s.mapping == 'gpu'),
+          implemented=True, wanted=lambda s: s.mapping == 'gpu', generate=(check_elevation_launch,), wave=3),
     Stack('mighty', 5, 'mighty_node, convert_odom_to_state, mpc, goal_selector per agent',
-          ('sim-mighty',), mighty_panes),
+          ('sim-mighty',), mighty_panes, wave=4),
     Stack('rviz', 5, 'RViz, started last', ('sim-gazebo',), rviz_panes, wanted=lambda s: s.rviz,
-          needs_display=_always),
+          needs_display=_always, wave=5),
 ))
 
 
@@ -1286,6 +1647,17 @@ def pending_stacks(session: Session) -> List[str]:
 
 def session_profiles(session: Session) -> List[str]:
     return [GPU_PROFILE] if session.mapping == 'gpu' else []
+
+
+def mapping_label(mode: str, runs: bool = True, absent: str = 'not running') -> str:
+    """How `up`, its dry run and `status` name a session's mapping mode; only what runs gets
+    the label (`up --stacks` without mapping runs none)."""
+    if not runs:
+        return '%s (session mapping: %s)' % (absent, mode)
+    if mode == 'fallback':
+        return ('fallback (NOT PARITY: no elevation map, no map_fusion; global_mapper on the sim\'s fallback '
+                'config, grid_relay.py; parity_check.py --mapping fallback)')
+    return 'gpu (parity: global_mapper, elevation_mapping_cupy, map_fusion, persistent_map)'
 
 
 # ---------------------------------------------------------------------------- tmux
@@ -2565,10 +2937,14 @@ def print_loadtest(summaries: Sequence[Dict[str, Any]], max_discovery: float) ->
 
 # ---------------------------------------------------------------------------- commands
 
-def print_plan(session: Session, plan: Sequence[Tuple[Stack, List[Pane]]], arm: bool = False) -> None:
+def print_plan(session: Session, plan: Sequence[Tuple[Stack, List[Pane]]], arm: bool = False,
+               ctx: Optional[RunContext] = None) -> None:
+    ctx = ctx or RunContext(run_dir=run_dir_from_env())
     print('session %s (%s): world %s (MID-360 %d rays/scan), gui %s, mapping %s, rviz %s, num_agents %d' % (
         session.name, session.source, session.world, world_lidar_samples(session.world),
         'on' if session.gui else 'off', session.mapping, 'on' if session.rviz else 'off', session.num_agents))
+    names = {stack.name for stack, _ in plan}
+    print('mapping: ' + mapping_label(session.mapping, 'mapping' in names, 'not started'))
     pins = read_pins()
     for a in session.agents:
         print('  %s  %s  id %02d  pose (%.2f, %.2f, %.1f deg)  calibrated from %s, lidar at %.2f m' % (
@@ -2577,19 +2953,53 @@ def print_plan(session: Session, plan: Sequence[Tuple[Stack, List[Pane]]], arm: 
     steps = generate_steps([stack for stack, _ in plan])
     if steps:
         print('before the panes: %s' % ', '.join(g.__name__ for g in steps))
-    if any(stack.name == 'dlio' for stack, _ in plan):
+    if 'dlio' in names:
         problem = dlio_scripts_problem(pins)
         print('dlio_ws scripts: %s -> %s/scripts (ro)' % (dlio_scripts_dir(pins), DLIO_WS) if not problem
               else 'WARNING: ' + problem)
-    for stack, panes in plan:
-        print('stack %s -> tmux session %s%s' % (stack.name, TMUX_PREFIX, stack.name))
-        for wname, wpanes in tmux_windows(panes):
-            print('  window %s' % wname)
-            for p in wpanes:
-                print('    [%s] %s\n      %s' % (p.slug, p.title, pane_command(p)))
-    if any(stack.name == 'gazebo' for stack, _ in plan):
-        print('after the panes: wait until the spawn pane has unpaused the world (up to %d s; fails if it '
-              'fails)' % SPAWN_WAIT_S)
+    if names & {'mapping', 'elevation'}:
+        users = ['sim-mapping'] + (['sim-elevation'] if 'elevation' in names else [])
+        problem = mapping_mounts_problem(pins, users)
+        where = ['sim-mapping:%s' % MAPPING_CONFIG_IN] + (
+            ['sim-elevation:%s and %s' % (ELEVATION_OVERLAY_IN, ORIN_PROBE)] if 'elevation' in names else [])
+        print('mapping_ws config: %s -> %s (ro)' % (mapping_checkout(pins), ', '.join(where)) if not problem
+              else 'WARNING: ' + problem)
+    if 'mapping' in names:
+        print('mapping settings: %s' % '; '.join('%s from %s' % (c, MAPPER_SETTINGS[c].source) for c in
+                                                 OrderedDict((a.cls, 1) for a in session.agents)))
+        problem = mapping_config_problem(session, pins)
+        if problem:
+            print('WARNING: ' + problem)
+        if session.mapping == 'fallback':
+            files = OrderedDict()  # type: OrderedDict[str, Tuple[str, str, List[str]]]
+            for a in session.agents:
+                for node, base, overlay, out in fallback_files(a):
+                    files.setdefault(out, (base, overlay, []))[2].append(a.name)
+            for out, (base, overlay, who) in files.items():
+                print('fallback params: %s = %s/%s + %s/%s (%s)' % (run_path(MAPPING_RUN_DIR, out), MAPPING_CONFIG_IN,
+                                                                    base, SIM_MAPPING_IN, overlay, ', '.join(who)))
+    if 'elevation' in names:
+        print('elevation overlays: %s' % '; '.join('%s %s' % (a.name, ','.join(elevation_overlays(a, pins)) or 'none')
+                                                   for a in session.agents))
+    print('start in waves; after each, wait until its panes have started their nodes (up to %d s) and the sim '
+          'containers are idle (rmw_zenohd under %.0f %% and all together under %.0f %% of a core, %d samples in a '
+          'row; up to %d s)' % (NODES_WAIT_S, SETTLE_ROUTER_PCT, SETTLE_STACKS_PCT_PER_AGENT * len(session.agents),
+                                SETTLE_QUIET_SAMPLES, SETTLE_TIMEOUT_S))
+    for k, wave in enumerate(start_waves(plan)):
+        print('wave %d: %s' % (k, ', '.join(s.name for s, _ in wave)))
+        for stack, panes in wave:
+            print('stack %s -> tmux session %s%s' % (stack.name, TMUX_PREFIX, stack.name))
+            for wname, wpanes in tmux_windows(panes):
+                print('  window %s' % wname)
+                for p in wpanes:
+                    print('    [%s] %s\n      %s' % (p.slug, p.title, pane_command(p)))
+        if any(s.name == 'gazebo' for s, _ in wave):
+            print('wave %d settles once the spawn pane has spawned every agent into the paused world (up to %d s; '
+                  'fails if it fails)' % (k, SPAWN_WAIT_S))
+    if 'gazebo' in names:
+        print('after the last wave: unpause physics over gazebo transport (up to %d tries; fails if the world stays '
+              'paused):\n      %s' % (UNPAUSE_TRIES, shlex_join(['docker', 'exec', 'sim-gazebo', 'bash', '-c',
+                                                                  unpause_cmd(ctx)])))
     if arm:
         print('after the panes: arm %s: /<ns>/auto_mode once its DLIO registers scans (auto_arm; '
               '--no-arm skips)' % ', '.join(a.name for a in session.agents))
@@ -2650,9 +3060,9 @@ def clear_ros_logs(names: Sequence[str]) -> None:
     parallel(lambda n: dexec(n, ['sh', '-c', _CLEAR_ROS_LOGS_SH], check=False, timeout=30), list(names))
 
 
-# The spawn pane's last line once every agent is in the world and physics runs (spawn_cmd); the
-# command line the pane log also holds has $(date ...) where this has the time.
-SPAWNED_RE = re.compile(r'\[rover_sim\] spawned .*; physics unpaused at \d\d:\d\d:\d\d')
+# The spawn pane's last line once every agent is in the paused world (spawn_cmd); the command
+# line the pane log also holds has $(date ...) where this has the time.
+SPAWNED_RE = re.compile(r'\[rover_sim\] spawned .* into the paused world at ' + PANE_TIME_RE)
 SPAWN_WAIT_S = 300            # gzserver's start, then up to 125 s per stuck spawn_entity (spawn_agent.launch.py)
 SPAWN_PANE_GRACE_S = 10       # before a pane's docker exec runs, tmux reports its bash
 
@@ -2667,13 +3077,10 @@ def spawn_pane_exited() -> bool:
 
 
 def wait_spawned(log_dir: Path, timeout: float = SPAWN_WAIT_S) -> float:
-    """Until the spawn pane has put every agent in the world and unpaused it. Once in 10
-    bring-ups gzserver never answered a /spawn_entity call (nor any other ROS service after
-    it): the pane then fails after spawn_agent's timeout (or the unpause call's), and this
-    says so instead of arming waiting 3 minutes for IMU data. Holding the other stacks until
-    here was tried and dropped: their start-up then lands in the first seconds of physics,
-    and in 1 of 3 runs cost an RTF violation (their ~40 processes load cores 12-15, the SMT
-    siblings of gzserver's).
+    """Until the spawn pane has put every agent in the paused world. Once in 10 bring-ups
+    gzserver never answered a /spawn_entity call (nor any other ROS service after it): the pane
+    then fails after spawn_agent's timeout, and this says so instead of arming waiting 3 minutes
+    for IMU data.
     Raises when the pane fails or takes longer than timeout; returns the seconds waited."""
     log, t0 = log_dir / 'gazebo' / 'spawn.log', time.time()
     while True:
@@ -2684,12 +3091,250 @@ def wait_spawned(log_dir: Path, timeout: float = SPAWN_WAIT_S) -> float:
             pass
         waited = time.time() - t0
         if waited > SPAWN_PANE_GRACE_S and spawn_pane_exited():
-            raise SimError('the spawn pane failed (%s): an agent was not spawned, or physics was not unpaused; '
+            raise SimError('the spawn pane failed (%s): an agent was not spawned; '
                            'scripts/sim.py down, then up again' % log)
         if waited > timeout:
             raise SimError('the agents were not all spawned within %.0f s (%s; scripts/sim.py attach gazebo): '
                            'scripts/sim.py down, then up again' % (timeout, log))
         time.sleep(1)
+
+
+# Physics starts only once every wave has settled. What went wrong otherwise, with 4 agents:
+# - Phase 3: a start-up burst in the first seconds of physics (~40 processes importing rclpy on
+#   the shared cores, 12-15 among them, the SMT siblings of gzserver's) cost an RTF violation
+#   once in 3 runs;
+# - Phase 4, mapping panes started after the unpause (all at once, or one agent at a time):
+#   zenoh delivery stalls of 0.5-1.2 s, which the sensor bridges take for sim time jumps, and
+#   parked DLIOs diverged;
+# - Phase 4, every stack at once into the paused world: /spawn_entity never answered (2 of 2),
+#   or the router timed out declarations (DeclareFinal) and two DLIOs never got their seed.
+# One wave at a time, each settled, then one unpause, was clean in all 6 runs.
+NODES_WAIT_S = 120            # a wave's panes past their gates (global_mapper's TF gate takes 60 s)
+SETTLE_TIMEOUT_S = 90         # then idle; past either, `up` warns and goes on
+SETTLE_QUIET_SAMPLES = 2      # docker stats samples in a row (about 2 s each) under both limits
+SETTLE_ROUTER_PCT = 10.0      # rmw_zenohd, % of a core (settle_router's limit)
+# Every sim container together (docker stats). A start-up burst keeps several cores busy; the
+# paused stacks need well under half a core per agent (Phase 4, paused, after the last wave: 108-126
+# % for 4 agents with elevation, 88 % for 2 in fallback).
+SETTLE_STACKS_PCT_PER_AGENT = 50.0
+# ...and the samples of a quiet run must agree within this many % of a core (or 15 % of the
+# load): two global_mappers still starting read 53 % then 88 %, under smoke's 100 % limit.
+SETTLE_STEADY_PCT = 15.0
+UNPAUSE_CALL_S = 30           # gz world's SIGKILL backstop
+UNPAUSE_TRIES = 2
+
+
+def pane_commands() -> Optional[Dict[Tuple[str, str], str]]:
+    """(tmux session, pane slug) -> the pane's current command: 'docker' while its exec runs.
+    None when tmux could not list the panes: then nothing is known about them."""
+    p = tmux('list-panes', '-a', '-F', '#{session_name}\t#{%s}\t#{pane_current_command}' % PANE_SLUG_OPTION,
+             check=False)
+    if p.returncode != 0:
+        return None
+    rows = [l.split('\t') for l in (p.stdout or '').splitlines()]
+    return dict(((r[0], r[1]), r[2]) for r in rows if len(r) == 3 and r[0].startswith(TMUX_PREFIX))
+
+
+def wait_nodes_started(plan: Sequence[Tuple[Stack, List[Pane]]], log_dir: Path, timeout: float = NODES_WAIT_S
+                       ) -> Tuple[float, List[str], List[str]]:
+    """Until every pane has started its node: its log has node_marker()'s line, which it prints
+    once its gates have passed. A pane whose docker exec has ended is not waited for; while tmux
+    cannot list the panes, none counts as ended.
+    Returns (seconds, panes that exited, panes still waiting at the timeout) as <stack>/<slug>."""
+    t0 = time.time()
+    pending = OrderedDict(('%s/%s' % (s.name, p.slug), log_dir / s.name / (p.slug + '.log'))
+                          for s, panes in plan for p in panes)
+    exited = []  # type: List[str]
+    while True:
+        for key, log in list(pending.items()):
+            try:
+                if NODE_STARTED_RE.search(log.read_text(errors='replace')):
+                    del pending[key]
+            except FileNotFoundError:
+                pass
+        waited = time.time() - t0
+        states = pane_commands() if pending and waited > SPAWN_PANE_GRACE_S else None
+        for key in list(pending) if states is not None else []:
+            stack, slug = key.split('/', 1)
+            if states.get((TMUX_PREFIX + stack, slug)) != 'docker':
+                exited.append(key)
+                del pending[key]
+        if not pending or waited > timeout:
+            return waited, exited, list(pending)
+        time.sleep(1)
+
+
+def _cpu_pct(text: str) -> float:
+    try:
+        return float(text.strip().rstrip('%'))
+    except ValueError:
+        return 0.0
+
+
+class LoadSampler:
+    """Each call: (rmw_zenohd, every given sim container together) in % of one core since the
+    previous call, or None when either cannot be read, a docker call that timed out included
+    (a busy daemon during a start burst: `up` goes on). A call takes docker stats' own sampling
+    time, about 2 s."""
+
+    def __init__(self, names: Sequence[str]):
+        self.names = list(names)
+        self.prev = (time.time(), self._router())
+
+    @staticmethod
+    def _router() -> Optional[float]:
+        try:
+            return router_cpu_seconds()
+        except SimError:
+            return None
+
+    def __call__(self) -> Optional[Tuple[float, float]]:
+        try:
+            stats = docker_stats(self.names)
+        except SimError:
+            stats = {}
+        now, cur = time.time(), self._router()
+        (t0, c0), self.prev = self.prev, (now, cur)
+        if not stats or cur is None or c0 is None or now <= t0:
+            return None
+        return 100.0 * (cur - c0) / (now - t0), sum(_cpu_pct(s['cpu']) for s in stats.values())
+
+
+def wait_idle(sample: Callable[[], Optional[Tuple[float, ...]]], limits: Sequence[float],
+              quiet: int = SETTLE_QUIET_SAMPLES, timeout: float = SETTLE_TIMEOUT_S,
+              clock: Callable[[], float] = time.time,
+              on_sample: Callable[[Optional[Tuple[float, ...]]], None] = lambda s: None,
+              sleep: Callable[[float], None] = time.sleep
+              ) -> Tuple[Optional[float], Optional[Tuple[float, ...]]]:
+    """Until `quiet` samples in a row are each under its limit and steady (their last value,
+    the containers' total, within SETTLE_STEADY_PCT of the previous one: a start-up still ramping
+    up is not idle), an equivalent of the load test's settle_router over more than the router.
+    A sample that cannot be taken (None) is not quiet: it breaks the run, and the next comes
+    after the usual 2 s. Returns (seconds waited, the last sample taken); seconds is None after
+    the timeout."""
+    t0, run, last = clock(), 0, None
+    while clock() - t0 < timeout:
+        cur = sample()
+        on_sample(cur)
+        if cur is None:
+            run = 0
+            sleep(2.0)
+            continue
+        if not all(v < lim for v, lim in zip(cur, limits)):
+            run = 0
+        elif run and abs(cur[-1] - last[-1]) > max(SETTLE_STEADY_PCT, 0.15 * last[-1]):
+            run = 1                     # this sample starts a new run
+        else:
+            run += 1
+        last = cur
+        if run >= quiet:
+            return clock() - t0, last
+    return None, last
+
+
+def start_waves(plan: Sequence[Tuple[Stack, List[Pane]]]) -> List[List[Tuple[Stack, List[Pane]]]]:
+    """The plan's stacks grouped by Stack.wave, in wave order (registry order within one)."""
+    waves = OrderedDict()  # type: OrderedDict[int, List[Tuple[Stack, List[Pane]]]]
+    for s, panes in sorted(plan, key=lambda sp: sp[0].wave):
+        waves.setdefault(s.wave, []).append((s, panes))
+    return list(waves.values())
+
+
+def settle_wave(wave: Sequence[Tuple[Stack, List[Pane]]], n_agents: int, log_dir: Path) -> List[str]:
+    """After a wave's stacks started: until its panes have started their nodes, then until the
+    sim containers are idle. Returns the panes that ended before starting their node, at once
+    (bring_up stops there); a pane that still waits, or stacks that stay busy or whose load
+    cannot be read, are reported and do not hold `up` back for ever."""
+    log, what = log_dir / BRINGUP_LOG, ', '.join(s.name for s, _ in wave)
+    waited, exited, missing = wait_nodes_started(wave, log_dir)
+    log_line(log, '%s: nodes started after %.1f s; exited %s; still waiting %s' % (what, waited, exited, missing))
+    if exited:
+        return exited
+    if missing:
+        warn('pane(s) still waiting on their gates after %.0f s: %s; going on' % (waited, ', '.join(missing)))
+    limits = (SETTLE_ROUTER_PCT, SETTLE_STACKS_PCT_PER_AGENT * n_agents)
+    took, last = wait_idle(LoadSampler(running_sim_containers()), limits, on_sample=lambda v: log_line(
+        log, '%s: load %s' % (what, 'router %.1f %%, sim containers %.0f %% of a core' % tuple(v) if v
+                              else 'not readable (a docker call failed or timed out)')))
+    log_line(log, '%s: idle check (limits router %.0f %%, sim containers %.0f %%): %s after %s s'
+             % ((what,) + limits + ('ok' if took is not None else 'NOT idle', took)))
+    if took is None:
+        warn('%s: the stacks did not go idle (%s; limits %.0f %% / %.0f %%): going on' % (
+            what, 'router %.0f %%, sim containers %.0f %% of a core' % last if last else 'cannot read the load',
+            limits[0], limits[1]))
+    else:
+        info('%s: %s started their nodes after %.0f s, idle %.0f s later (router %.0f %%, sim containers %.0f %% '
+             'of a core)' % ((what, 'the other panes' if missing else 'all panes', waited, took) + tuple(last)))
+    return []
+
+
+GZ_SETUP = '. /usr/share/gazebo/setup.sh'
+
+
+def unpause_cmd(ctx: RunContext) -> str:
+    """The one unpause, in sim-gazebo: gz world over gazebo transport, then gz stats until the
+    world reports it runs (gz stats prints nothing while paused). Not /unpause_physics:
+    gzserver's ROS executor is what stops answering services (rmw_zenoh 0.1.9's lost wakeup;
+    Phase 3 and 4 runs), and gazebo transport does not go through it. Not pinned to the rest
+    core like the other gazebo panes: gz world and gz stats never return when their affinity
+    is one core (any of sim-gazebo's, every try), and the world is paused while gz world runs."""
+    del ctx
+    return ' && '.join([GZ_SETUP, 'timeout -k 2 %d gz world -p 0' % UNPAUSE_CALL_S,
+                        'for i in 1 2 3; do timeout -k 2 6 gz stats -d 2 | grep -m1 -o "Paused\\[F\\]" '
+                        '&& exit 0; done; echo "gz stats: the world still reports no Paused[F]"; exit 1'])
+
+
+def unpause_physics(ctx: RunContext, log: Optional[Path] = None) -> int:
+    """Unpauses the world (idempotent), a second time if the first try does not work. Raises
+    when neither does; returns the try that worked."""
+    for attempt in range(1, UNPAUSE_TRIES + 1):
+        t0 = time.time()
+        try:
+            p = dexec('sim-gazebo', ['bash', '-c', unpause_cmd(ctx)], check=False, timeout=UNPAUSE_CALL_S + 40)
+            rc, out = p.returncode, ((p.stdout or '') + (p.stderr or '')).strip()
+        except SimError as e:            # the docker exec client hung
+            rc, out = None, str(e)
+        log_line(log, 'unpause %d: exit %s after %.1f s: %s' % (attempt, rc, time.time() - t0,
+                                                                 ' | '.join(out.splitlines()[-3:])))
+        if rc == 0:
+            return attempt
+        warn('unpause %d of %d failed (exit %s): %s' % (attempt, UNPAUSE_TRIES, rc, ''.join(out.splitlines()[-1:])))
+    raise SimError('physics was not unpaused: gz world -p 0 did not take (%s); the world stays paused: '
+                   'scripts/sim.py down, then up again' % (log or 'no log'))
+
+
+def bring_up(session: Session, plan: Sequence[Tuple[Stack, List[Pane]]], ctx: RunContext, log_dir: Path) -> None:
+    """Starts the stacks wave by wave into the paused world, then unpauses it once (when this
+    `up` started gazebo). Wave 0 holds the spawn: it settles once every agent is in. A pane that
+    ends before its node starts (a failed gate, a missing file) stops `up` after its wave, before
+    the next wave and the unpause, so a broken bring-up never looks like a working one."""
+    log = log_dir / BRINGUP_LOG
+    gazebo = any(s.name == 'gazebo' for s, _ in plan)
+    waves = start_waves(plan)
+    for k, wave in enumerate(waves):
+        log_line(log, 'wave %d: starting %s' % (k, ', '.join(s.name for s, _ in wave)))
+        for s, panes in wave:
+            sess = start_stack(s, panes, log_dir)
+            info('%-11s up: tmux attach -t %s   (scripts/sim.py attach %s)' % (s.name, sess, s.name))
+        if any(s.name == 'gazebo' for s, _ in wave):
+            waited = wait_spawned(log_dir)
+            log_line(log, 'every agent spawned after %.1f s' % waited)
+            info('every agent spawned into the paused world after %.0f s' % waited)
+        exited = settle_wave(wave, len(session.agents), log_dir)
+        if exited:
+            later = [s.name for w in waves[k + 1:] for s, _ in w]
+            log_line(log, 'stopping: pane(s) ended before starting their node: %s' % ', '.join(exited))
+            raise SimError(
+                'pane(s) ended before starting their node: %s (pane logs in %s; scripts/sim.py attach %s). '
+                '`up` stops here%s%s; every safety_node stays DISARMED. Fix it, then scripts/sim.py down and up '
+                'again' % (', '.join(exited), log_dir, exited[0].split('/', 1)[0],
+                           ': the world stays paused' if gazebo else '',
+                           ', and %s did not start' % ', '.join(later) if later else ''))
+    if gazebo:
+        attempt = unpause_physics(ctx, log)
+        log_line(log, 'physics unpaused')
+        info('physics unpaused at %s%s; DLIO calibrates its IMU now' % (
+            time.strftime(HOST_TIME_FMT), '' if attempt == 1 else ' (try %d)' % attempt))
 
 
 def cmd_up(args: argparse.Namespace) -> int:
@@ -2705,7 +3350,7 @@ def cmd_up(args: argparse.Namespace) -> int:
             warn(problem + ': gzserver will fail to load it')
     arm = will_arm(session, stacks, args.no_arm)
     if args.dry_run:
-        print_plan(session, plan, arm)
+        print_plan(session, plan, arm, ctx)
         return 0
     for tool in ('docker', 'tmux'):
         if shutil.which(tool) is None:
@@ -2720,8 +3365,14 @@ def cmd_up(args: argparse.Namespace) -> int:
                 else list(images))
     used = OrderedDict((k, v) for k, v in images.items() if k in services)
     check_images(used)
-    if any(c.startswith('sim-dlio-') for c in services):
-        problem = dlio_scripts_problem(read_pins())     # compose would refuse the mount
+    pins = read_pins()
+    # Compose would refuse these mounts.
+    for problem in ((dlio_scripts_problem(pins) if any(c.startswith('sim-dlio-') for c in services) else None),
+                    mapping_mounts_problem(pins, services)):
+        if problem:
+            raise SimError(problem)
+    if any(s.name == 'mapping' for s in stacks):
+        problem = mapping_config_problem(session, pins)
         if problem:
             raise SimError(problem)
     for line in image_provenance(used):
@@ -2749,17 +3400,15 @@ def cmd_up(args: argparse.Namespace) -> int:
     ctx = dataclasses.replace(ctx, log_dir=log_dir)
     for step in generate_steps(stacks):
         step(session, ctx)
-    for s, panes in plan:
-        sess = start_stack(s, panes, log_dir)
-        info('%-8s up: tmux attach -t %s   (scripts/sim.py attach %s)' % (s.name, sess, s.name))
     info('session %s: %s' % (session.name, ', '.join('%s (%s)' % (a.name, a.cls) for a in session.agents)))
+    if any(s.name == 'mapping' for s in stacks):
+        (warn if session.mapping == 'fallback' else info)('mapping: ' + mapping_label(session.mapping))
     pending = pending_stacks(session)
     if pending:
         info('not started yet (later phases): ' + ', '.join(pending))
     info('pane logs: %s' % log_dir)
     info('run dir:   %s' % run_dir)
-    if any(s.name == 'gazebo' for s in stacks):
-        info('every agent spawned, physics running, after %.0f s' % wait_spawned(log_dir))
+    bring_up(session, plan, ctx, log_dir)
     if not arm:
         if session.auto_arm and not args.no_arm:
             info('not arming: the dlio and drive stacks are not both started (scripts/sim.py arm)')
@@ -2877,29 +3526,34 @@ def cmd_status(args: argparse.Namespace) -> int:
     run_dir = resolve_run_dir() if up else run_dir_from_env()
     sf = run_dir / 'session.json'
     s = json.loads(sf.read_text()) if sf.is_file() else None
+    stacks = {r[0][len(TMUX_PREFIX):] for r in rows} & {'gazebo', 'dlio', 'drive', 'mapping'}
     if s:
-        print('session: %s (%s), world %s, mapping %s, agents %s' % (
-            s['name'], s.get('source', ''), s['world'], s['mapping'], ', '.join(a['name'] for a in s['agents'])))
+        print('session: %s (%s), world %s, agents %s' % (
+            s['name'], s.get('source', ''), s['world'], ', '.join(a['name'] for a in s['agents'])))
+        print('mapping: %s' % mapping_label(s.get('mapping', 'gpu'), 'mapping' in stacks))
     print('run dir: %s' % run_dir)
     if (LOG_ROOT / 'latest').exists():
         print('logs:    %s' % (LOG_ROOT / 'latest').resolve())
-    stacks = {r[0][len(TMUX_PREFIX):] for r in rows} & {'gazebo', 'dlio', 'drive'}
+    maps = bool(getattr(args, 'maps', False)) and 'mapping' in stacks
     if problems:
         # The query opens a ROS session; `up` starts none on a broken network either.
         print('sim time: not queried (isolation BROKEN)')
     elif s and QUERY_CONTAINER in up and stacks:
         names = [a['name'] for a in s['agents']]
-        vals = status_values(status_specs(names, stacks))
+        vals = status_values(status_specs(names, stacks, maps))
         if 'gazebo' in stacks:
             print('sim time (each agent\'s livox_sim_bridge; time_offset = wall - sim):')
             for line in sim_time_lines(names, vals):
                 print('  ' + line)
         else:
             print('sim time: n/a (the gazebo stack is not running)')
-        if stacks & {'dlio', 'drive'}:
-            print('agents (DLIO over %g s; safety_node mode%s):' % (
-                RATE_WINDOW_S, '' if s.get('auto_arm', False) else '; auto_arm off'))
-            for line in agent_lines(names, vals, stacks):
+        if stacks & {'dlio', 'drive', 'mapping'}:
+            fallback = s.get('mapping') == 'fallback' and 'mapping' in stacks
+            print('agents (DLIO%s over %g s; safety_node mode%s%s%s):' % (
+                ' and maps' if maps else '', RATE_WINDOW_S, '' if s.get('auto_arm', False) else '; auto_arm off',
+                '; maps not read (status --maps)' if 'mapping' in stacks and not maps else '',
+                '; maps from the fallback, NOT PARITY' if fallback else ''))
+            for line in agent_lines(names, vals, stacks, maps):
                 print('  ' + line)
     else:
         print('sim time: n/a (the gazebo stack is not running)')
@@ -2921,6 +3575,14 @@ RTF_MIN = 0.95                         # the bridges log a violation below this 
 ECHO_TIMEOUT_S = 8                     # topics are 1 Hz; rclpy itself takes 1-2 s to start
 RATE_WINDOW_S = 3.0                    # DLIO odom (100 Hz) and scan (10 Hz) rates are taken over this
 ODOM_MAX_AGE_S = 1.0                   # an older DLIO odom stamp: no IMU is reaching DLIO
+# The query leaves the graph one subscription at a time, then pauses before it closes (_STATUS_PY).
+# On the loaded 4-agent gpu graph (rmw_zenoh 0.1.9) undeclaring its 20 subscriptions at once, by
+# destroy_node or by exiting, stopped every delivery for 0.9-1.0 s (32 with --maps: 1.3-1.4 s);
+# all destroyed at once, then a pause: 0.7 s. One every 0.1 s, with no rosout and no parameter
+# services on its node (entities its close would otherwise undeclare in a burst): none, the
+# clouds' worst inter-arrival 141-205 ms, as without a query (Phase 4 review, 4 runs of each).
+STATUS_LEAVE_GAP_S = 0.1
+STATUS_LEAVE_PAUSE_S = 0.5
 # Both queries run in sim-drive, on the cores the non-Gazebo stacks share, not on the core of
 # sim-gazebo where the sensor bridges run: DLIO odom is 100 Hz per agent.
 QUERY_CONTAINER = ROUTER_CONTAINER
@@ -2928,30 +3590,44 @@ QUERY_CONTAINER = ROUTER_CONTAINER
 # sessions starting at once on the bridges' one core joined so slowly that the router blocked
 # on them (5 s per undeliverable declaration) and stalled the whole sim graph for 3 minutes.
 # SIGKILL backs up the timeout: a session stuck in its close keeps the router waiting until
-# its socket closes. Arguments are <kind>:<topic>, and each prints one line:
+# its socket closes. The timeout covers the paced leave (STATUS_LEAVE_GAP_S): a query killed
+# then closes all at once. Arguments are <kind>:<topic>, and each prints one line:
 #   f64    std_msgs/Float64, first value                    '@@ <topic> <value>'
 #   str    std_msgs/String, last value                      '@@ <topic> <value>'
 #   odom   nav_msgs/Odometry: rate, last stamp's age, count  '@@ <topic> <Hz> <age s|inf> <n>'
 #   count  sensor_msgs/PointCloud2 (not deserialised): rate  '@@ <topic> <Hz> <n>'
+#   grid   nav_msgs/OccupancyGrid: as odom, its stamp read from the serialised header (a grid
+#          is not deserialised: the persistent map grows to megabytes)
+#   change a grid published only when it changed (persistent_map/grid): as grid, not waited for
 # or '@@ <topic>' if nothing came. It stops when every one-shot value is in and every rate
-# has RATE_WINDOW_S of samples, or at the deadline. Subscriptions are best effort, so the
-# publishers' KEEP_LAST queues never wait for this reader; safety_node's mode is
-# TRANSIENT_LOCAL but also re-published at 2 Hz, so no late-joiner delivery is needed.
+# but a `change` one (unless only those were asked for) has RATE_WINDOW_S of samples, or at
+# the deadline. Subscriptions are best effort, so the publishers' KEEP_LAST queues never wait
+# for this reader; safety_node's mode is TRANSIENT_LOCAL but also re-published at 2 Hz, so no
+# late-joiner delivery is needed.
 _STATUS_PY = r"""
-import sys, time
+import struct, sys, time
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy
-from nav_msgs.msg import Odometry
+from nav_msgs.msg import OccupancyGrid, Odometry
 from sensor_msgs.msg import PointCloud2
 from std_msgs.msg import Float64, String
 end, window = time.time() + float(sys.argv[1]), float(sys.argv[2])
 specs = [a.split(':', 1) for a in sys.argv[3:]]
+LEAVE_GAP_S, LEAVE_PAUSE_S = @LEAVE@
 rclpy.init(args=[])
-node = Node('sim_status_%d' % (time.time_ns() % 1000000))
+node = Node('sim_status_%d' % (time.time_ns() % 1000000), enable_rosout=False, start_parameter_services=False)
 qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
-TYPES = {'f64': Float64, 'str': String, 'odom': Odometry, 'count': PointCloud2}
+TYPES = {'f64': Float64, 'str': String, 'odom': Odometry, 'count': PointCloud2, 'grid': OccupancyGrid,
+         'change': OccupancyGrid}
+RAW = ('count', 'grid', 'change')
 times, last = {t: [] for _, t in specs}, {}
+def raw_stamp(b):
+    # Little-endian CDR: a 4-byte encapsulation header, then header.stamp (int32 sec, uint32 nsec).
+    if len(b) < 12 or b[1:2] != b'\x01':
+        return 0.0
+    sec, nsec = struct.unpack_from('<iI', b, 4)
+    return sec + nsec * 1e-9
 def cb(kind, topic):
     def f(m):
         times[topic].append(time.time())
@@ -2961,11 +3637,14 @@ def cb(kind, topic):
             last[topic] = m.data
         elif kind == 'odom':
             last[topic] = m.header.stamp.sec + m.header.stamp.nanosec * 1e-9
+        elif kind in ('grid', 'change'):
+            last[topic] = raw_stamp(m)
     return f
-subs = [node.create_subscription(TYPES[k], t, cb(k, t), qos, raw=(k == 'count')) for k, t in specs]
+subs = [node.create_subscription(TYPES[k], t, cb(k, t), qos, raw=(k in RAW)) for k, t in specs]
+waited = [(k, t) for k, t in specs if k != 'change'] or specs
 def complete():
     return all((t in last) if k in ('f64', 'str') else (times[t] and times[t][-1] - times[t][0] >= window)
-               for k, t in specs)
+               for k, t in waited)
 while time.time() < end and not complete():
     rclpy.spin_once(node, timeout_sec=0.05)
 now = time.time()
@@ -2978,16 +3657,26 @@ for k, t in specs:
         out.append('@@ %s' % t)
     elif k in ('f64', 'str'):
         out.append('@@ %s %s' % (t, last[t]))
-    elif k == 'odom':
+    elif k in ('odom', 'grid', 'change'):
         out.append('@@ %s %s %.3f %d' % (t, rate(r), now - last[t] if last[t] else float('inf'), len(r)))
     else:
         out.append('@@ %s %s %d' % (t, rate(r), len(r)))
 print('\n'.join(out), flush=True)
+for s in subs:
+    node.destroy_subscription(s)
+    rclpy.spin_once(node, timeout_sec=0)
+    time.sleep(LEAVE_GAP_S)
+time.sleep(LEAVE_PAUSE_S)
 node.destroy_node()
 rclpy.try_shutdown()
-"""
-_STATUS_SH = 'exec timeout -k 2 %d python3 -c "$SIM_STATUS_PY" %d %g "$@"' % (
-    ECHO_TIMEOUT_S + 4, ECHO_TIMEOUT_S, RATE_WINDOW_S)
+""".replace('@LEAVE@', '%r, %r' % (STATUS_LEAVE_GAP_S, STATUS_LEAVE_PAUSE_S))
+# $1: the timeout, then the specs.
+_STATUS_SH = 'exec timeout -k 2 "$1" python3 -c "$SIM_STATUS_PY" %d %g "${@:2}"' % (ECHO_TIMEOUT_S, RATE_WINDOW_S)
+
+
+def status_budget(n_specs: int) -> int:
+    """Seconds the query may take: rclpy's start, its deadline, then its paced leave."""
+    return int(math.ceil(ECHO_TIMEOUT_S + 4 + n_specs * STATUS_LEAVE_GAP_S + STATUS_LEAVE_PAUSE_S))
 
 
 def odom_topic(n: str) -> str:
@@ -2998,9 +3687,23 @@ def scans_topic(n: str) -> str:
     return '/%s/dlio/odom_node/pointcloud/deskewed' % n
 
 
-def status_specs(names: Sequence[str], stacks: Iterable[str]) -> List[str]:
+# What the planner reads from the mapping stack (map_fusion, or the fallback's grid_relay.py),
+# how old a grid may be (mighty's map-age hold, 1.5 s) and the query kind. persistent_map/grid
+# has no limit and is not waited for: it is latched and re-published (every 2 s) only when the
+# map changed, so on a parked agent its age just grows, and none may come within the query.
+# Read only with `status --maps`: 3 more subscriptions per agent, one of them megabytes (before
+# the paced leave, STATUS_LEAVE_GAP_S, that query's end stalled the 4-agent graph for 1.3 s).
+MAP_GRIDS = (('occ_2d_topic', 1.5, 'grid'), ('esdf_2d_topic', 1.5, 'grid'), ('persistent_map/grid', None, 'change'))
+
+
+def grid_topic(n: str, grid: str) -> str:
+    return '/%s/%s' % (n, grid)
+
+
+def status_specs(names: Sequence[str], stacks: Iterable[str], maps: bool = False) -> List[str]:
     """What `status` reads for the stacks that run: the bridges' sim/rtf and
-    sim/time_offset, DLIO's odom and deskewed scans, safety_node's mode."""
+    sim/time_offset, DLIO's odom and deskewed scans, safety_node's mode, and with maps the
+    planner's grids."""
     stacks = set(stacks)
     out = []  # type: List[str]
     for n in names:
@@ -3010,6 +3713,8 @@ def status_specs(names: Sequence[str], stacks: Iterable[str]) -> List[str]:
             out += ['odom:' + odom_topic(n), 'count:' + scans_topic(n)]
         if 'drive' in stacks:
             out.append('str:/%s/mode' % n)
+        if maps and 'mapping' in stacks:
+            out += ['%s:%s' % (kind, grid_topic(n, g)) for g, _, kind in MAP_GRIDS]
     return out
 
 
@@ -3033,9 +3738,10 @@ def _num(vals: Dict[str, List[str]], topic: str, i: int = 0) -> Optional[float]:
 def status_values(specs: Sequence[str]) -> Dict[str, List[str]]:
     """One sample of every spec (status_specs), read by one rclpy process in sim-drive."""
     inner = ' && '.join([setup_snippet(CONTAINERS[QUERY_CONTAINER]), _STATUS_SH])
+    budget = status_budget(len(specs))
     try:
-        p = dexec(QUERY_CONTAINER, ['bash', '-c', inner, 'status'] + list(specs), check=False,
-                  timeout=ECHO_TIMEOUT_S + 20, env=(('SIM_STATUS_PY', _STATUS_PY),))
+        p = dexec(QUERY_CONTAINER, ['bash', '-c', inner, 'status', str(budget)] + list(specs), check=False,
+                  timeout=budget + 16, env=(('SIM_STATUS_PY', _STATUS_PY),))
     except SimError as e:           # a hung query must not hide the violation check after it
         warn('status query: %s' % e)
         return {}
@@ -3056,11 +3762,12 @@ def sim_time_lines(names: Sequence[str], vals: Dict[str, List[str]]) -> List[str
     return out
 
 
-def agent_lines(names: Sequence[str], vals: Dict[str, List[str]], stacks: Iterable[str]) -> List[str]:
-    """Per agent: DLIO's odom rate and stamp age, its scan rate, safety_node's mode. DLIO
-    publishes odom from a 100 Hz timer from the start, stamped with the last IMU sample's
-    time (0 before the first one); deskewed scans only come once its IMU calibration is done
-    and it registers scans."""
+def agent_lines(names: Sequence[str], vals: Dict[str, List[str]], stacks: Iterable[str],
+                maps: bool = False) -> List[str]:
+    """Per agent: DLIO's odom rate and stamp age, its scan rate, safety_node's mode, with maps
+    the planner's grids (map_part). DLIO publishes odom from a 100 Hz timer from the start, stamped
+    with the last IMU sample's time (0 before the first one); deskewed scans only come once its
+    IMU calibration is done and it registers scans."""
     stacks = set(stacks)
     out = []
     for n in names:
@@ -3078,8 +3785,28 @@ def agent_lines(names: Sequence[str], vals: Dict[str, List[str]], stacks: Iterab
         if 'drive' in stacks:
             mode = (vals.get('/%s/mode' % n) or [None])[0]
             parts.append('safety %s' % mode if mode else 'safety: no /%s/mode (scripts/sim.py attach drive)' % n)
+        if maps and 'mapping' in stacks:
+            parts.append(map_part(n, vals))
         out.append('%s  %s' % (n, ',  '.join(parts)))
     return out
+
+
+def map_part(n: str, vals: Dict[str, List[str]]) -> str:
+    """The planner's grids of one agent: rate and stamp age each, STALE past the age a consumer
+    allows. Nothing before physics runs and DLIO registers scans."""
+    grids = []
+    for g, max_age, _ in MAP_GRIDS:
+        topic = grid_topic(n, g)
+        hz, age, count = _num(vals, topic), _num(vals, topic, 1), _num(vals, topic, 2)
+        when = '' if max_age is not None else ', on change'
+        rate = 'once' if count == 1 else '%.1f Hz' % (hz or 0.0)       # one sample has no rate
+        if hz is None:
+            grids.append('%s none%s' % (g, ' (published on change)' if when else ''))
+        elif age is None or math.isinf(age):
+            grids.append('%s %s, unstamped' % (g, rate))
+        else:
+            grids.append('%s %s (age %.2f s%s)' % (g, rate, age, when or (', STALE' if age > max_age else '')))
+    return 'maps: ' + ', '.join(grids)
 
 
 # Arming. One rclpy process for every agent, in sim-drive next to the safety_nodes. For
@@ -3259,7 +3986,7 @@ def log_line(path: Optional[Path], text: str) -> None:
         return
     try:
         with open(str(path), 'a') as f:
-            f.write('%s %s\n' % (time.strftime('%Y-%m-%dT%H:%M:%S'), text))
+            f.write('%s %s\n' % (time.strftime(HOST_TIME_FMT), text))
     except OSError as e:
         warn('cannot log to %s: %s' % (path, e))
 
@@ -3393,10 +4120,15 @@ def cmd_loadtest(args: argparse.Namespace) -> int:
     images = compose_images(profiles, run_dir)
     # Test whatever stacks are built; only the router's image is required.
     have = [s for s, img in images.items() if docker_inspect('image', img) is not None]
-    problem = dlio_scripts_problem(read_pins())
+    pins = read_pins()
+    problem = dlio_scripts_problem(pins)
     if problem and any(s.startswith('sim-dlio-') for s in have):
         warn(problem + ': testing without the DLIO containers')
         have = [s for s in have if not s.startswith('sim-dlio-')]
+    blocked = [c for c in have if mapping_mounts_problem(pins, [c])]
+    if blocked:
+        warn('%s: testing without %s' % (mapping_mounts_problem(pins, blocked), ', '.join(blocked)))
+        have = [s for s in have if s not in blocked]
     if ROUTER_CONTAINER not in have:
         check_images(images)
     if len(have) < len(images):
@@ -3482,7 +4214,12 @@ def build_parser() -> argparse.ArgumentParser:
     down.add_argument('--containers', action='store_true', help='also remove the containers and network')
     att = sub.add_parser('attach', help='attach to rsim-<stack>')
     att.add_argument('stack', nargs='?', choices=list(STACKS))
-    sub.add_parser('status', help='containers, isolation, router links, panes, sim time, DLIO, safety modes')
+    st = sub.add_parser('status', help='containers, isolation, router links, panes, sim time, DLIO, safety modes '
+                        '(one ROS session, which leaves the graph one subscription at a time: all at once stalled '
+                        'a loaded graph for a second)')
+    st.add_argument('--maps', action='store_true',
+                    help="also read the planner's grids (occ_2d_topic, esdf_2d_topic, persistent_map/grid): 3 more "
+                         'subscriptions per agent, one of them the megabyte persistent map')
     for verb, what in (('arm', 'put safety_nodes in AUTO (/<ns>/auto_mode) once their DLIO tracks'),
                        ('disarm', 'put safety_nodes in DISARMED (/<ns>/disarm)')):
         a = sub.add_parser(verb, help=what)
