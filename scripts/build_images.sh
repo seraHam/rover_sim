@@ -356,6 +356,7 @@ unit_labels() {  # -> LABELS: provenance, and the inputs key the skip check read
     rev=$(git -C "$U_SRC" rev-parse HEAD 2>/dev/null) || rev=unknown
     if [[ -n $(git -C "$U_SRC" status --porcelain 2>/dev/null) ]]; then dirty=true; fi
   fi
+  U_REV=$rev U_DIRTY=$dirty
   LABELS=(--label "rover_sim.unit=$U" --label "rover_sim.inputs=${KEY[$U]}"
           --label "rover_sim.source=$src" --label "rover_sim.dirty=$dirty"
           --label "org.opencontainers.image.source=$url"
@@ -389,6 +390,9 @@ build_cmd() {  # $1 unit (prepared) -> CMD
   if [[ $U_KIND == self && -n $U_SRC ]]; then CMD+=(--build-context "$U_LOCAL_CTX=$U_SRC"); fi
   unit_labels
   CMD+=("${LABELS[@]}")
+  # mighty's Dockerfile.hw sets its own revision and dirty labels from these (mighty#16; its
+  # last instruction, so they bust no cache): the same commit and state as rover_sim's labels.
+  if [[ $U == mighty ]]; then CMD+=(--build-arg "GIT_SHA=$U_REV" --build-arg "GIT_DIRTY=$U_DIRTY"); fi
   if (( PARALLEL > 1 )); then CMD+=(--progress=plain); fi
   CMD+=("$ctx")
 }
