@@ -1,0 +1,97 @@
+/JR02/goal_selector:
+  ros__parameters:
+    exploration:
+      bounds:
+        enabled: false
+        max_x: 18.0
+        max_y: 0.0
+        min_x: -6.0
+        min_y: -17.5
+      default_goal_z: 0.0
+      detector:
+        border_margin_cells: 1
+        cluster_min_cells: 6
+        max_cluster_extent_m: 3.0
+        obstacle_clearance_cells: 0
+        robot_snap_radius_m: 0.5
+      enabled: true
+      geofence:
+        enabled: true
+        gate_max_age_sec: 2.0
+        gate_topic_name: safety_node/geofence_gate
+        margin_m: 0.0
+        max_age_sec: 2.0
+        startup_wait_sec: 10.0
+        topic_name: geofence/goal_fence
+      manager:
+        centroid_ema_alpha: 0.5
+        invalidation_cooldown_sec: 60.0
+        invalidation_keep_out_radius_m: 0.75
+        max_frontiers: 1000
+        merge_radius_m: 0.75
+        preempt_enabled: true
+        preempt_margin: 2.0
+        preempt_min_commit_sec: 2.0
+        pursuit_timeout_factor: 3.0
+        pursuit_timeout_min_sec: 10.0
+        pursuit_timeout_v_ref: 0.5
+        stuck_move_thresh_m: 0.1
+        stuck_timeout_sec: 5.0
+        unreachable_consec_thresh: 5
+        verify_radius_cells: 2
+        visit_dwell_sec: 3.0
+        visit_radius_m: 0.3
+      minpos:
+        enabled: false
+        min_frontier_dist_to_peers_m: 3.0
+        peer_publish_rate_hz: 5.0
+        peer_timeout_sec: 5.0
+        peer_visit_radius_m: 2.0
+      persistent_map:
+        detect_radius_m: 30.0
+        detect_whole_map: true
+        enabled: true
+      return_home:
+        enabled: false
+      select_rate_hz: 1.0
+      utility:
+        dist_ref_m: 60.0
+        goal_select_threshold: -1000000000.0
+        sensor_radius_m: 5.0
+        size_ref_m2: 5.0
+        w_dist: 60.0
+        w_heading: 0.3
+        w_info: 1.0
+        w_revisit: 0.5
+        w_size: 1.0
+      visited_map:
+        center_x: 0.0
+        center_y: 0.0
+        detect_on_visited_map: true
+        fuse_into_local: true
+        height_m: 100.0
+        publish: true
+        resolution_m: 0.1
+        width_m: 100.0
+      visualization:
+        publish_markers: true
+    goal_radius: 0.5
+    inflation_2d_m: 0.1
+    manual_goal:
+      start_timeout_sec: 15.0
+    map_frame_id: JR02/map
+    map_max_age_sec: 1.5
+    occ_2d_topic_name: occ_2d_topic
+    persistent_map_topic_name: persistent_map/grid
+    qos_overrides:
+      /parameter_events:
+        publisher:
+          depth: 1000
+          durability: volatile
+          history: keep_last
+          reliability: reliable
+    unknown_inflation_2d_m: 0.5
+    use_2d_planning: true
+    use_sim_time: false
+    vehicle_type: ground_robot
+

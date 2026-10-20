@@ -1,5 +1,24 @@
 # syntax=docker/dockerfile:1.7
-# rover_sim — standalone Docker build of the mighty ground-robot sim stack:
+# rover_sim — Docker builds for the simulation. Two independent sets of targets
+# share this file until the legacy one is removed (Phase 6).
+#
+# STACK TARGETS (docker/compose.stack.yaml, built by scripts/build_images.sh).
+# The JR02 stacks (mighty, mapping_ws, dlio_ws, rover) are built from each
+# repo's own Dockerfile at the pins in docker/stacks.env; only the containers
+# with no robot image are built here:
+#   stack-base  ros:humble-ros-base pinned by digest + the fleet's rmw_zenoh pin
+#   gazebo      Gazebo classic + gazebo_ros, the Livox sim plugin and its msg
+#               types, decomp's RViz plugins, RViz, and this repo's rover_sim
+#               package. Sim-only deps: rover_sim.sim.repos, or a local vcs
+#               import of it with --build-context stack-sim-src=<dir>
+#   elevation   elevation_mapping_cupy + ros2_numpy and their CUDA Python deps
+#               (the robot runs this natively on its Orin; needs an NVIDIA GPU
+#               to run). Local checkout: --build-context stack-elevation-src=<dir>
+# Their helper stages are named stack-* and share nothing with the legacy
+# stages. Every source they clone is public, so they need no SSH.
+#
+# LEGACY MONOLITH (rover-sim:local; docker/compose.yaml, make build/up):
+# standalone build of the mighty ground-robot sim stack:
 # mighty + mpc + global_mapper_ros (acl-mapping) + Gazebo/RViz/Livox-sim, all
 # pulled from their upstream repos (rover_sim.repos + the *_GIT_* args below)
 # rather than requiring a local checkout of any of them.
@@ -37,6 +56,277 @@ ARG ELEVATION_GIT_URL=https://github.com/nehirgerek/elevation_mapping_cupy.git
 ARG ELEVATION_GIT_REF=3968f412e799098b63d7dc3d0def30b784c378f5
 ARG ROS2_NUMPY_GIT_URL=https://github.com/Box-Robotics/ros2_numpy.git
 ARG ROS2_NUMPY_GIT_REF=d5ebf723e1d2457d36fa89bf021b212e340c3c11
+
+# ---------- stack targets: pins ----------------------------------------------
+# Base of every stack-* stage, pinned by digest so all of them, and every
+# rebuild, start from the same ROS packages (the legacy stages float on the
+# tag). This is the 2026-09-09 build (rclcpp 16.0.19). JR02's images came from
+# another ros:humble-ros-base build (sha256:860e5379..., seen only in its
+# BuildKit cache; it is neither this index nor one of its platform images);
+# move this pin to it once its full digest is known.
+ARG STACK_BASE_IMAGE=ros:humble-ros-base@sha256:1813d3c85d7f96ff7d3012d865204583255740182db5d0065f8f8cd029a83138
+# elevation target: the fleet's fork (parameter overlays, extra cloud inputs).
+# The legacy ELEVATION_GIT_* above are the older nehirgerek commit.
+ARG STACK_ELEVATION_GIT_URL=https://github.com/blakete/elevation_mapping_cupy.git
+ARG STACK_ELEVATION_GIT_REF=43803679774cd04b36007aca84577b74999e9771
+ARG STACK_ROS2_NUMPY_GIT_URL=https://github.com/Box-Robotics/ros2_numpy.git
+ARG STACK_ROS2_NUMPY_GIT_REF=d5ebf723e1d2457d36fa89bf021b212e340c3c11
+
+# ---------- stack-base: pinned base + the fleet's rmw_zenoh build ------------
+FROM ${STACK_BASE_IMAGE} AS stack-base
+ARG STACK_BASE_IMAGE
+SHELL ["/bin/bash", "-c"]
+ENV DEBIAN_FRONTEND=noninteractive
+# The block below is mighty 3cf7320 docker/Dockerfile.hw:135-193 (the robot
+# images' pin), minus its rosdep line. In the sim it puts the rover_sim-built
+# containers on the same rmw_zenoh build as the robot-built ones.
+#
+# RMW PIN. Every container on a rover (drive, sensors, dlio, this one) must run the
+# SAME rmw_zenoh build. Two builds that both call themselves 0.1.9 are not
+# interchangeable: with dlio/drive/sensors on 0.1.9-1jammy.20260723 and this image
+# on 0.1.9-1jammy.20260907 (what an unpinned install pulled on 2026-09-07),
+# TRANSIENT_LOCAL subscriptions across that boundary received NOTHING while
+# VOLATILE ones were fine. tf2 takes /tf_static as TRANSIENT_LOCAL, so MPC never
+# saw <ns>/map -> <ns>/odom, commanded 0/0 in AUTO, and the rover sat still with a
+# plan on screen (RR08, 2026-09-17). packages.ros.org keeps only the newest build
+# per version, so the pin comes from the dated ROS snapshot repo instead, which is
+# signed by the same ROS archive key the base image already ships in
+# /usr/share/keyrings/ros2-archive-keyring.gpg.
+# apt-mark hold + the dpkg-query at the end make a silent drift fail the build.
+# When the fleet moves forward, bump all three ARGs together and rebuild EVERY
+# rover image in the same rollout.
+#
+# 2026-09-19: the fleet pin moved to rmw_zenoh 0.1.9-1jammy.20260907.200640 (the
+# build the C2 cart and every rover drive/sensors/dlio image now carry -- rover repo
+# rover_bringup/docker/Dockerfile{,.sensors}, dlio_ws docker/Dockerfile). No
+# snapshots.ros.org snapshot carries that build yet (newest is 2026-08-07 =
+# 20260723), so RMW_ZENOH_CPP_VER resolves from stock packages.ros.org, which the
+# base image already lists; the snapshot line below still serves the vendor pin
+# (20260723.020902 is identical on both). packages.ros.org keeps only the newest
+# build per version, so this exact pin stops resolving once ROS rebuilds 0.1.9 --
+# the dpkg-query tripwire below fails the build loudly when that happens; move
+# every fleet image together (or re-pin to a snapshot once one carries 20260907).
+#
+# 2026-10-12: that happened. packages.ros.org moved on to 0.1.11 (20261011) and dropped the
+# 20260907 build, so the build failed at the apt install. The 2026-09-14 snapshot carries both
+# pins exactly (rmw_zenoh 0.1.9-1jammy.20260907.200640, zenoh_cpp_vendor
+# 0.1.9-1jammy.20260723.020902), so ROS_SNAPSHOT below now serves both and nothing depends on
+# packages.ros.org. Snapshots are immutable, so this no longer rots.
+ARG ROS_SNAPSHOT=2026-09-14
+ARG RMW_ZENOH_CPP_VER=0.1.9-1jammy.20260907.200640
+ARG ZENOH_CPP_VENDOR_VER=0.1.9-1jammy.20260723.020902
+# snapshots.ros.org is signed by "ROS Snapshot builder" (AD19BAB3CBF125EA), NOT by the
+# Open Robotics key in ros2-archive-keyring.gpg that packages.ros.org uses. Vendored
+# here rather than pulled from a keyserver so the build needs no keyserver and cannot
+# silently pick up a different key; the fingerprint assert below is the tripwire.
+ARG ROS_SNAPSHOT_KEY_FPR=4B63CF8FDE49746E98FA01DDAD19BAB3CBF125EA
+COPY docker/keys/ros-snapshot-archive-keyring.asc /tmp/ros-snapshot.asc
+RUN gpg --dearmor < /tmp/ros-snapshot.asc > /usr/share/keyrings/ros-snapshot-archive-keyring.gpg \
+ && gpg --show-keys --with-colons /tmp/ros-snapshot.asc | awk -F: '/^fpr/{print $10; exit}' \
+      | grep -qx "${ROS_SNAPSHOT_KEY_FPR}" \
+ && rm -f /tmp/ros-snapshot.asc \
+ && echo "deb [signed-by=/usr/share/keyrings/ros-snapshot-archive-keyring.gpg] http://snapshots.ros.org/humble/${ROS_SNAPSHOT}/ubuntu jammy main" \
+        > /etc/apt/sources.list.d/ros2-snapshot.list \
+ && printf 'Package: ros-humble-rmw-zenoh-cpp ros-humble-zenoh-cpp-vendor\nPin: origin snapshots.ros.org\nPin-Priority: 1001\n' \
+        > /etc/apt/preferences.d/99-rmw-zenoh-pin \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends \
+        ros-humble-rmw-zenoh-cpp=${RMW_ZENOH_CPP_VER} \
+        ros-humble-zenoh-cpp-vendor=${ZENOH_CPP_VENDOR_VER} \
+        tmux python3-pip \
+ && apt-mark hold ros-humble-rmw-zenoh-cpp ros-humble-zenoh-cpp-vendor \
+ && test "$(dpkg-query -W -f='${Version}' ros-humble-rmw-zenoh-cpp)" = "${RMW_ZENOH_CPP_VER}" \
+ && test "$(dpkg-query -W -f='${Version}' ros-humble-zenoh-cpp-vendor)" = "${ZENOH_CPP_VENDOR_VER}" \
+ && rm -rf /var/lib/apt/lists/*
+# The verified pin, for the targets below to re-check after their own apt
+# layers (hold + pin make a drift unlikely; this fails the layer that caused it):
+#   dpkg-query -W ros-humble-rmw-zenoh-cpp ros-humble-zenoh-cpp-vendor | diff /etc/rover_sim/rmw-zenoh.pin -
+RUN mkdir -p /etc/rover_sim \
+ && dpkg-query -W ros-humble-rmw-zenoh-cpp ros-humble-zenoh-cpp-vendor > /etc/rover_sim/rmw-zenoh.pin
+LABEL org.opencontainers.image.base.name="${STACK_BASE_IMAGE}" \
+      rover_sim.rmw_zenoh_cpp="${RMW_ZENOH_CPP_VER}" \
+      rover_sim.zenoh_cpp_vendor="${ZENOH_CPP_VENDOR_VER}"
+
+# ---------- stack-sim-src: the gazebo target's sim-only deps -----------------
+FROM stack-base AS stack-sim-git
+COPY rover_sim.sim.repos /tmp/rover_sim.sim.repos
+RUN mkdir -p /src && vcs import /src < /tmp/rover_sim.sim.repos
+FROM scratch AS stack-sim-src
+COPY --from=stack-sim-git /src /
+
+# ---------- stack-gazebo-build: gazebo_ros, Livox sim + msgs, decomp ---------
+FROM stack-base AS stack-gazebo-build
+ARG WS
+ARG JOBS
+# Same caps as deps-build (see JOBS above).
+ENV MAKEFLAGS=-j${JOBS}
+ENV CMAKE_BUILD_PARALLEL_LEVEL=${JOBS}
+WORKDIR ${WS}
+COPY --from=stack-sim-src / ${WS}/src
+
+# Livox-SDK2/livox_ros_driver2 aren't plain colcon packages (as in deps-build):
+# move them out before colcon sees them. The driver's ROS 2 manifest is
+# package_ROS2.xml, which its build.sh copies into place; do that now so
+# rosdep sees the driver's deps too.
+RUN mkdir -p /opt/livox_sdk /opt/livox_ws/src \
+ && mv ${WS}/src/Livox-SDK2 /opt/livox_sdk/src \
+ && mv ${WS}/src/livox_ros_driver2 /opt/livox_ws/src/livox_ros_driver2 \
+ && cp /opt/livox_ws/src/livox_ros_driver2/package_ROS2.xml /opt/livox_ws/src/livox_ros_driver2/package.xml
+
+# --skip-keys catkin: DecompUtil's package.xml says buildtool_depend catkin but
+# it's a plain CMake project. Undeclared: Eigen (decomp_util) and boost_chrono
+# (ros2_livox links it by name).
+RUN apt-get update && rosdep update \
+ && rosdep install -y --ignore-src --from-paths src /opt/livox_ws/src --skip-keys "catkin" \
+ && apt-get install -y --no-install-recommends libeigen3-dev libboost-chrono-dev \
+ && rm -rf /var/lib/apt/lists/*
+
+# Livox-SDK2: plain CMake project, cmake-installed to /usr/local (where the
+# driver's CMakeLists looks for it).
+RUN cd /opt/livox_sdk/src && cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+ && make -C build -j"${JOBS}" && make -C build install \
+ && ldconfig
+
+# livox_ros_driver2: built via its own build.sh (picks the ROS 2 message
+# variant) in its own workspace. build.sh exits 0 even when colcon fails, so
+# check for the package's ament index entry, which is installed last.
+RUN source /opt/ros/humble/setup.bash \
+ && cd /opt/livox_ws/src/livox_ros_driver2 && ./build.sh humble \
+ && test -f /opt/livox_ws/install/livox_ros_driver2/share/ament_index/resource_index/packages/livox_ros_driver2
+
+# decomp_util first: decomp_rviz_plugins find_package()s it without declaring
+# the dependency, so colcon can't order them in one invocation. livox_ws is
+# sourced first so install/setup.bash chains it.
+RUN source /opt/ros/humble/setup.bash && source /opt/livox_ws/install/setup.bash \
+ && colcon build --executor sequential --packages-select decomp_util --cmake-args -DCMAKE_BUILD_TYPE=Release \
+ && source install/setup.bash \
+ && colcon build --executor sequential --packages-skip decomp_util \
+        --cmake-args -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF \
+ && rm -rf build log
+# Manifests for the gazebo target's rosdep, mtime-pinned (as in mighty-build).
+RUN mkdir -p /manifests/livox_ros_driver2 && cd src \
+ && find . -name package.xml -exec cp --parents {} /manifests \; \
+ && cp /opt/livox_ws/src/livox_ros_driver2/package.xml /manifests/livox_ros_driver2/ \
+ && find /manifests -exec touch -d @0 {} +
+
+# ---------- stack-rover-sim-build: this repo's rover_sim package -------------
+# Its own stage so an edit to src/rover_sim rebuilds only this and the gazebo
+# target's last COPY.
+FROM stack-base AS stack-rover-sim-build
+ARG WS
+WORKDIR ${WS}
+COPY src/rover_sim ${WS}/src/rover_sim
+RUN source /opt/ros/humble/setup.bash \
+ && colcon build --packages-select rover_sim \
+ && rm -rf build log \
+ && mkdir -p /manifests/rover_sim && cp src/rover_sim/package.xml /manifests/rover_sim/ \
+ && find /manifests -exec touch -d @0 {} +
+
+# ---------- gazebo: the sim-gazebo container ---------------------------------
+FROM stack-base AS gazebo
+ARG WS
+LABEL rover_sim.stack="gazebo"
+WORKDIR ${WS}
+COPY --from=stack-gazebo-build /manifests /tmp/manifests
+COPY --from=stack-rover-sim-build /manifests /tmp/manifests
+# Exec deps from the manifests (Gazebo itself comes in via gazebo_dev), plus
+# RViz, xacro, numpy for the sim's Python nodes, boost_chrono for ros2_livox,
+# and stock Mesa (as in runtime). The last line fails this layer if any of it
+# moved the rmw_zenoh pin.
+RUN apt-get update && rosdep update \
+ && rosdep install -y --ignore-src --dependency-types exec --from-paths /tmp/manifests --skip-keys "catkin" \
+ && apt-get install -y --no-install-recommends \
+        ros-humble-rviz2 ros-humble-xacro python3-numpy libboost-chrono1.74.0 \
+        libgl1-mesa-glx libgl1-mesa-dri libglx-mesa0 mesa-vulkan-drivers mesa-utils \
+ && rm -rf /var/lib/apt/lists/* /tmp/manifests \
+ && dpkg-query -W ros-humble-rmw-zenoh-cpp ros-humble-zenoh-cpp-vendor | diff /etc/rover_sim/rmw-zenoh.pin -
+# The Livox SDK's shared library (liblivox_ros_driver2.so links it) + the
+# driver's install tree, then the workspace.
+COPY --from=stack-gazebo-build /usr/local/lib/liblivox_lidar_sdk_shared.so /usr/local/lib/
+RUN ldconfig
+COPY --from=stack-gazebo-build /opt/livox_ws/install /opt/livox_ws/install
+COPY --from=stack-gazebo-build ${WS}/install ${WS}/install
+# Lets Gazebo resolve package://rover_sim/... meshes.
+ENV GAZEBO_MODEL_PATH=${WS}/install/rover_sim/share
+# Qt (RViz, gzclient) draws over the X11 socket; the container doesn't share
+# the X server's IPC namespace, so MIT-SHM would fail.
+ENV QT_X11_NO_MITSHM=1
+# Read by the NVIDIA runtime only when compose gives this container a GPU;
+# graphics adds the GL/EGL driver libraries Gazebo and RViz render with.
+ENV NVIDIA_DRIVER_CAPABILITIES=graphics,compute,utility
+# Interactive shells (docker exec -it ... bash) see the workspace; the panes
+# send their own setup line. install/setup.bash alone also chains livox_ws.
+RUN printf 'source /opt/ros/humble/setup.bash\nsource /opt/livox_ws/install/setup.bash\nsource %s/install/setup.bash\n' "${WS}" >> /root/.bashrc
+COPY --from=stack-rover-sim-build ${WS}/install/rover_sim ${WS}/install/rover_sim
+# Command comes from compose: the container only idles (sleep infinity).
+
+# ---------- stack-elevation-src: elevation_mapping_cupy ----------------------
+FROM stack-base AS stack-elevation-git
+ARG STACK_ELEVATION_GIT_URL
+ARG STACK_ELEVATION_GIT_REF
+RUN git clone "${STACK_ELEVATION_GIT_URL}" /src && git -C /src checkout "${STACK_ELEVATION_GIT_REF}"
+FROM scratch AS stack-elevation-src
+COPY --from=stack-elevation-git /src /
+
+# ---------- stack-elevation-build: elevation_mapping_cupy + ros2_numpy -------
+FROM stack-base AS stack-elevation-build
+ARG WS
+ARG STACK_ROS2_NUMPY_GIT_URL
+ARG STACK_ROS2_NUMPY_GIT_REF
+WORKDIR ${WS}
+COPY --from=stack-elevation-src / ${WS}/src/elevation_mapping_cupy
+# As in elevation-build: sensor_processing (semantic_sensor, for camera
+# semantics) isn't used. plane_segmentation carries its own COLCON_IGNORE.
+RUN git clone "${STACK_ROS2_NUMPY_GIT_URL}" src/ros2_numpy && git -C src/ros2_numpy checkout "${STACK_ROS2_NUMPY_GIT_REF}" \
+ && touch src/elevation_mapping_cupy/sensor_processing/COLCON_IGNORE \
+ && apt-get update && rosdep update \
+ && rosdep install -y --ignore-src --from-paths src --skip-keys "semantic_sensor" \
+ && rm -rf /var/lib/apt/lists/*
+RUN source /opt/ros/humble/setup.bash \
+ && colcon build --base-paths src --cmake-args -DBUILD_TESTING=OFF \
+ && rm -rf build log
+RUN mkdir -p /manifests && cd src \
+ && find . -name package.xml -not -path "*/sensor_processing/*" -not -path "*/plane_segmentation/*" \
+        -exec cp --parents {} /manifests \; \
+ && find /manifests -exec touch -d @0 {} +
+
+# ---------- elevation: the sim-elevation container ---------------------------
+# Clean: stack-base + elevation only, nothing from the legacy runtime stage.
+FROM stack-base AS elevation
+ARG WS
+ARG STACK_ELEVATION_GIT_REF
+# The pinned ref. A --build-context build of another checkout still carries it
+# unless overridden with --label rover_sim.elevation.ref=... (build_images.sh).
+LABEL rover_sim.stack="elevation" \
+      rover_sim.elevation.ref="${STACK_ELEVATION_GIT_REF}"
+WORKDIR ${WS}
+COPY --from=stack-elevation-build /manifests /tmp/manifests
+RUN apt-get update && rosdep update \
+ && rosdep install -y --ignore-src --dependency-types exec --from-paths /tmp/manifests --skip-keys "semantic_sensor" \
+ && rm -rf /var/lib/apt/lists/* /tmp/manifests \
+ && dpkg-query -W ros-humble-rmw-zenoh-cpp ros-humble-zenoh-cpp-vendor | diff /etc/rover_sim/rmw-zenoh.pin -
+# The same Python pins as runtime-elevation. CUDA comes from pip (12.4, what
+# l01's 550 driver supports): torch's cu124 wheels and CuPy's cuda-toolkit
+# extra. numpy 2 (CuPy 14 needs it) breaks jammy's apt cv2, so OpenCV comes
+# from pip too.
+RUN pip3 install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cu124 \
+        torch==2.6.0+cu124 \
+        cupy-cuda12x==14.1.1 "cuda-toolkit[cublas,cudart,cufft,curand,cusolver,cusparse,nvrtc]==12.4.1" \
+        opencv-python-headless==5.0.0.93 simple-parsing==0.1.9 shapely==2.1.2 \
+        transforms3d==0.4.2 ruamel.yaml==0.19.1 numpy==2.2.6 scipy==1.15.3
+# CuPy's cupyx.cusolver links libcusolver.so.11 by name, so the pip CUDA
+# libraries have to be on the loader path. (The base image sets no
+# LD_LIBRARY_PATH; the ROS setup files prepend theirs at run time.)
+ARG NV=/usr/local/lib/python3.10/dist-packages/nvidia
+ENV LD_LIBRARY_PATH=${NV}/cusolver/lib:${NV}/cublas/lib:${NV}/cusparse/lib:${NV}/nvjitlink/lib:${NV}/cufft/lib:${NV}/curand/lib:${NV}/cuda_runtime/lib:${NV}/cuda_nvrtc/lib
+COPY --from=stack-elevation-build ${WS}/install ${WS}/install
+RUN printf 'source /opt/ros/humble/setup.bash\nsource %s/install/setup.bash\n' "${WS}" >> /root/.bashrc
+# Command comes from compose: the container only idles (sleep infinity).
+
+# =============================================================================
+# LEGACY MONOLITH: everything below builds rover-sim:local (make build). Left
+# unchanged until Phase 6 removes it with docker/compose.yaml and launch/.
+# =============================================================================
 
 # ---------- *-src: the repos a local checkout can replace -------------------
 FROM ros:humble-ros-base AS git-base

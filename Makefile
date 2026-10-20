@@ -30,3 +30,27 @@ up:    ; xhost +local: >/dev/null 2>&1 || true; $(COMPOSE) up -d
 down:  ; $(COMPOSE) down
 shell: ; docker exec -it rover-sim bash
 logs:  ; $(COMPOSE) logs -f
+
+# ---------- per-stack sim (docker/compose.stack.yaml), alongside the above until PR 6 ----------
+# make images      each stack's image from its own repo's Dockerfile at the docker/stacks.env
+#                  pins (scripts/build_images.sh --help). STACKS="mighty dlio" picks stacks,
+#                  FORCE=1 rebuilds, REUSE="mighty=mighty-hw:main-3cf7320 ..." retags an
+#                  existing image instead, JOBS=N caps colcon in our own targets, PARALLEL=N
+#                  builds N stacks at once. SRC="mighty=~/code/mighty ..." builds a local
+#                  checkout into the stack's tag (sim.py warns while it is in use); not
+#                  MIGHTY_SRC/ELEVATION_SRC, which are the legacy build's.
+# make stack-up    the sim-* containers, idle (sessions docker-exec their nodes into them);
+#                  GPU=1 adds sim-elevation (compose profile gpu)
+# make stack-down  stop the session's nodes, then remove the containers of every profile
+# make session S=<name>  run config/sessions/<name>.yaml (scripts/sim.py up)
+# Compose goes through `sim.py compose`: it adds the pin file, the run dir it has checked and
+# the CPU budget, and skips a compose.local.yaml written for the legacy service. X access
+# for the containers (xhost +SI:localuser:root, never +local: on this shared host) is
+# granted by `sim.py up` when a session opens windows.
+
+.PHONY: images stack-up stack-down session
+images:     ; scripts/build_images.sh $(STACKS) $(if $(FORCE),--force) $(foreach r,$(REUSE),--reuse $(r)) \
+                $(foreach s,$(SRC),--src $(s)) $(if $(JOBS),--jobs $(JOBS)) $(if $(PARALLEL),--parallel $(PARALLEL))
+stack-up:   ; python3 scripts/sim.py compose $(if $(GPU),--profile gpu) up -d
+stack-down: ; python3 scripts/sim.py down --containers
+session:    ; $(if $(S),python3 scripts/sim.py up $(S),$(error usage: make session S=<name>, for config/sessions/<name>.yaml))

@@ -1,0 +1,3 @@
+/JR02/persistent_map_node:
+  ros__parameters:
+    save_dir: /var/lib/rover/persistent_map/JR02

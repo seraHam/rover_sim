@@ -1,0 +1,3 @@
+/JR02/map_fusion_node:
+  ros__parameters:
+    degraded_mode: elevation_only

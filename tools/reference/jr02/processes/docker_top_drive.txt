@@ -1,0 +1,15 @@
+# docker top drive -eo pid,lstart,args on JR02 (19:24 UTC), TRIMMED: the URDF argument of
+# robot_state_publisher and the firmware serial device are left out.
+PID                 STARTED             COMMAND
+2631                Thu                 Oct 15 18:07:04 2026 /sbin/docker-init -- /ros_entrypoint.sh sleep infinity
+2683                Thu                 Oct 15 18:07:04 2026 sleep infinity
+3893                Thu                 Oct 15 18:07:05 2026 /usr/bin/python3 /opt/ros/humble/bin/ros2 launch rover_description state_publisher.launch.py robot_name:=JR02 ns_tf_frame_ids:=true
+3963                Thu                 Oct 15 18:07:05 2026 /usr/bin/python3 /opt/ros/humble/bin/ros2 launch rover_control teleop.launch.yaml robot_name:=JR02
+4016                Thu                 Oct 15 18:07:05 2026 /usr/bin/python3 /opt/ros/humble/bin/ros2 run rmw_zenoh_cpp rmw_zenohd --ros-args -r __node:=zenoh_router
+4048                Thu                 Oct 15 18:07:05 2026 /usr/bin/python3 /opt/ros/humble/bin/ros2 run rover_firmware_driver rover_firmware_driver --ros-args -r __node:=rover_firmware_driver -r __ns:=/JR02 -p serial_port:=<serial device not kept here> -p publish_tf:=false -p odom_frame:=JR02/odom -p base_frame:=JR02/base_link
+4308                Thu                 Oct 15 18:07:05 2026 /opt/ros/humble/lib/rmw_zenoh_cpp/rmw_zenohd --ros-args -r __node:=zenoh_router
+5327                Thu                 Oct 15 18:07:08 2026 /home/swarm/code/rover_ws/install/lib/rover_firmware_driver/rover_firmware_driver --ros-args -r __node:=rover_firmware_driver -r __ns:=/JR02 -p serial_port:=<serial device not kept here> -p publish_tf:=false -p odom_frame:=JR02/odom -p base_frame:=JR02/base_link
+5610                Thu                 Oct 15 18:07:08 2026 /opt/ros/humble/lib/robot_state_publisher/robot_state_publisher <URDF not kept here: see tf/tf_tree.yaml> --ros-args -r __node:=robot_state_publisher -r __ns:=/JR02 --params-file /tmp/launch_params_z_ufdiqh
+6016                Thu                 Oct 15 18:07:09 2026 /opt/ros/humble/lib/joy/joy_node --ros-args -r __node:=joy_node -r __ns:=/JR02/joy_teleop --params-file /tmp/launch_params_szj_n7u0 --params-file /tmp/launch_params_ndm99fki
+6020                Thu                 Oct 15 18:07:09 2026 /opt/ros/humble/lib/teleop_twist_joy/teleop_node --ros-args -r __node:=teleop_twist_joy_node -r __ns:=/JR02/joy_teleop --params-file /tmp/launch_params_spqagce5
+6026                Thu                 Oct 15 18:07:09 2026 /usr/bin/python3 /home/swarm/code/rover_ws/install/lib/acl_ctrl_safety/safety_node --ros-args -r __node:=safety_node -r __ns:=/JR02 --params-file /tmp/launch_params_5pz6vhj3

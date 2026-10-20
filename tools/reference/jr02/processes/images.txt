@@ -1,0 +1,6 @@
+# docker inspect of JR02's stack containers (19:24 UTC), TRIMMED: container|image|image id|
+# created|image labels; the sensors and geofence containers and compose's labels are left out.
+/hw-mighty|mighty-hw:local|sha256:dc73bc2d489298fdfda0106199f6f61ef682af54d02fdab592692f455f924c86|2026-10-15T22:07:07.468877398Z|{"org.opencontainers.image.version": "22.04"}
+/mapping|rover-mapping:local|sha256:0c937a1d7ac987d045d8ad0ec979395f7cc81be59cefaa1ff9659a431d857ece|2026-10-15T22:07:05.512132912Z|{"org.mit-acl.map-fusion.ref": "8ea4ca788d5709e143fd8634fb1803a3b908de4f", "org.opencontainers.image.version": "22.04"}
+/dlio|dlio:local|sha256:b463e082b75f9782fb31b1baea1ed4e6a87208ebf0d9402f28609e407e8ca054|2026-10-15T19:20:38.431472595Z|{"org.opencontainers.image.version": "22.04"}
+/drive|rover-drive:local|sha256:dc6aa953d163c124581bd95a3a573692324295c04eef0abecd8ba7ae86695f98|2026-10-15T19:05:12.629678906Z|{"org.acl.geofence_gate": "1", "org.opencontainers.image.version": "22.04"}

@@ -1,0 +1,187 @@
+From 3036c24d02073d051f84a6235be1e2ed0fdb7de4 Mon Sep 17 00:00:00 2001
+From: blakete <blakeedwards823@gmail.com>
+Date: Sun, 18 Oct 2026 15:27:56 -0400
+Subject: [PATCH] docker: pin rmw_zenoh from the 2026-09-14 ROS snapshot
+
+The bare apt pin ros-humble-rmw-zenoh-cpp=0.1.9-1jammy.20260907.200640 no
+longer resolves: packages.ros.org keeps only the newest build per version
+and moved to 0.1.11 on 2026-10-11. zenoh-cpp-vendor was unpinned besides.
+
+Use the same block as mighty docker/Dockerfile.hw, the rover drive
+Dockerfile and mapping_ws Dockerfile.mapping: the immutable dated snapshot
+2026-09-14 carries exactly the fleet pair (rmw 20260907.200640 + vendor
+20260723.020902), signed by the vendored "ROS Snapshot builder" key
+(fingerprint asserted), with apt-mark hold and a dpkg-query tripwire.
+
+The key goes in keys/ rather than docker/keys/ because .dockerignore drops
+docker/ from the build context.
+
+Claude-Session: https://claude.ai/code/session_01QBCWc95CLQNQd4oPCWmiXC
+---
+ docker/Dockerfile                     |  42 ++++++++---
+ keys/ros-snapshot-archive-keyring.asc | 100 ++++++++++++++++++++++++++
+ 2 files changed, 134 insertions(+), 8 deletions(-)
+ create mode 100644 keys/ros-snapshot-archive-keyring.asc
+
+diff --git a/docker/Dockerfile b/docker/Dockerfile
+index f88ad22..d96ea3e 100644
+--- a/docker/Dockerfile
++++ b/docker/Dockerfile
+@@ -53,17 +53,43 @@ WORKDIR ${WS}
+ # layer does not depend on the source tree.
+ COPY --from=build ${WS}/src/direct_lidar_inertial_odometry/package.xml \
+                   manifests/direct_lidar_inertial_odometry/package.xml
+-# rmw_zenoh pinned 2026-09-18 to the C2 cart laptop's snapshot. Builds between
+-# 20260820 and 20260907 are NOT graph-compatible: liveliness tokens stop resolving
+-# across the gap, so pub/sub data still flows while service discovery dies -- which
+-# is what broke C2 teleop (set_mode 'service not ready'). Keep this equal to the C2
+-# and to the other rover images; moving one side alone re-splits the graph.
+-RUN apt-get update && rosdep update \
++# RMW PIN (same scheme as mighty docker/Dockerfile.hw and the rover drive Dockerfile):
++# every container on a rover must run the SAME rmw_zenoh build, and this one must equal
++# the C2 too. Builds between 20260820 and 20260907 are NOT graph-compatible: liveliness
++# tokens stop resolving across the gap, so pub/sub data still flows while service
++# discovery dies -- which is what broke C2 teleop (set_mode 'service not ready'). Two
++# builds both called 0.1.9 also dropped TRANSIENT_LOCAL /tf_static between images on
++# RR08 (2026-09-17). Moving one side alone re-splits the graph.
++# 2026-10-11: packages.ros.org moved to 0.1.11 and dropped 0.1.9-1jammy.20260907.200640
++# (it keeps only the newest build per version), so the bare apt pin that was here stopped
++# resolving and the unpinned vendor would have drifted with it. The dated snapshot
++# 2026-09-14 carries exactly the fleet pair (rmw 20260907.200640 + vendor 20260723.020902);
++# snapshots are immutable, and Pin-Priority 1001 also covers rosdep's own install of
++# rmw_zenoh_cpp. The snapshot repo is signed by "ROS Snapshot builder" (vendored key,
++# fingerprint asserted); apt-mark hold + dpkg-query make any drift fail the build.
++# The key lives in keys/, not docker/keys/: .dockerignore drops docker/ from the context.
++ARG ROS_SNAPSHOT=2026-09-14
++ARG RMW_ZENOH_CPP_VER=0.1.9-1jammy.20260907.200640
++ARG ZENOH_CPP_VENDOR_VER=0.1.9-1jammy.20260723.020902
++ARG ROS_SNAPSHOT_KEY_FPR=4B63CF8FDE49746E98FA01DDAD19BAB3CBF125EA
++COPY keys/ros-snapshot-archive-keyring.asc /tmp/ros-snapshot.asc
++RUN gpg --dearmor < /tmp/ros-snapshot.asc > /usr/share/keyrings/ros-snapshot-archive-keyring.gpg \
++ && gpg --show-keys --with-colons /tmp/ros-snapshot.asc | awk -F: '/^fpr/{print $10; exit}' \
++      | grep -qx "${ROS_SNAPSHOT_KEY_FPR}" \
++ && rm -f /tmp/ros-snapshot.asc \
++ && echo "deb [signed-by=/usr/share/keyrings/ros-snapshot-archive-keyring.gpg] http://snapshots.ros.org/humble/${ROS_SNAPSHOT}/ubuntu jammy main" \
++        > /etc/apt/sources.list.d/ros2-snapshot.list \
++ && printf 'Package: ros-humble-rmw-zenoh-cpp ros-humble-zenoh-cpp-vendor\nPin: origin snapshots.ros.org\nPin-Priority: 1001\n' \
++        > /etc/apt/preferences.d/99-rmw-zenoh-pin \
++ && apt-get update && rosdep update \
+  && rosdep install -y -r --ignore-src --dependency-types exec --from-paths manifests \
+  && apt-get install -y --no-install-recommends \
+-      ros-humble-rmw-zenoh-cpp=0.1.9-1jammy.20260907.200640 \
+-      ros-humble-zenoh-cpp-vendor \
++      ros-humble-rmw-zenoh-cpp=${RMW_ZENOH_CPP_VER} \
++      ros-humble-zenoh-cpp-vendor=${ZENOH_CPP_VENDOR_VER} \
+       ros-humble-tf2-ros \
++ && apt-mark hold ros-humble-rmw-zenoh-cpp ros-humble-zenoh-cpp-vendor \
++ && test "$(dpkg-query -W -f='${Version}' ros-humble-rmw-zenoh-cpp)" = "${RMW_ZENOH_CPP_VER}" \
++ && test "$(dpkg-query -W -f='${Version}' ros-humble-zenoh-cpp-vendor)" = "${ZENOH_CPP_VENDOR_VER}" \
+  && rm -rf /var/lib/apt/lists/* manifests
+ 
+ # Baked workspace (cheap COPY layers last, so the apt layer above stays cached).
+diff --git a/keys/ros-snapshot-archive-keyring.asc b/keys/ros-snapshot-archive-keyring.asc
+new file mode 100644
+index 0000000..1cb0b68
+--- /dev/null
++++ b/keys/ros-snapshot-archive-keyring.asc
+@@ -0,0 +1,100 @@
++-----BEGIN PGP PUBLIC KEY BLOCK-----
++
++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
++=exS3
++-----END PGP PUBLIC KEY BLOCK-----

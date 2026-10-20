@@ -1,0 +1,10 @@
+/JR02/global_mapper_ros:
+  ros__parameters:
+    drone_frame: JR02/base_link
+    global_frame: JR02/odom
+    obstacle_tracker.enabled: false
+    pose_type: pose_stamped
+    secondary_cloud.enabled: false
+    secondary_cloud.frame_override: ''
+    temporal_grid.publish_dynamic_grid: false
+    temporal_grid.use_temporal_grid: false

@@ -1,0 +1,90 @@
+# JR02 TF tree, 2026-10-18. Static joints come from the robot model, NOT from a live ros2 CLI
+# capture (no ros2 CLI was run on the robot). {ns} is the agent namespace; JR02/RR08 names are
+# substituted by parity_check.py. rpy is URDF fixed-axis XYZ in radians.
+reference_robot: {jr: JR02, rr: RR08}
+static:
+  jr:
+    source: deployed robot_state_publisher robot_description on JR02 (its launch params; the URDF is not kept here), identical
+      to rover 9b0b4ba red_rover_sensors_ns_frame_ids.urdf.xml + sensor_calib/JR02_lidar_mount.yaml + JR02_calib.npy
+    publisher: /JR02/robot_state_publisher (sim-drive, /tf_static, TRANSIENT_LOCAL)
+    joints:
+    - joint: JR02_base_to_tower
+      parent: JR02/base_link
+      child: JR02/sensor_tower
+      xyz: [0.15, 0.0, 0.12]
+      rpy: [0.0, 0.0, 0.0]
+      pitch_deg: 0.0
+      note: visual only
+      required: false
+    - joint: JR02_base_to_lidar
+      parent: JR02/base_link
+      child: JR02/lidar
+      xyz: [0.0, 0.0, 0.0]
+      rpy: [0.0, 0.5117309, 0.0]
+      pitch_deg: 29.32
+      note: 'LOAD-BEARING: sole publisher of base_link -> lidar (sensor_calib/<name>_lidar_mount.yaml)'
+      required: true
+    - joint: JR02_base_to_d435
+      parent: JR02/base_link
+      child: JR02_d435_link
+      xyz: [-0.225, 0.0, 0.12]
+      rpy: [0.0, 0.0, 3.14159]
+      pitch_deg: 0.0
+      note: no D435 fitted/consumed; fixed in the URDF
+      required: false
+    - joint: JR02_base_to_d455
+      parent: JR02/base_link
+      child: JR02_d455_link
+      xyz: [0.09024987099106646, -0.03595941081845882, -0.09830866049144009]
+      rpy: [-3.1334429326135207, -0.022888875513890943, 0.003271939929886771]
+      pitch_deg: -1.3114
+      note: sensor_calib/<name>_calib.npy; the D455 had 0 consumers on JR02
+      required: false
+  rr:
+    source: 'DERIVED, not captured: rover 9b0b4ba red_rover_sensors_ns_frame_ids.urdf.xml + sensor_calib/RR08_lidar_mount.yaml
+      + RR08_calib.npy (state_publisher.launch.py logic)'
+    publisher: /RR08/robot_state_publisher
+    joints:
+    - joint: RR08_base_to_tower
+      parent: RR08/base_link
+      child: RR08/sensor_tower
+      xyz: [0.15, 0.0, 0.12]
+      rpy: [0.0, 0.0, 0.0]
+      pitch_deg: 0.0
+      note: visual only
+      required: false
+    - joint: RR08_base_to_lidar
+      parent: RR08/base_link
+      child: RR08/lidar
+      xyz: [0.0, 0.0, 0.0]
+      rpy: [0.0, 0.3590419, 0.0]
+      pitch_deg: 20.5716
+      note: 'LOAD-BEARING: sole publisher of base_link -> lidar (sensor_calib/<name>_lidar_mount.yaml)'
+      required: true
+    - joint: RR08_base_to_d435
+      parent: RR08/base_link
+      child: RR08_d435_link
+      xyz: [-0.225, 0.0, 0.12]
+      rpy: [0.0, 0.0, 3.14159]
+      pitch_deg: 0.0
+      note: no D435 fitted/consumed; fixed in the URDF
+      required: false
+    - joint: RR08_base_to_d455
+      parent: RR08/base_link
+      child: RR08_d455_link
+      xyz: [0.0708915267464993, 0.0, -0.07536952]
+      rpy: [0.0, 0.6108652877991495, 0.0]
+      pitch_deg: 35.0
+      note: sensor_calib/<name>_calib.npy; the D455 had 0 consumers on JR02
+      required: false
+dynamic:
+- {parent: world, child: '{ns}/map', topic: /tf, publisher: 'SIM ONLY (sim_tf.py, spawn pose)', note: 'not on the robot: /JR02/world
+    is only a seed-pose topic. Must be periodic /tf, not /tf_static'}
+- {parent: '{ns}/map', child: '{ns}/odom', topic: /tf, publisher: /map_odom_tf_broadcaster, note: 'dlio_ws scripts/map_odom_tf.py
+    <ns>: identity, 20 Hz, stamped +0.2 s (periodic: rmw_zenoh late joiners miss TRANSIENT_LOCAL). Root-level fixed name;
+    the sim renames it per agent'}
+- {parent: '{ns}/odom', child: '{ns}/base_link', topic: /tf, publisher: '/{ns}/dlio_odom_node', note: 'DLIO; base_link = lidar
+    origin, seeded at z 0.36 (JR02 DLIO_SEED_Z) above the floor'}
+not_on_tf: [/JR02/geofence/* keeps a private tree on /JR02/geofence/tf (geofence is out of scope for the sim), 'rover_firmware_driver
+    runs with publish_tf:=false (wheel odom on /JR02/odom, 0 subscribers)', the D455 driver hangs its optical frames off JR02_d455_link;
+    not modelled]

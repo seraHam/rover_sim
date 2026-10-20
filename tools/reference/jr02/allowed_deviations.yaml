@@ -1,0 +1,98 @@
+# Differences from JR02 that the sim makes on purpose. parity_check.py reports a difference
+# matching an entry here as ALLOWED, with the reason given; any other difference is a DIFF and
+# fails the check. Add an entry only together with the change that needs it, and say why.
+#
+# Layers: 'all' always applies, then class.<jr|rr>, then mapping.<gpu|fallback> (the session's
+# mapping mode, parity_check --mapping). Lists add up; params merge per node.
+# {ns} = the agent namespace, {class} = jr | rr. Patterns are shell globs (fnmatch).
+#   params:   node -> {param name: reason}. robot_state_publisher's URDF is compared per joint,
+#             as robot_description:<joint name>.
+#   absent:   robot nodes the sim does not run; their endpoints are not expected.
+#   sim_only: sim nodes with no robot counterpart; their endpoints on reference topics are fine.
+#   ignore:   tooling, never compared.
+#   topics:   topic -> reason, for edges whose set depends on the session.
+
+# Fixed node names that would collide between agents are made unique (--ros-args -r __node:=).
+rename:
+  /dlio_map_node: /dlio_map_node_{ns}
+  /map_odom_tf_broadcaster: /map_odom_tf_broadcaster_{ns}
+
+all:
+  params:
+    mighty_node:
+      num_agents: >-
+        each pane passes num_agents:=<highest agent id in the session>; JR02 runs the launch
+        default 10, and a vehicle overlay cannot raise it (onboard_mighty.launch.py:181-185 vs :200)
+    persistent_map_node:
+      save_dir: sim runs save_dir:=none; JR02 saves under /var/lib/rover/persistent_map/JR02
+      corrected_path_topic: >-
+        JR02-only MAD-SLAM block at the end of persistent_map.yaml (/madslam/estimate/robot_2,
+        which had 0 publishers on JR02); sim agents get the '' default
+    robot_state_publisher:
+      "robot_description:{ns}_base_to_d455": >-
+        D455 extrinsics come from sensor_calib/<name>_calib.npy, which sim names lack (identity);
+        the D455 has no consumers on JR02 and is not simulated
+
+  absent:
+    - /{ns}/rover_firmware_driver   # Teensy serial driver; Gazebo diff drive takes cmd_vel instead
+    - /{ns}/d455                    # RealSense driver; not simulated, 0 consumers on JR02
+    - /{ns}/livox_lidar_publisher   # livox_ros_driver2; replaced by the sim's lidar bridge
+    - /{ns}/geofence/*              # geofence and prior-map localisation are out of scope for now
+    - /{ns}/geofence/loc/*
+
+  sim_only:
+    - /{ns}/livox_sim_bridge*       # Gazebo MID-360 + IMU -> livox/lidar, livox/imu
+    - /{ns}/gazebo*                 # Gazebo plugin nodes (diff drive, p3d ground truth, sensors)
+    - /{ns}/*diff_drive*
+    - /{ns}/*p3d*
+    - /{ns}/*imu*
+    - /{ns}/*mid360*
+    - /{ns}/odom_eval*
+    - /{ns}/goal_relay*
+    - /{ns}/frame_align*            # ground-truth frame_align (nothing publishes it on JR02)
+    - /{ns}/sim_tf*                 # world -> <ns>/map at the spawn pose
+    - /gazebo*
+    - /spawn_entity*
+    - /frame_align_publisher*
+    - /sim_tf*
+
+  ignore:
+    - /_ros2cli_*                   # ros2 CLI, incl. the `ros2 topic pub` seed-pose publisher
+    - /*/transform_listener_impl_*  # tf2 listener helper nodes, random suffix
+    - /transform_listener_impl_*
+    - /rviz*
+    - /*/rviz*
+    - /zenoh_router
+
+  topics:
+    "/frame_align/{ns}/*": >-
+      mighty_node subscribes /frame_align/<ns>/<prefix><id> for ids 1..num_agents
+      (mighty_node.cpp:199-216), so the list follows the session's num_agents
+
+class:
+  rr:
+    params:
+      map_fusion_node:
+        semseg_occ_topic: >-
+          no Orin terrain_projection water layer in the sim: '' instead of the red rovers'
+          semseg/occ_2d_topic
+
+mapping:
+  fallback:
+    # mapping: fallback is labelled "not parity": no GPU, so no elevation mapper and no
+    # map_fusion; global_mapper publishes the planner grids through a relay.
+    params:
+      global_mapper_ros:
+        "*": fallback runs config/mapping/global_mapper_fallback_<class>.yaml (z_ground, esdf_enabled, truncation)
+      persistent_map_node:
+        window_topic: fallback overlay window_topic:=voxel/occ_2d_topic (no map_fusion contract output)
+      goal_selector:
+        exploration.persistent_map.enabled: fallback may turn the persistent map input off
+      mighty_node:
+        plan_to_terminal_goal: fallback has no composite map to plan the terminal goal on
+        max_window_m: fallback has no composite map window
+    absent:
+      - /{ns}/map_fusion_node
+      - /{ns}/elevation_mapping_node
+    sim_only:
+      - /{ns}/*relay*

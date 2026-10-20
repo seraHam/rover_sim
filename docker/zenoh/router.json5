@@ -1,0 +1,59 @@
+// The sim's one zenoh router (`ros2 run rmw_zenoh_cpp rmw_zenohd` in sim-drive, the
+// container that hosts the router on a rover too). Based on mighty 3cf7320
+// docker/dev/zenoh_router_config.json5. Keys not listed here take zenoh defaults.
+//
+// ISOLATION: this host also runs the fleet C2 router on *:7447. This router listens
+// on 7447 only inside the internal docker network `rover-sim` (docker/compose.stack.yaml):
+// no port is published, the network has no route out, and the router dials nothing and
+// scouts nothing. The sim names (JR81, RR83, ...) and the fleet-wide root topics
+// (/trajs, /exploration/return_home) must never meet the fleet's graph.
+{
+  mode: "router",
+  listen: {
+    // The dual-stack wildcard, as on JR02. The sim containers have IPv6 disabled, but a
+    // socket on :: needs no IPv6 address and still accepts IPv4. If it ever fails to
+    // bind, tcp/0.0.0.0:7447 is equivalent: the rover-sim network is IPv4-only.
+    endpoints: ["tcp/[::]:7447"],
+  },
+  connect: {
+    endpoints: [],
+  },
+  scouting: {
+    multicast: { enabled: false },
+    gossip: {
+      enabled: true,
+      multihop: false,
+      autoconnect: { router: [], peer: ["router"] },
+    },
+  },
+  routing: {
+    // JR02's router has this off: on a rover every session meshes with every other over
+    // loopback, so the router never has to forward between two peers. Sim sessions live
+    // in separate containers (separate netns) and do not dial each other (see
+    // session.json5), so the router must broker all peer-to-peer traffic.
+    router: { peers_failover_brokering: true },
+  },
+  timestamping: {
+    enabled: { router: true, peer: true, client: true },
+  },
+  transport: {
+    link: {
+      tx: {
+        // Same bounds as JR02's router (/home/swarm/config/zenoh_mesh5_config.json):
+        // a session of a killed container is dropped within 5 s, and a stalled reader
+        // cannot block the router's forwarding for longer than 5 s.
+        lease: 5000,
+        keep_alive: 4,
+        queue: {
+          congestion_control: {
+            block: { wait_before_close: 5000000 },
+          },
+        },
+      },
+    },
+  },
+  adminspace: {
+    enabled: true,
+    permissions: { read: true, write: false },
+  },
+}
