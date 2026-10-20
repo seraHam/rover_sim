@@ -1,18 +1,20 @@
 # What a MID-360 can cost per world: the most rays per 10 Hz scan (spawn_agent.launch.py
-# lidar_samples; scripts/sim.py passes these) that keep 4 agents (2 jr + 2 rr) in real time.
-# The robot casts 20000. A scan casts every k-th point of the 20000-point pattern frame, with
-# k = ceil(20000 / lidar_samples), so ceil(20000 / k) rays: 3000 casts 2858.
+# lidar_samples; scripts/sim.py passes these) that keep 4 agents (2 jr + 2 rr) in real time
+# and give DLIO enough to match. The robot casts 20000. A scan casts every k-th point of the
+# 20000-point pattern frame, with k = ceil(20000 / lidar_samples), so ceil(20000 / k) rays:
+# 3000 casts 2858, 1500 casts 1429.
 #
 # The livox plugin casts every ray of a scan while holding the physics lock (~0.6 us a ray in
 # empty, ~2.5 us among the office's 86 walls), so physics stalls for the cast. The worlds'
 # real_time_lock plugin makes the stalled time up afterwards, which holds sim time to the
 # wall clock as long as casts + physics fit in real time on gzserver's busiest thread; past
-# that RTF drops fast. Measured 2026-10-18 on a 20-core dev host (RTX 3090) through
-# scripts/sim.py (gzserver on 3 of sim-gazebo's cores), 60 s each: gz stats RTF, the bridges'
-# worst 5 s sim/rtf, the largest sim/time_offset span, points per scan after the bridge's
-# no-hit cut. "rays" is what each scan cast.
+# that RTF drops fast. Measured on a 20-core dev host (RTX 3090) through scripts/sim.py
+# (gzserver on 3 of sim-gazebo's cores), 60 s each: gz stats RTF, the bridges' worst 5 s
+# sim/rtf, the largest sim/time_offset span, points per scan after the bridge's no-hit cut.
+# "rays" is what each scan cast.
 #
-#   empty (multi_agent_swap)      rays   RTF     worst 5 s  offset span  points
+#   2026-10-18, no DLIO           rays   RTF     worst 5 s  offset span  points
+#   empty
 #     idle host                   1539   1.0000  0.999       2.6 ms       377
 #                                 5000   1.0002  0.988       9.4 ms      1226
 #                                10000   0.908   0.891      (drifts)     2451
@@ -20,16 +22,50 @@
 #     CPUs 12-15 busy (*)         2858   1.0002  0.972      40 ms         700
 #                                 4000   1.0002  0.938      83 ms         981
 #                                 5000   0.998   0.913     140 ms        1227
-#   ACL_office_simple (office_explore)
+#   ACL_office_simple
 #     idle host                    500   1.0000  0.999       0.9 ms       378
 #                                 1539   1.0003  0.996       5.4 ms      1160
 #                                 2858   0.891   0.874      (drifts)     2154
 #     CPUs 12-15 busy (*)         1000   1.0000  0.982       6.5 ms       755
 #                                 1539   0.999   0.912     168 ms        1160
 #
+#   2026-10-19, 4 DLIO running
+#   arena (multi_agent_swap, smoke, odom_eval)
+#     idle host                   2858   1.0005  0.995      18 ms        1370
+#     CPUs 12-15 busy (**)        2858   0.9998  0.978      71 ms        1370
+#   ACL_office_simple (office_explore)
+#     idle host                   1429   1.0000  0.992      23 ms     700-1300
+#     CPUs 12-15 busy (**)        1429   0.9997  0.976      89 ms     700-1300
+#
 # (*) 4 numpy matmul loops on 12-15, the SMT siblings of sim-gazebo's 2-5, which the other
-# stacks share: the later phases' load. The budgets below are the ones that held there.
+# stacks share: the later phases' load. (**) 4 single-threaded 1200x1200 numpy matmul loops
+# there. That load costs less than (*) did: without DLIO it left the office at 1539 rays at
+# 0.985, not 0.912, so Phase 5 has to re-check the margin under its real load.
+#
+# DLIO (dlio_ws cfg_overlay JR02/RR08, unchanged) needs both structure and density:
+#   - empty: never. On a flat floor with only the other robots in view, x, y and yaw are
+#     unobservable; DLIO drifted 4-21 m in under a minute while parked, at 2858 and at 10000
+#     rays. Its sessions moved to arena.
+#   - ACL_office_simple at 1000 rays (~500 points): along the 24 m hall the far walls get too
+#     few points, and an agent in its middle lost x (2.9-6.6 m ATE over a 63 m drive). From 1429
+#     rays on it tracked at every tested spot: ATE RMSE 1.6-6.7 cm, max 8-15 cm (the
+#     feasibility probe's drives); 4 agents on 4 m squares along the hall, 48 m each through
+#     odom_eval.py --drive: RMSE 2.0-4.6 cm, max 6.8-17.9 cm (the max in in-place turns).
+#   - arena at 2858 rays, JR and RR, 4 agents driving ~48 m each (3D ATE, odom_eval.py):
+#     odom_eval.yaml's drive (odom_eval.py --drive, drive_pattern.py's 0.5 m/s^2 ramps):
+#     RMSE 1.4-2.6 cm, max 4.3-6.3 cm (three runs); the feasibility probe's drives, which
+#     stepped the speed, among them that same route: RMSE 1.1-2.7 cm, max 7.8-9.2 cm.
+# In the arena most of each max is lag while accelerating: the IMU is in g like the
+# MID-360's, DLIO's calibration takes the 1/9.81 scale as a z accel bias, so its IMU prior
+# sees accelerations 9.81x too small (also on the robot).
 # The budget is per scan, not per world: fewer agents cost less but each scan stalls the same.
 lidar_samples_4_agents:
   empty: 3000                 # 2858 rays
-  ACL_office_simple: 1000     # 1000 rays
+  arena: 3000                 # 2858 rays
+  ACL_office_simple: 1500     # 1429 rays
+
+# [xmin, ymin, xmax, ymax] of the inner faces of a world's outer walls, m. sim.py copies it
+# into <run>/spawn.yaml, and drive_pattern.py refuses a plan that comes within 0.5 m of them
+# (WALL_MARGIN); it knows nothing of the obstacles inside. The office's walls are no box.
+walls:
+  arena: [-8.0, -8.0, 8.0, 8.0]

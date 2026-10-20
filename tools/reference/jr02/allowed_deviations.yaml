@@ -13,6 +13,10 @@
 #   topics:   topic -> reason, for edges whose set depends on the session.
 
 # Fixed node names that would collide between agents are made unique (--ros-args -r __node:=).
+# dlio_map_node's interfaces keep their root names (scripts/sim.py DLIO_SIM_LAUNCH renames the
+# node only), so with N agents the sim graph has N servers of /save_pcd (a call reaches any one),
+# N /map publishers and N subscriptions to /dlio/odom_node/pointcloud/keyframe; JR02 has one of
+# each. The reference graph has none of these edges, so parity_check does not report them.
 rename:
   /dlio_map_node: /dlio_map_node_{ns}
   /map_odom_tf_broadcaster: /map_odom_tf_broadcaster_{ns}
