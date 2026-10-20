@@ -2795,6 +2795,12 @@ def checkout_file(rel):
     return f if f.is_file() else None
 
 
+def orin_launcher():
+    """The pinned checkout's Orin launcher, or None without a checkout. mapping_ws renamed it
+    orin/local_mapper_host_tmux.sh -> orin/elevation_mapper_host_tmux.sh on 2026-10-20."""
+    return checkout_file('orin/elevation_mapper_host_tmux.sh') or checkout_file('orin/local_mapper_host_tmux.sh')
+
+
 class Phase4Mapping(unittest.TestCase):
     ctx = sim.RunContext(run_dir=Path(sim.RUN_DIR_DEFAULT))
 
@@ -3076,7 +3082,7 @@ class Phase4Mapping(unittest.TestCase):
                          [(a.name, ['elevation-' + a.name]) for a in OFFICE.agents])
         p = panes[2]
         self.assertEqual((p.container, p.env, p.waits), ('sim-elevation', sim.robot_env(OFFICE.agents[2]), ''))
-        # local_mapper_host_tmux.sh's line, for an elevation_mapping_cupy that takes param_overlays.
+        # elevation_mapper_host_tmux.sh's line, for an elevation_mapping_cupy that takes param_overlays.
         self.assertEqual(p.cmd, "ros2 launch elevation_mapping_cupy elevation_mapping_dlio.launch.py quad:=RR83 "
                                 "'extra_cloud_exclude:=livox/*' occupancy_grid_topic:=elev/occ_2d_topic "
                                 "planning_occupancy_grid_topic:=elev/planning_occ_2d_topic "
@@ -3089,7 +3095,9 @@ class Phase4Mapping(unittest.TestCase):
         out = subprocess.run(['bash', '-c', 'f() { printf "%s\\n" "$@"; }; f ' + p.cmd[len('ros2 launch '):]],
                              stdout=subprocess.PIPE, universal_newlines=True, cwd='/').stdout.split('\n')
         self.assertIn('extra_cloud_exclude:=livox/*', out)                    # as the container's bash passes it
-        script = checkout_file('orin/local_mapper_host_tmux.sh')
+        script = orin_launcher()
+        if script is None and sim.mapping_checkout(sim.read_pins()).is_dir():
+            self.fail('the pinned mapping_ws checkout has no Orin launcher (orin/elevation_mapper_host_tmux.sh)')
         if script is not None:
             topics = re.search(r'^TOPIC_ARGS=" (.*)"$', script.read_text(), re.M).group(1).split()
             self.assertEqual(tuple(topics), sim.ELEVATION_TOPIC_ARGS)
