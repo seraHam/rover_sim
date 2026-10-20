@@ -395,6 +395,23 @@ class CliTest(unittest.TestCase):
                 self.assertEqual(oe.main(['--ns', 'JR81', '--spawn', p, '--drive', '--pattern', 'loop']), 2)
             self.assertIn('needs --size', err.getvalue())
 
+    def test_truth_agent_refused(self):
+        """odometry: truth (NOT PARITY): its DLIO topics carry the truth; exit 2 before rclpy is imported."""
+        data = {'agents': [{'name': 'JR81', 'class': 'jr', 'id': 81, 'x': -2.0, 'y': 0.5, 'yaw': 0.5,
+                            'lidar_height': 0.36, 'reference_robot': 'JR02', 'odometry': 'truth'}]}
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, 'spawn.yaml')
+            with open(p, 'w') as f:
+                yaml.safe_dump(data, f)
+            err = io.StringIO()
+            with unittest.mock.patch.dict(sys.modules, {'rclpy': None}), contextlib.redirect_stderr(err):
+                self.assertEqual(oe.main(['--ns', 'JR81', '--spawn', p, '--duration', '1']), 2)
+            self.assertIn('JR81 has odometry: truth (NOT PARITY', err.getvalue())
+            data['agents'][0]['odometry'] = 'dlio'
+            with open(p, 'w') as f:
+                yaml.safe_dump(data, f)
+            oe.refuse_truth(p, 'JR81')                                   # dlio: no refusal
+
     def test_split_argv(self):
         self.assertEqual(oe.split_argv(['--ns', 'JR81', '--drive', '--pattern', 'loop']),
                          (['--ns', 'JR81'], ['--pattern', 'loop']))

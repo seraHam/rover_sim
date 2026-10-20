@@ -475,6 +475,25 @@ def load_spawn_entry(path, ns):
     return spawn_entry(load_spawn(path), ns, path)
 
 
+ODOMETRY_MODES = ('dlio', 'truth')    # sim.py ODOMETRY_MODES
+
+
+def spawn_odometry(data, ns, source='spawn.yaml'):
+    """Agent ns's odometry in parsed spawn.yaml: dlio (the robot's DLIO) or truth (ground truth
+    under DLIO's names, NOT PARITY: truth_odom.py). An entry without the key is dlio: every run
+    before the key existed was."""
+    agents = data.get('agents') if isinstance(data, dict) else None
+    if not isinstance(agents, list):
+        raise PlanError('%s: expected {agents: [...]}' % source)
+    for a in agents:
+        if isinstance(a, dict) and a.get('name') == ns:
+            mode = a.get('odometry', 'dlio')
+            if mode not in ODOMETRY_MODES:
+                raise PlanError('%s: %s: odometry %r is not one of %s' % (source, ns, mode, ', '.join(ODOMETRY_MODES)))
+            return mode
+    raise PlanError('%s: no agent %s' % (source, ns))
+
+
 def ns_class(ns):
     return PREFIX_CLASS.get(ns[:2])
 

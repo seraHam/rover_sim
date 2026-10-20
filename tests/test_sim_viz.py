@@ -386,6 +386,16 @@ class Drawing(unittest.TestCase):
         u, v = self.view.aff().apply(x, y)
         return int(round(v)), int(round(u))
 
+    def test_truth_odometry_in_the_header(self):
+        # odometry: truth (spawn.yaml; NOT PARITY): the panel says so next to the agent's name.
+        texts = []
+        with mock.patch.object(viz, 'put', lambda img, text, *a, **k: texts.append(text)):
+            viz.draw_header(self.panel, 400, self.shown, False, 1.0, 15.0, self.view, 0.0)
+            truth = viz.AgentPanel(self.spawns[0], 'jr', viz.PANEL_COLORS[0], list(viz.LAYERS), 'truth')
+            viz.draw_header(truth, 400, self.shown, False, 1.0, 15.0, self.view, 0.0)
+        self.assertIn('JR81 (JR)', texts)
+        self.assertIn('JR81 (JR, TRUTH odom: not parity)', texts)
+
     def draw(self, now=0.0):
         return self.panel.draw(self.view, self.shown, self.store, self.frames, now)
 

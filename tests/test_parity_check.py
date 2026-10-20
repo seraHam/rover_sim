@@ -150,9 +150,9 @@ class SessionMappingTest(unittest.TestCase):
         seen = []
         real = pc.Reference.__init__
 
-        def spy(self, ref, ns, mapping):
+        def spy(self, ref, ns, mapping, odometry='dlio'):
             seen.append(mapping)
-            real(self, ref, ns, mapping)
+            real(self, ref, ns, mapping, odometry)
         with tempfile.TemporaryDirectory() as d:
             self.run_dir(d, {'name': 'smoke', 'mapping': 'fallback', 'agents': [{'name': 'JR81'}]})
             out = io.StringIO()
@@ -163,6 +163,73 @@ class SessionMappingTest(unittest.TestCase):
                     pc.main(['JR81', '--run-dir', os.path.join(d, 'none'), '--show-ref', 'mpc'])
                 pc.main(['JR81', '--run-dir', os.path.join(d, 'none'), '--show-ref', 'mpc'])
         self.assertEqual(seen, ['fallback', 'gpu', 'fallback', 'gpu'])
+
+
+class SessionOdometryTest(unittest.TestCase):
+    """odometry: truth (NOT PARITY): the agent's mode from session.json, and its layer."""
+
+    def run_dir(self, d, data):
+        Path(d, 'session.json').write_text(json.dumps(data))
+        return d
+
+    def test_from_session_json(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.run_dir(d, {'name': 'office', 'odometry': 'dlio', 'agents': [
+                {'name': 'JR81', 'odometry': 'truth'}, {'name': 'RR83', 'odometry': 'dlio'}, {'name': 'RR84'}]})
+            self.assertEqual(pc.session_odometry('JR81', d)[0], 'truth')
+            self.assertEqual(pc.session_odometry('RR83', d)[0], 'dlio')
+            self.assertEqual(pc.session_odometry('RR84', d)[0], 'dlio')         # the session's default
+            mode, note = pc.session_odometry('JR82', d)
+            self.assertIsNone(mode)
+            self.assertIn('JR82 is not an agent of session office', note)
+            self.run_dir(d, {'name': 'old', 'agents': [{'name': 'JR81'}]})     # before the key: dlio
+            self.assertEqual(pc.session_odometry('JR81', d)[0], 'dlio')
+            self.run_dir(d, {'name': 'all', 'odometry': 'truth', 'agents': [{'name': 'JR81'}]})
+            self.assertEqual(pc.session_odometry('JR81', d)[0], 'truth')
+            self.run_dir(d, {'name': 'bad', 'agents': [{'name': 'JR81', 'odometry': 'gps'}]})
+            self.assertIsNone(pc.session_odometry('JR81', d)[0])
+        self.assertIsNone(pc.session_odometry('JR81', '/nonexistent/run')[0])
+
+    def test_main_takes_it(self):
+        seen = []
+        real = pc.Reference.__init__
+
+        def spy(self, ref, ns, mapping, odometry='dlio'):
+            seen.append(odometry)
+            real(self, ref, ns, mapping, odometry)
+        with tempfile.TemporaryDirectory() as d:
+            self.run_dir(d, {'name': 'office', 'agents': [{'name': 'JR81', 'odometry': 'truth'}, {'name': 'RR83'}]})
+            out = io.StringIO()
+            with mock.patch.object(pc.Reference, '__init__', spy), contextlib.redirect_stdout(out):
+                pc.main(['JR81', '--run-dir', d, '--show-ref', 'mpc'])
+                pc.main(['RR83', '--run-dir', d, '--show-ref', 'mpc'])
+                pc.main(['JR81', '--run-dir', d, '--odometry', 'dlio', '--show-ref', 'mpc'])
+                pc.main(['JR81', '--run-dir', os.path.join(d, 'none'), '--show-ref', 'mpc'])
+        self.assertEqual(seen, ['truth', 'dlio', 'dlio', 'dlio'])
+
+    def test_truth_layer(self):
+        truth, dlio = pc.Reference('JR02', 'JR81', 'gpu', 'truth'), pc.Reference('JR02', 'JR81', 'gpu')
+        for fqn in ('/JR81/dlio_odom_node', '/dlio_map_node_JR81', '/JR81/dlio_session'):
+            self.assertEqual(truth.node_class(fqn), 'absent', fqn)
+            self.assertEqual(truth.absent_reason(fqn), 'odometry: truth', fqn)
+            self.assertIsNone(dlio.node_class(fqn), fqn)
+        # truth_odom.py's node is the agent's own; map->odom still runs in both modes.
+        self.assertEqual(truth.node_class('/JR81/truth_odom_JR81'), 'sim_only')
+        self.assertIsNone(truth.node_class('/JR82/truth_odom_JR82'))
+        self.assertIsNone(truth.node_class('/map_odom_tf_broadcaster_JR81'))
+        self.assertIsNone(dlio.node_class('/JR81/truth_odom_JR81'))
+        # The layers add up: the fallback's absent nodes are named by their own layer.
+        both = pc.Reference('JR02', 'RR83', 'fallback', 'truth')
+        self.assertEqual(both.absent_reason('/RR83/map_fusion_node'), 'fallback mapping')
+        self.assertEqual(both.absent_reason('/RR83/dlio_odom_node'), 'odometry: truth')
+        self.assertIsNone(both.absent_reason('/RR83/safety_node'))
+
+    def test_sim_only_name_is_truth_odoms(self):
+        spec = importlib.util.spec_from_file_location('truth_odom', str(REPO / 'scripts' / 'truth_odom.py'))
+        to = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(to)
+        ref = pc.Reference('JR02', 'RR83', 'gpu', 'truth')
+        self.assertEqual(ref.node_class('/RR83/' + to.node_name('RR83')), 'sim_only')
 
 
 # ---------------------------------------------------------------------------- the query session, fake rclpy

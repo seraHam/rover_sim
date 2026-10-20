@@ -41,7 +41,10 @@ Criteria (Verification PR 5):
                (logged at ERROR because of that log level; counted and listed apart)
   rtf          no sim/rtf run below --rtf-min longer than 5 s and no new rtf_violations.log line
   odometry     each agent's DLIO estimate stayed within --odom-max m (xy) of ground truth; the xy
-               ATE RMSE and the distance driven in the window are reported with it
+               ATE RMSE and the distance driven in the window are reported with it. An agent with
+               odometry: truth (spawn.yaml; NOT PARITY, truth_odom.py) is not graded: its residual
+               is reported as truth_check (non-zero is a frame bug in the stand-in), and with no
+               DLIO agent left the criterion is N/A; the last line then says NOT PARITY
 Exit 0 every criterion PASS, 1 a FAIL, 2 a setup error (no run, no probe, no recording).
 
 The pure parts (geometry, the URDF footprint, the world's boxes, the log scan, the grading)
@@ -652,6 +655,19 @@ def odometry_summary(est, truth, spawns, limit):
     return ok and bool(out), out
 
 
+def odometry_modes(spawn, agents):
+    """{ns: dlio | truth} from the run's spawn.yaml (truth: NOT PARITY; an entry without the key,
+    or no entry, is dlio)."""
+    dp = goal_relay.drive_pattern
+    out = {}
+    for n in agents:
+        try:
+            out[n] = dp.spawn_odometry(spawn, n)
+        except dp.PlanError:
+            out[n] = 'dlio'
+    return out
+
+
 def coverage_summary(cov, growth):
     if len(cov) < 2:
         return False, {'samples': len(cov)}
@@ -676,8 +692,9 @@ def grade(rec, logs, boxes, opts):
     fps = {n: tuple(v) for n, v in rec['footprints'].items()}
     crit = []
 
-    def add(name, ok, summary, detail):
-        crit.append({'name': name, 'pass': bool(ok), 'summary': summary, 'detail': detail})
+    def add(name, ok, summary, detail, na=False):
+        crit.append(dict({'name': name, 'pass': bool(ok), 'summary': summary, 'detail': detail},
+                         **({'na': True} if na else {})))
 
     if mode == 'swap':
         ok, per = leg_summary(logs['legs'], agents, t0, t1, opts.min_legs, truth, opts.goal_radius)
@@ -727,21 +744,43 @@ def grade(rec, logs, boxes, opts):
     add('rtf', rok and not viol, 'sim/rtf never below %.2f for over 5 s, %d new violation line(s): %s' % (
         opts.rtf_min, len(viol), ', '.join('%s min %s mean %s' % (n, v['min'], v['mean']) for n, v in rtf.items())),
         {'agents': rtf, 'violations': viol})
-    ook, odo = odometry_summary({n: [tuple(r) for r in rows] for n, rows in (rec.get('est') or {}).items()},
-                                truth, spawns, opts.odom_max)
-    add('odometry', ook, 'DLIO within %.2f m of ground truth: %s' % (opts.odom_max, ', '.join(
-        '%s max %s m (RMSE %s m, %s m driven)' % (n, v['max_m'], v['rmse_m'], v['path_m'])
-        for n, v in odo.items())), odo)
-    return {'mode': mode, 'session': rec.get('session', {}).get('name'), 'agents': agents,
-            'window': {'t0': t0, 't1': t1, 'duration_s': round(t1 - t0, 1)},
-            'pass': all(c['pass'] for c in crit), 'criteria': crit, 'notes': rec.get('notes', [])}
+    modes = odometry_modes(rec.get('spawn') or {}, agents)
+    truth_agents = [n for n in agents if modes[n] == 'truth']
+    est = {n: [tuple(r) for r in rows] for n, rows in (rec.get('est') or {}).items()}
+    ook, odo = odometry_summary({n: v for n, v in est.items() if n not in truth_agents}, truth, spawns,
+                                opts.odom_max)
+    graded = ', '.join('%s max %s m (RMSE %s m, %s m driven)' % (n, v['max_m'], v['rmse_m'], v['path_m'])
+                       for n, v in odo.items())
+    if not truth_agents:
+        add('odometry', ook, 'DLIO within %.2f m of ground truth: %s' % (opts.odom_max, graded), odo)
+    else:
+        # The truth agents' estimate is the truth: graded it would pass by construction. What is
+        # left of it is the stand-in's frames (expected ~0), reported apart.
+        _, check = odometry_summary({n: v for n, v in est.items() if n in truth_agents}, truth, spawns, math.inf)
+        residual = 'odometry: truth (NOT PARITY), not graded: %s' % (', '.join(
+            '%s residual max %s m' % (n, v['max_m']) for n, v in check.items()) or ', '.join(truth_agents))
+        if len(truth_agents) == len(agents):
+            add('odometry', True, 'n/a: ' + residual, dict(odo, truth_check=check), na=True)
+        else:
+            add('odometry', ook, 'DLIO within %.2f m of ground truth: %s; %s' % (opts.odom_max, graded, residual),
+                dict(odo, truth_check=check))
+    out = {'mode': mode, 'session': rec.get('session', {}).get('name'), 'agents': agents,
+           'window': {'t0': t0, 't1': t1, 'duration_s': round(t1 - t0, 1)},
+           'pass': all(c['pass'] for c in crit), 'criteria': crit, 'notes': rec.get('notes', [])}
+    if truth_agents:
+        out['odometry'] = modes
+    return out
 
 
 def report_lines(report):
-    out = ['%s  %-10s  %s' % ('PASS' if c['pass'] else 'FAIL', c['name'], c['summary']) for c in report['criteria']]
-    out.append('%s: %s demo of %s, %.0f s, %d criteria' % ('PASS' if report['pass'] else 'FAIL', report['mode'],
-                                                           report['session'], report['window']['duration_s'],
-                                                           len(report['criteria'])))
+    out = ['%s  %-10s  %s' % ('N/A ' if c.get('na') else 'PASS' if c['pass'] else 'FAIL', c['name'], c['summary'])
+           for c in report['criteria']]
+    na = sum(bool(c.get('na')) for c in report['criteria'])
+    truth = [n for n, m in sorted((report.get('odometry') or {}).items()) if m == 'truth']
+    out.append('%s: %s demo of %s, %.0f s, %d criteria%s%s' % (
+        'PASS' if report['pass'] else 'FAIL', report['mode'], report['session'], report['window']['duration_s'],
+        len(report['criteria']), ' (%d n/a)' % na if na else '',
+        '; NOT PARITY: odometry truth for %s' % ', '.join(truth) if truth else ''))
     return out
 
 

@@ -31,7 +31,9 @@ Reports ATE RMSE/max (3D, xy, z), yaw and rotation error, end-point drift (m and
 truth path length), the SE(2)-aligned xy ATE (what is left once a constant offset is
 removed), sample counts and rates, and prints one verdict line: PASS when the 3D ATE RMSE is
 under --target (the plan's 10 cm). Exit 0 PASS, 1 FAIL, 2 no data or a setup error, 3 when
-the --drive pattern did not complete (the run is still graded).
+the --drive pattern did not complete (the run is still graded). An agent whose spawn.yaml entry
+has odometry: truth (NOT PARITY: truth_odom.py publishes the truth as DLIO) is refused with exit 2
+before anything is recorded: graded against the truth it would pass by construction.
 
 The math (SE(3) compose, interpolation, ATE, the offset search) is pure Python and imports
 without rclpy; tests/test_odom_eval.py covers it.
@@ -546,9 +548,18 @@ def finish(report, args, drive=None):
     return 0 if report['verdict'] == 'PASS' else 1
 
 
+def refuse_truth(path, ns):
+    """PlanError for an agent on odometry: truth: truth against truth grades nothing."""
+    if drive_pattern.spawn_odometry(drive_pattern.load_spawn(path), ns, path) == 'truth':
+        raise drive_pattern.PlanError('%s has odometry: truth (NOT PARITY, %s): its DLIO topics carry the ground '
+                                      'truth, so there is no estimate to grade; run it with odometry: dlio'
+                                      % (ns, path))
+
+
 def record(args, drive_argv):
     ns = args.ns
     world_map, h = spawn_pose(args.spawn, ns)
+    refuse_truth(args.spawn, ns)
     if args.lidar_height is not None:
         h = args.lidar_height
     dargs = None
