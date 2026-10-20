@@ -2,8 +2,8 @@ cmake_minimum_required(VERSION 3.8)
 project(rover_sim)
 
 find_package(ament_cmake REQUIRED)
-# Optional: the legacy image builds this package without Gazebo's headers and never loads
-# the plugin. The stack's gazebo image builds it, and its build fails if the library is missing.
+# Optional so the package still configures without Gazebo's headers (it then has no
+# plugin). The gazebo image builds it, and its build fails if the library is missing.
 find_package(gazebo_dev QUIET)
 
 if(gazebo_dev_FOUND)

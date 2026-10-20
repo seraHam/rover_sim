@@ -1,6 +1,6 @@
 <?xml version="1.0"?>
 <!-- Livox MID-360 and its built-in IMU, as mounted on the JR02-parity models. Started from
-     docker/overrides/mid360.xacro (the legacy path's copy), changed:
+     the old single-container sim's mid360.xacro (removed), changed:
      - the link and the ray sensor are both named 'lidar': the livox plugin stamps
        <namespace>/<sensor name> (livox_points_plugin.cpp:209), so the cloud is in <ns>/lidar,
        the frame rover_description publishes;

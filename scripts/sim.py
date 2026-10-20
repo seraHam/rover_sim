@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """rover_sim session runner (host side) for the per-stack sim.
 
-docker/compose.stack.yaml is a set of idle containers, one per robot stack. This
+docker/compose.yaml is a set of idle containers, one per robot stack. This
 script brings them up and runs every node as a `docker exec` from a host tmux session
 per stack (rsim-<stack>), the way the robot's *_host_tmux.sh units do, so Ctrl-C / Up /
 Enter in a pane restarts that one node.
@@ -120,7 +120,7 @@ from a container of its own (sim-viz: compose profile viz, never started by `up`
 X like sim-gazebo, cores off gzserver's and their SMT siblings) in tmux session rsim-viz. It joins
 the running graph as `start` does, and leaves it one subscription at a time: `viz --stop` and `down`
 stop it first and wait for that, before anything else goes down (a docker stop of sim-viz waits too:
-compose.stack.yaml). `viz --snapshot PNG` writes one frame of it to PNG on this host, no window.
+compose.yaml). `viz --snapshot PNG` writes one frame of it to PNG on this host, no window.
 
 Host needs: python3 >= 3.8 with PyYAML, tmux, the docker CLI with compose v2.
 """
@@ -157,14 +157,14 @@ except ImportError:  # pragma: no cover - host setup problem
 
 REPO = Path(__file__).resolve().parent.parent
 DOCKER_DIR = REPO / 'docker'
-COMPOSE_FILE = DOCKER_DIR / 'compose.stack.yaml'
+COMPOSE_FILE = DOCKER_DIR / 'compose.yaml'
 LOCAL_COMPOSE_FILE = DOCKER_DIR / 'compose.local.yaml'
 STACKS_ENV = DOCKER_DIR / 'stacks.env'
 ZENOH_DIR = DOCKER_DIR / 'zenoh'
 SESSIONS_DIR = REPO / 'config' / 'sessions'
 
 PROJECT = 'rover-sim-stack'          # compose project; every compose call is scoped to it
-NETWORK = 'rover-sim'                # internal docker network (compose.stack.yaml)
+NETWORK = 'rover-sim'                # internal docker network (compose.yaml)
 GPU_PROFILE = 'gpu'                  # compose profile of sim-elevation
 TMUX_PREFIX = 'rsim-'
 ROUTER_CONTAINER = 'sim-drive'
@@ -724,7 +724,7 @@ SIM_WS = '/home/swarm/code/rover_sim_ws'          # rover_sim's own images (gaze
 SIM_PROBE = '/rover_sim/scripts/wait_zenoh_ready.py'
 MAPPING_WS = '/home/swarm/code/mapping_ws'         # mapping_ws docker/Dockerfile.mapping ARG WS
 # On the Orin, mapping_ws tools/install_orin.sh installs scripts/wait_zenoh_ready.py here and
-# config/elevation/ under ELEVATION_OVERLAY_IN; compose.stack.yaml mounts the pinned checkout's.
+# config/elevation/ under ELEVATION_OVERLAY_IN; compose.yaml mounts the pinned checkout's.
 ORIN_PROBE = '/usr/local/lib/rover/wait_zenoh_ready.py'
 
 
@@ -778,7 +778,7 @@ DESCRIPTION_CONTAINER = 'sim-drive'
 TELEOP_SRC = '/home/swarm/code/rover_ws/install/share/rover_control/config/teleop_logitech.yaml'
 
 # dlio_ws as its image bakes it. On the robot, the pinned checkout's scripts/ is bind-mounted
-# over the image's (dlio_ws docker/compose.yaml); compose.stack.yaml mounts build_images.sh's
+# over the image's (dlio_ws docker/compose.yaml); compose.yaml mounts build_images.sh's
 # checkout of DLIO_SHA there, read-only.
 DLIO_WS = '/home/swarm/code/dlio_ws'
 DLIO_SCRIPTS = ('dlio_with_session.launch.py', 'dlio_session.py', 'map_odom_tf.py', 'wait_zenoh_ready.py')
@@ -979,8 +979,10 @@ def zenoh_panes(session: Session, ctx: RunContext) -> List[Pane]:
     return [Pane(
         title='zenoh router (%s:%d)' % (ROUTER_HOST, ROUTER_PORT), slug='router',
         container=ROUTER_CONTAINER, gate=False, env=(('RUST_LOG', ctx.rust_log),),
-        cmd=require_readable('ZENOH_ROUTER_CONFIG_URI')
-        + ' && ros2 run rmw_zenoh_cpp rmw_zenohd --ros-args -r __node:=zenoh_router')]
+        # Its config is checked before the node marker: an unreadable one ends the pane, and
+        # `up` stops at once instead of every other pane waiting for a router that never comes.
+        waits=require_readable('ZENOH_ROUTER_CONFIG_URI'),
+        cmd='ros2 run rmw_zenoh_cpp rmw_zenohd --ros-args -r __node:=zenoh_router')]
 
 
 def _not_yet(stack: str) -> SimError:
@@ -1447,7 +1449,7 @@ def write_teleop_file(session: Session, ctx: RunContext) -> None:
 
 def dlio_scripts_dir(pins: Dict[str, str]) -> Path:
     """build_images.sh's checkout of the dlio_ws pin (.cache/src/dlio_ws@<DLIO_SHA>): its
-    scripts/ is what compose.stack.yaml mounts in both DLIO containers."""
+    scripts/ is what compose.yaml mounts in both DLIO containers."""
     return REPO / '.cache' / 'src' / ('dlio_ws@' + pins.get('DLIO_SHA', '')) / 'scripts'
 
 
@@ -1576,14 +1578,14 @@ def dlio_panes(session: Session, ctx: RunContext) -> List[Pane]:
 # ---------------------------------------------------------------------------- mapping
 
 # As on the robot, whose mapping_ws compose bind-mounts the pinned checkout's config/mapping at
-# /mapping_config (docker/compose.mapping.yaml): compose.stack.yaml mounts build_images.sh's
+# /mapping_config (docker/compose.mapping.yaml): compose.yaml mounts build_images.sh's
 # checkout of MAPPING_SHA there, read-only, and that checkout's config/elevation where the Orin
 # has it (tools/install_orin.sh; elevation_mapper_host_tmux.sh EM_OVERLAY_DIR).
 MAPPING_CONFIG_IN = '/mapping_config'
 ELEVATION_OVERLAY_IN = '/usr/local/share/rover/elevation'
 WAIT_FOR_TF = MAPPING_WS + '/install/share/rover_bringup/scripts/wait_for_tf.py'
 PERSISTENT_MAP_PARAMS = 'persistent_map.yaml'
-# What compose.stack.yaml binds from that checkout, per container. Compose refuses to start a
+# What compose.yaml binds from that checkout, per container. Compose refuses to start a
 # container whose bind source is missing (never created: it would be root's).
 MAPPING_MOUNTS = (('sim-mapping', 'config/mapping'), ('sim-elevation', 'config/elevation'),
                   ('sim-elevation', 'scripts/wait_zenoh_ready.py'))
@@ -1888,7 +1890,7 @@ def check_elevation_launch(session: Session, ctx: RunContext) -> None:
     info('elevation launch file takes param_overlays and the grid topic arguments: %s' % out)
 
 
-# cupy's compiled kernels, kept in a named volume (compose.stack.yaml cupy-kernel-cache).
+# cupy's compiled kernels, kept in a named volume (compose.yaml cupy-kernel-cache).
 _KERNEL_CACHE_SH = 'find "${CUPY_CACHE_DIR:-$HOME/.cupy/kernel_cache}" -name "*.cubin" 2>/dev/null | wc -l'
 
 
@@ -2147,7 +2149,7 @@ VIZ_LAYERS = ('occ', 'orig_hgp', 'hgp', 'traj', 'frontiers', 'pose', 'map')   # 
 VIZ_MAX_PANELS = 4                   # sim_viz.py MAX_PANELS
 # Ctrl-C to the viewer, then this long for its leave (0.5 s per subscription: 4 agents x 7 layers
 # take 14.5 s) before SIGTERM. A docker stop of sim-viz gets the same: its command traps the SIGTERM,
-# Ctrl-Cs the viewer and waits, within the same 30 s (compose.stack.yaml stop_grace_period).
+# Ctrl-Cs the viewer and waits, within the same 30 s (compose.yaml stop_grace_period).
 VIZ_STOP_GRACE_S = 30.0
 VIZ_SNAPSHOT_IN = '/tmp/sim_viz_snapshot.png'    # in sim-viz (the run dir is read-only there); docker cp
 # Not in STACKS: `up` never starts it, `viz` does, on the running session.
@@ -2420,7 +2422,7 @@ def _volume_source(v: Any) -> str:
 def override_problems(doc: Dict[str, Any]) -> List[str]:
     out = []
     if doc.get('networks'):
-        out.append('top-level networks (the rover-sim network is defined in compose.stack.yaml only)')
+        out.append('top-level networks (the rover-sim network is defined in compose.yaml only)')
     for name, svc in sorted((doc.get('services') or {}).items()):
         svc = svc or {}
         for key in OVERRIDE_FORBIDDEN:
@@ -2433,10 +2435,10 @@ def override_problems(doc: Dict[str, Any]) -> List[str]:
 
 
 def local_override() -> Optional[Path]:
-    """docker/compose.local.yaml is shared with the legacy docker/compose.yaml. Append it
-    only if it overrides this stack's services: an override of the legacy `rover-sim`
-    service would add a broken service to this project. Refuse one that could undo the
-    sim's isolation (OVERRIDE_FORBIDDEN)."""
+    """docker/compose.local.yaml (gitignored): this machine's overrides of the sim's services.
+    Append it only if it overrides only services this file has: one of another service (the
+    removed single-container sim's `rover-sim`) would add a broken service to the project.
+    Refuse one that could undo the sim's isolation (OVERRIDE_FORBIDDEN)."""
     if not LOCAL_COMPOSE_FILE.is_file():
         return None
     try:
@@ -2445,8 +2447,8 @@ def local_override() -> Optional[Path]:
         raise SimError('%s: %s' % (LOCAL_COMPOSE_FILE, e))
     foreign = sorted(set((doc.get('services') or {})) - set(stack_services()))
     if foreign:
-        warn('not applying %s to the stack: it overrides service(s) %s, which only the legacy '
-             'docker/compose.yaml has' % (LOCAL_COMPOSE_FILE.name, ', '.join(foreign)))
+        warn('not applying %s: it overrides service(s) %s, which docker/compose.yaml does not have '
+             '(the removed single-container sim\'s?)' % (LOCAL_COMPOSE_FILE.name, ', '.join(foreign)))
         return None
     problems = override_problems(doc)
     if problems:
@@ -2466,7 +2468,7 @@ def compose_cmd(profiles: Sequence[str] = ()) -> List[str]:
     return cmd
 
 
-# CPU budget (each service's cpuset in compose.stack.yaml), for hosts with at least
+# CPU budget (each service's cpuset in compose.yaml), for hosts with at least
 # CPU_BUDGET_MIN cores. The first HOST_CPUS cores are left to the host: X, docker and
 # the fleet C2 stack, which the sim must never starve. sim-gazebo gets GAZEBO_CPUS cores
 # that no other sim container may use, because physics has to keep real time (RTF
@@ -2641,6 +2643,36 @@ def image_provenance(images: Dict[str, str]) -> List[str]:
 
 def gpu_available() -> bool:
     return shutil.which('nvidia-smi') is not None
+
+
+# A file under each of the sim's bind mounts (docker/compose.yaml x-sim-volumes). A bind mount
+# pins the host directory it was made from: one the host has since replaced (a git operation that
+# removed and recreated it) shows up empty in a container created before, while compose reuses
+# that container as it is (2026-10-20: sim-drive's /rover_sim/zenoh was empty, the router could
+# not read its config, and nothing came up).
+MOUNT_PROBES = ('/rover_sim/scripts/sim.py', '/rover_sim/zenoh/session.json5', '/rover_sim/config/sim.env')
+
+
+def stale_mounts(names: Sequence[str]) -> List[str]:
+    """The containers that do not see this checkout's files through their mounts."""
+    probe = ['test'] + ' -a '.join('-e %s' % f for f in MOUNT_PROBES).split()
+    rcs = parallel(lambda n: dexec(n, probe, check=False).returncode, list(names))
+    return [n for n, rc in zip(names, rcs) if rc != 0]
+
+
+def refresh_stale(names: Sequence[str], profiles: Sequence[str], run_dir: Path) -> None:
+    """Recreate the running containers whose mounts went stale (stale_mounts), and check again."""
+    stale = stale_mounts(names)
+    if not stale:
+        return
+    warn('%s: the mounts no longer show this checkout\'s files (a mounted directory was replaced on the host '
+         'since the container was created): recreating %s' % (', '.join(stale), 'them' if len(stale) > 1 else 'it'))
+    sh(compose_cmd(profiles) + ['up', '-d', '--force-recreate'] + list(stale), capture=False, env=compose_env(run_dir))
+    wait_running(stale)
+    stale = stale_mounts(stale)
+    if stale:
+        raise SimError('%s still does not see this checkout through its mounts (%s): scripts/sim.py down '
+                       '--containers, then up' % (', '.join(stale), ', '.join(MOUNT_PROBES)))
 
 
 def wait_running(names: Sequence[str], timeout: float = 30.0) -> None:
@@ -2938,7 +2970,7 @@ class Proc(NamedTuple):
 
 def private_pid_namespace(name: str) -> bool:
     """Whether signalling processes inside the container can only reach its own: a
-    compose.stack.yaml container with no `pid:` (HostConfig.PidMode empty)."""
+    compose.yaml container with no `pid:` (HostConfig.PidMode empty)."""
     c = docker_inspect('container', sim_only(name))
     if c is None:
         return False
@@ -2966,7 +2998,7 @@ def stop_targets(procs: Sequence[Proc], match: Optional[str] = None) -> Tuple[Li
     Everything else came from a docker exec.
 
     Fails closed: unless PID 1 is docker-init (or tini), this is not the private PID
-    namespace of a compose.stack.yaml container (in the host's, PID 1 is the host's
+    namespace of a compose.yaml container (in the host's, PID 1 is the host's
     init), and nothing is a target."""
     init = next((p for p in procs if p.pid == 1), None)
     if init is None or not re.search(r'(^|/)(docker-init|tini)( |$)', init.cmd):
@@ -4257,6 +4289,7 @@ def cmd_up(args: argparse.Namespace) -> int:
     sh(compose_cmd(profiles) + ['up', '-d'] + (services if args.partial else []),
        capture=False, env=compose_env(run_dir))
     wait_running(services)
+    refresh_stale(services, profiles, run_dir)
     ensure_run_dir(run_dir)
     problems = check_isolation()
     if problems:
@@ -4403,6 +4436,7 @@ def cmd_viz(args: argparse.Namespace) -> int:
     stop_viz()
     sh(compose_cmd([VIZ_PROFILE]) + ['up', '-d', VIZ_CONTAINER], capture=False, env=compose_env(run_dir))
     wait_running([VIZ_CONTAINER])
+    refresh_stale([VIZ_CONTAINER], [VIZ_PROFILE], run_dir)
     problems = check_isolation()
     if problems:
         print('isolation: BROKEN\n  - ' + '\n  - '.join(problems))

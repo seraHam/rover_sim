@@ -1227,7 +1227,7 @@ class Json5AndZenoh(unittest.TestCase):
 
 class ComposeFile(unittest.TestCase):
     def setUp(self):
-        self.doc = yaml.safe_load((REPO / 'docker' / 'compose.stack.yaml').read_text())
+        self.doc = yaml.safe_load((REPO / 'docker' / 'compose.yaml').read_text())
 
     def test_isolated_network(self):
         net = self.doc['networks']['rover-sim']
@@ -2132,7 +2132,7 @@ class Phase3Panes(unittest.TestCase):
             self.assertIsNone(sim.dlio_scripts_problem(sim.read_pins()))
 
     def test_compose_mounts_pinned_scripts(self):
-        doc = yaml.safe_load((REPO / 'docker' / 'compose.stack.yaml').read_text())
+        doc = yaml.safe_load((REPO / 'docker' / 'compose.yaml').read_text())
         for name, svc in doc['services'].items():
             mounts = [v for v in svc['volumes'] if isinstance(v, dict)]
             if name not in ('sim-dlio-jr', 'sim-dlio-rr'):
@@ -2924,7 +2924,7 @@ class Phase4Mapping(unittest.TestCase):
                     self.assertEqual(ran.get(e['fqn'].replace('JR02', a.name)), e['container'], (name, a.name))
 
     def test_compose_mounts(self):
-        doc = yaml.safe_load((REPO / 'docker' / 'compose.stack.yaml').read_text())
+        doc = yaml.safe_load((REPO / 'docker' / 'compose.yaml').read_text())
         want = {'sim-mapping': [('config/mapping', '/mapping_config')],
                 'sim-elevation': [('config/elevation', '/usr/local/share/rover/elevation'),
                                   ('scripts/wait_zenoh_ready.py', '/usr/local/lib/rover/wait_zenoh_ready.py')]}
@@ -3553,7 +3553,7 @@ class PausedBringUp(unittest.TestCase):
                 'tmux_sessions': lambda: [], 'running_sim_containers': lambda: [], 'busy_containers': lambda n: [],
                 'prepare_run_dir': lambda r: None,
                 'sh': lambda args, **k: asked.setdefault('compose', list(args)),
-                'compose_env': lambda run_dir: {}, 'wait_running': lambda s: None, 'ensure_run_dir': lambda r: None,
+                'compose_env': lambda run_dir: {}, 'wait_running': lambda s: None, 'ensure_run_dir': lambda r: None, 'stale_mounts': lambda names: [],
                 'check_isolation': lambda: [], 'write_session_file': lambda s, r: None,
                 'rotate_rtf_log': lambda r: None, 'clear_ros_logs': lambda n: None, 'make_log_dir': lambda: logs,
                 'generate_steps': lambda stacks: [],
@@ -3591,7 +3591,7 @@ class PausedBringUp(unittest.TestCase):
                 'tmux_sessions': lambda: [], 'running_sim_containers': lambda: [], 'busy_containers': lambda n: [],
                 'prepare_run_dir': lambda r: None, 'sh': lambda *a, **k: order.append('compose up'),
                 'compose_env': lambda run_dir: {},
-                'wait_running': lambda s: None, 'ensure_run_dir': lambda r: None, 'check_isolation': lambda: [],
+                'wait_running': lambda s: None, 'ensure_run_dir': lambda r: None, 'check_isolation': lambda: [], 'stale_mounts': lambda names: [],
                 'write_session_file': lambda s, r: None, 'rotate_rtf_log': lambda r: None,
                 'clear_ros_logs': lambda n: None, 'make_log_dir': lambda: logs,
                 'generate_steps': lambda stacks: [lambda s, c: order.append('generate')],
@@ -4254,7 +4254,7 @@ class GoalsStack(unittest.TestCase):
                     'mapping_config_problem': lambda session, pins: None,
                     'tmux_sessions': lambda: [], 'running_sim_containers': lambda: [], 'busy_containers': lambda n: [],
                     'prepare_run_dir': lambda r: None, 'sh': lambda *a, **k: None, 'compose_env': lambda run_dir: {},
-                    'wait_running': lambda s: None, 'ensure_run_dir': lambda r: None, 'check_isolation': lambda: [],
+                    'wait_running': lambda s: None, 'ensure_run_dir': lambda r: None, 'check_isolation': lambda: [], 'stale_mounts': lambda names: [],
                     'write_session_file': lambda s, r: None, 'rotate_rtf_log': lambda r: None,
                     'clear_ros_logs': lambda n: None, 'make_log_dir': lambda: logs, 'generate_steps': lambda stacks: [],
                     'bring_up': lambda session, plan, ctx, log_dir, before_unpause=None: order.append(
@@ -4540,7 +4540,7 @@ class VizCommand(unittest.TestCase):
                        'grant_x_access': lambda: calls.append('xhost'), 'stop_processes': stop,
                        'tmux': lambda *a, **k: calls.append(('tmux',) + a),
                        'sh': compose, 'compose_env': lambda run_dir: {}, 'wait_running': lambda n: calls.append(
-                           ('wait', list(n))),
+                           ('wait', list(n))), 'stale_mounts': lambda names: [],
                        'start_stack': lambda st, panes, log_dir: calls.append(('start', st.name, panes)) or 'rsim-viz',
                        'wait_nodes_started': lambda plan, log_dir, timeout: nodes}
             env = {'DISPLAY': display} if display else {}
@@ -4615,7 +4615,7 @@ class VizCommand(unittest.TestCase):
     def test_docker_stop_is_a_ctrl_c(self):
         # docker-init gives a stop's SIGTERM to the container's command alone, and the kernel SIGKILLs the
         # exec'd viewer once it exits: sim-viz's command traps it, Ctrl-Cs the viewer and waits for it.
-        doc = yaml.safe_load((REPO / 'docker' / 'compose.stack.yaml').read_text())
+        doc = yaml.safe_load((REPO / 'docker' / 'compose.yaml').read_text())
         svc = doc['services']['sim-viz']
         cmd = svc['command']
         self.assertEqual(cmd[:2], ['bash', '-c'])
@@ -4705,6 +4705,41 @@ class VizCommand(unittest.TestCase):
         self.assertEqual(compose[-2:], ['down', '--remove-orphans'])
         self.assertEqual([compose[i + 1] for i, a in enumerate(compose) if a == '--profile'], ['gpu', 'viz'])
 
+    def test_stale_mounts(self):
+        # The probe: one docker exec per container, every mounted file at once.
+        seen = []
+        with mock.patch.object(sim, 'dexec', lambda name, args, **kw: seen.append((name, args)) or mock.Mock(
+                returncode=0 if name == 'sim-gazebo' else 1)):
+            self.assertEqual(sim.stale_mounts(['sim-gazebo', 'sim-drive']), ['sim-drive'])
+        self.assertEqual(seen[0][1], ['test', '-e', sim.MOUNT_PROBES[0], '-a', '-e', sim.MOUNT_PROBES[1], '-a', '-e',
+                                      sim.MOUNT_PROBES[2]])
+        # Each probe is a file the compose file mounts into every sim container.
+        compose = (REPO / 'docker' / 'compose.yaml').read_text()
+        for f in sim.MOUNT_PROBES:
+            self.assertIn(':%s' % f.rsplit('/', 1)[0], compose, f)
+
+    def test_refresh_stale_recreates_then_checks(self):
+        calls, answers = [], [['sim-drive'], []]
+        patches = {'stale_mounts': lambda names: calls.append(('probe', list(names))) or answers.pop(0),
+                   'sh': lambda args, **kw: calls.append(('compose', args[-3:])),
+                   'compose_cmd': lambda profiles: ['docker', 'compose'], 'compose_env': lambda r: {},
+                   'wait_running': lambda names: calls.append(('wait', list(names)))}
+        with mock.patch.multiple(sim, **patches), contextlib.redirect_stderr(io.StringIO()) as err:
+            sim.refresh_stale(['sim-drive', 'sim-gazebo'], [], Path('/tmp/x'))
+        self.assertEqual(calls, [('probe', ['sim-drive', 'sim-gazebo']), ('compose', ['-d', '--force-recreate', 'sim-drive']),
+                                 ('wait', ['sim-drive']), ('probe', ['sim-drive'])])
+        self.assertIn('recreating it', err.getvalue())
+        answers[:] = [['sim-drive'], ['sim-drive']]
+        with mock.patch.multiple(sim, **patches), contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaisesRegex(sim.SimError, 'still does not see this checkout'):
+                sim.refresh_stale(['sim-drive'], [], Path('/tmp/x'))
+
+    def test_router_checks_its_config_before_its_marker(self):
+        p = sim.zenoh_panes(SMOKE, sim.RunContext(run_dir=Path(sim.RUN_DIR_DEFAULT)))[0]
+        self.assertIn('ZENOH_ROUTER_CONFIG_URI', p.waits)
+        inner = sim.pane_inner(p)
+        self.assertLess(inner.index('ZENOH_ROUTER_CONFIG_URI'), inner.index(sim.node_marker()))
+
     def test_down_waits_for_goal_relays_leave(self):
         # sim-mighty's goal_relay.py leaves one entity at a time: 4 agents, ~17 s, longer than 10 s.
         seen = {}
@@ -4748,7 +4783,7 @@ class VizCommand(unittest.TestCase):
         self.assertEqual(sim.cpuset_var('sim-viz'), 'ROVER_SIM_CPUSET_VIZ')
 
     def test_compose_service(self):
-        svc = yaml.safe_load((REPO / 'docker' / 'compose.stack.yaml').read_text())['services']['sim-viz']
+        svc = yaml.safe_load((REPO / 'docker' / 'compose.yaml').read_text())['services']['sim-viz']
         self.assertEqual(svc['profiles'], ['viz'])
         self.assertTrue(svc['image'].startswith('${GAZEBO_IMAGE:?'))
         self.assertEqual(svc['networks'], ['rover-sim'])

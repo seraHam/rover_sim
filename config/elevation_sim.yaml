@@ -1,7 +1,0 @@
-# Sim overrides of the rovers' elevation_mapping_cupy config (core_param.yaml,
-# setups/dlio/base.yaml), loaded on top of it by elevation_mapping_sim.launch.py.
-/**:
-  ros__parameters:
-    map_length: 20.0    # rovers: 60.0. Robot-centered window [m]; cost grows with its area.
-    # scripts/elevation_start.py relays this to planning_occ_2d_topic once the map is ready.
-    planning_occupancy_grid_topic: planning_occ_2d_topic_ungated

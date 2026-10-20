@@ -3,7 +3,7 @@
 // docker/dev/zenoh_router_config.json5. Keys not listed here take zenoh defaults.
 //
 // ISOLATION: this host also runs the fleet C2 router on *:7447. This router listens
-// on 7447 only inside the internal docker network `rover-sim` (docker/compose.stack.yaml):
+// on 7447 only inside the internal docker network `rover-sim` (docker/compose.yaml):
 // no port is published, the network has no route out, and the router dials nothing and
 // scouts nothing. The sim names (JR81, RR83, ...) and the fleet-wide root topics
 // (/trajs, /exploration/return_home) must never meet the fleet's graph.

@@ -3,8 +3,8 @@
 #
 #   scripts/sim.py up office_explore
 #
-# Starts are the legacy launch/office_explore_demo.yaml ones, facing into the building,
-# except RR83's: the legacy (16.5, -17.0) is in a 1.5 m corridor, 0.62 m from a wall
+# Starts are the old tmuxp office_explore_demo's (removed), facing into the building,
+# except RR83's: the old (16.5, -17.0) is in a 1.5 m corridor, 0.62 m from a wall
 # corner, so it starts in the alcove at (13.0, -14.5) facing out of it. Clearance from
 # the nearest wall (2D, the world's box collisions): JR81 1.20 m, JR82 1.20 m,
 # RR83 1.19 m, RR84 1.10 m.
