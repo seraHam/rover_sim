@@ -36,6 +36,7 @@ x-sim-volumes:
   # No default: sim.py sets it to a dir it has checked only you can write
   # (/tmp/rover_sim-<uid>/run), as the containers run as root and execute files there.
   - &vol-run ${ROVER_SIM_RUN:?set by scripts/sim.py; plain compose needs ROVER_SIM_RUN=<a dir only you can write>}:/rover_sim/run
+  - &vol-run-ro ${ROVER_SIM_RUN:?set by scripts/sim.py; plain compose needs ROVER_SIM_RUN=<a dir only you can write>}:/rover_sim/run:ro
   # The DLIO pane scripts, as on the robot: its dlio_ws compose bind-mounts the pinned
   # checkout's scripts/ over the copy the image bakes. Here that is build_images.sh's checkout
   # of DLIO_SHA, so a pin bump follows. Never created when missing (it would be root's):
@@ -166,7 +167,14 @@ services:
     container_name: sim-elevation
     hostname: sim-elevation
     cpuset: ${ROVER_SIM_CPUSET_ELEVATION:-}
-    volumes: [*vol-zenoh, *vol-scripts, *vol-config, *vol-run, *vol-elevation-overlays, *vol-orin-probe]
+    # cupy compiles each kernel on first use and keeps it in ~/.cupy/kernel_cache, which the
+    # robot's disk keeps. In the container's layer it is gone whenever compose recreates
+    # it (a new image or compose change), and then 4 mappers compile about a minute of
+    # kernels at once right after the unpause, the first cloud being the first use: a
+    # start-up burst on the shared cores (Phase 5: the elevation grids came 24 s late and
+    # a graph stall made a parked DLIO diverge). A named volume keeps them.
+    volumes: [*vol-zenoh, *vol-scripts, *vol-config, *vol-run, *vol-elevation-overlays, *vol-orin-probe,
+              "cupy-kernel-cache:/root/.cupy"]
     deploy:
       resources:
         reservations:
@@ -181,6 +189,48 @@ services:
     container_name: sim-mighty
     hostname: sim-mighty
     cpuset: ${ROVER_SIM_CPUSET_MIGHTY:-}
+    # Its nodes, goal_relay.py and demo_eval.py's probe only read the run dir (spawn.yaml,
+    # session.json, frame_align.yaml): read-only, as sim-viz has it.
+    volumes: [*vol-zenoh, *vol-scripts, *vol-config, *vol-run-ro]
+
+  # scripts/sim_viz.py, the live 2D view of the agents, which `scripts/sim.py viz` starts on a
+  # running session (profile viz: `up` never does). Gazebo's image has rclpy, numpy and cv2; X as
+  # sim-gazebo has it, but the socket read-only (connecting needs no write). It only reads the run dir
+  # (spawn.yaml). Its cores are off gzserver's and their SMT siblings (sim.py cpu_budget).
+  # The viewer leaves the graph 0.5 s per subscription. `viz --stop` and `down` Ctrl-C it and wait.
+  # A docker stop (compose stop/down, a recreate) would not: docker-init hands SIGTERM to this
+  # command only, and once it exits the kernel SIGKILLs every docker exec'd process, the viewer's
+  # subscriptions all undeclared at once. So the command traps TERM, Ctrl-Cs the viewers and waits
+  # for their leave within stop_grace_period ([s]: pgrep must not match this line). docker kill does not.
+  sim-viz:
+    <<: *sim
+    profiles: [viz]
+    image: ${GAZEBO_IMAGE:?set in docker/stacks.env; pass --env-file docker/stacks.env}
+    container_name: sim-viz
+    hostname: sim-viz
+    cpuset: ${ROVER_SIM_CPUSET_VIZ:-}
+    command:
+      - bash
+      - -c
+      - >-
+        trap 'pkill -INT -f "[s]im_viz.py";
+        while pgrep -f "[s]im_viz.py" >/dev/null; do sleep 0.5; done; exit 0' TERM;
+        sleep infinity & wait
+    stop_grace_period: 30s
+    environment:
+      DISPLAY: ${DISPLAY:-}
+      QT_X11_NO_MITSHM: "1"           # private IPC: no X shared memory
+      NO_AT_BRIDGE: "1"               # GTK: no accessibility bus in the container
+    volumes:
+      - *vol-zenoh
+      - *vol-scripts
+      - *vol-config
+      - *vol-run-ro
+      - /tmp/.X11-unix:/tmp/.X11-unix:ro   # X over the unix socket, not the network
+
+volumes:
+  cupy-kernel-cache:
+    name: rover-sim-cupy-kernel-cache
 
 networks:
   rover-sim:

@@ -1,0 +1,261 @@
+    # Agent @NS@: the robot's own topics and frames (rviz_config fills in the name, a colour and
+    # the mapping: gpu displays). Few displays are on: each one on is a subscription (a Map is two)
+    # that the graph undeclares at once when RViz closes. Topics a publisher sends best effort are
+    # read best effort; the planner's grids reliable, the latched persistent map transient local.
+    - Class: rviz_common/Group
+      Displays:
+        - Alpha: 1
+          Class: rviz_default_plugins/Axes
+          Enabled: true
+          Length: 0.6000000238418579
+          Name: @NS@ base_link
+          Radius: 0.05000000074505806
+          Reference Frame: @NS@/base_link
+          Value: true
+        - Alpha: 1
+          Autocompute Intensity Bounds: true
+          Autocompute Value Bounds:
+            Max Value: 10
+            Min Value: -10
+            Value: true
+          Axis: Z
+          Channel Name: intensity
+          Class: rviz_default_plugins/PointCloud2
+          Color: @COLOR@
+          Color Transformer: FlatColor
+          Decay Time: 0
+          Enabled: true
+          Invert Rainbow: false
+          Max Color: 255; 255; 255
+          Max Intensity: 4096
+          Min Color: 0; 0; 0
+          Min Intensity: 0
+          Name: @NS@ dlio deskewed cloud
+          Position Transformer: XYZ
+          Selectable: true
+          Size (Pixels): 2
+          Size (m): 0.029999999329447746
+          Style: Flat Squares
+          Topic:
+            Depth: 1
+            Durability Policy: Volatile
+            Filter size: 10
+            History Policy: Keep Last
+            Reliability Policy: Best Effort
+            Value: /@NS@/dlio/odom_node/pointcloud/deskewed
+          Use Fixed Frame: true
+          Use rainbow: true
+          Value: true
+        # Raw scan, in @NS@/lidar: needs rover_description's latched base_link -> lidar.
+        - Alpha: 1
+          Autocompute Intensity Bounds: true
+          Autocompute Value Bounds:
+            Max Value: 10
+            Min Value: -10
+            Value: true
+          Axis: Z
+          Channel Name: intensity
+          Class: rviz_default_plugins/PointCloud2
+          Color: @COLOR@
+          Color Transformer: Intensity
+          Decay Time: 0
+          Enabled: false
+          Invert Rainbow: false
+          Max Color: 255; 255; 255
+          Max Intensity: 255
+          Min Color: 0; 0; 0
+          Min Intensity: 0
+          Name: @NS@ livox/lidar (raw)
+          Position Transformer: XYZ
+          Selectable: true
+          Size (Pixels): 2
+          Size (m): 0.019999999552965164
+          Style: Points
+          Topic:
+            Depth: 1
+            Durability Policy: Volatile
+            Filter size: 10
+            History Policy: Keep Last
+            Reliability Policy: Best Effort
+            Value: /@NS@/livox/lidar
+          Use Fixed Frame: true
+          Use rainbow: true
+          Value: false
+        - Alpha: 0.699999988079071
+          Class: rviz_default_plugins/Map
+          Color Scheme: map
+          Draw Behind: false
+          Enabled: true
+          Name: @NS@ occ_2d_topic (the planner's grid)
+          Topic:
+            Depth: 1
+            Durability Policy: Volatile
+            Filter size: 10
+            History Policy: Keep Last
+            Reliability Policy: Reliable
+            Value: /@NS@/occ_2d_topic
+          Update Topic:
+            Depth: 5
+            Durability Policy: Volatile
+            History Policy: Keep Last
+            Reliability Policy: Reliable
+            Value: /@NS@/occ_2d_topic_updates
+          Use Timestamp: false
+          Value: true
+        - Alpha: 0.4000000059604645
+          Class: rviz_default_plugins/Map
+          Color Scheme: map
+          Draw Behind: true
+          Enabled: true
+          Name: @NS@ persistent_map/grid
+          Topic:
+            Depth: 1
+            Durability Policy: Transient Local
+            Filter size: 10
+            History Policy: Keep Last
+            Reliability Policy: Reliable
+            Value: /@NS@/persistent_map/grid
+          Update Topic:
+            Depth: 5
+            Durability Policy: Volatile
+            History Policy: Keep Last
+            Reliability Policy: Reliable
+            Value: /@NS@/persistent_map/grid_updates
+          Use Timestamp: false
+          Value: true
+        - Alpha: 0.699999988079071
+          Class: rviz_default_plugins/Map
+          Color Scheme: costmap
+          Draw Behind: true
+          Enabled: false
+          Name: @NS@ esdf_2d_topic
+          Topic:
+            Depth: 1
+            Durability Policy: Volatile
+            Filter size: 10
+            History Policy: Keep Last
+            Reliability Policy: Reliable
+            Value: /@NS@/esdf_2d_topic
+          Update Topic:
+            Depth: 5
+            Durability Policy: Volatile
+            History Policy: Keep Last
+            Reliability Policy: Reliable
+            Value: /@NS@/esdf_2d_topic_updates
+          Use Timestamp: false
+          Value: false
+        - Alpha: 0.699999988079071
+          Class: rviz_default_plugins/Map
+          Color Scheme: map
+          Draw Behind: false
+          Enabled: false
+          Name: @NS@ voxel/occ_2d_topic (global_mapper)
+          Topic:
+            Depth: 1
+            Durability Policy: Volatile
+            Filter size: 10
+            History Policy: Keep Last
+            Reliability Policy: Best Effort
+            Value: /@NS@/voxel/occ_2d_topic
+          Update Topic:
+            Depth: 5
+            Durability Policy: Volatile
+            History Policy: Keep Last
+            Reliability Policy: Best Effort
+            Value: /@NS@/voxel/occ_2d_topic_updates
+          Use Timestamp: false
+          Value: false
+@MAPPING_DISPLAYS@
+        - Class: rviz_default_plugins/MarkerArray
+          Enabled: true
+          Name: @NS@ trajectory (mighty)
+          Namespaces:
+            {}
+          Topic:
+            Depth: 5
+            Durability Policy: Volatile
+            History Policy: Keep Last
+            Reliability Policy: Best Effort
+            Value: /@NS@/traj_committed_colored
+          Value: true
+        - Class: rviz_default_plugins/MarkerArray
+          Enabled: false
+          Name: @NS@ global path (mighty)
+          Namespaces:
+            {}
+          Topic:
+            Depth: 5
+            Durability Policy: Volatile
+            History Policy: Keep Last
+            Reliability Policy: Best Effort
+            Value: /@NS@/hgp_path_marker
+          Value: false
+        - Alpha: 1
+          Class: rviz_default_plugins/PointStamped
+          Color: @COLOR@
+          Enabled: false
+          History Length: 1
+          Name: @NS@ point_G_term (mighty's terminal goal)
+          Radius: 0.30000001192092896
+          Topic:
+            Depth: 5
+            Durability Policy: Volatile
+            Filter size: 10
+            History Policy: Keep Last
+            Reliability Policy: Best Effort
+            Value: /@NS@/point_G_term
+          Value: false
+        - Alpha: 1
+          Axes Length: 1
+          Axes Radius: 0.10000000149011612
+          Class: rviz_default_plugins/Pose
+          Color: @COLOR@
+          Enabled: true
+          Head Length: 0.30000001192092896
+          Head Radius: 0.20000000298023224
+          Name: @NS@ term_goal (goal_selector)
+          Shaft Length: 0.5
+          Shaft Radius: 0.05000000074505806
+          Shape: Arrow
+          Topic:
+            Depth: 5
+            Durability Policy: Volatile
+            Filter size: 10
+            History Policy: Keep Last
+            Reliability Policy: Best Effort
+            Value: /@NS@/term_goal
+          Value: true
+        - Class: rviz_default_plugins/MarkerArray
+          Enabled: @EXPLORE@
+          Name: @NS@ exploration/frontiers
+          Namespaces:
+            {}
+          Topic:
+            Depth: 5
+            Durability Policy: Volatile
+            History Policy: Keep Last
+            Reliability Policy: Best Effort
+            Value: /@NS@/exploration/frontiers
+          Value: @EXPLORE@
+        - Alpha: 1
+          Axes Length: 1
+          Axes Radius: 0.10000000149011612
+          Class: rviz_default_plugins/Pose
+          Color: @COLOR@
+          Enabled: false
+          Head Length: 0.30000001192092896
+          Head Radius: 0.30000001192092896
+          Name: @NS@ exploration/current_goal
+          Shaft Length: 1
+          Shaft Radius: 0.10000000149011612
+          Shape: Arrow
+          Topic:
+            Depth: 5
+            Durability Policy: Volatile
+            Filter size: 10
+            History Policy: Keep Last
+            Reliability Policy: Best Effort
+            Value: /@NS@/exploration/current_goal
+          Value: false
+      Enabled: true
+      Name: @NS@

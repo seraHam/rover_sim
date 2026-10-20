@@ -6,12 +6,15 @@ script brings them up and runs every node as a `docker exec` from a host tmux se
 per stack (rsim-<stack>), the way the robot's *_host_tmux.sh units do, so Ctrl-C / Up /
 Enter in a pane restarts that one node.
 
-  scripts/sim.py up <session> [--stacks a,b] [--partial] [--no-arm] [--dry-run]
+  scripts/sim.py up <session> [--stacks a,b] [--partial] [--no-arm] [--rviz] [--dry-run]
   scripts/sim.py down [--containers]
   scripts/sim.py attach [<stack>]
   scripts/sim.py status [--maps]
   scripts/sim.py arm [<ns>...] [--now] [--timeout S]     (safety_node AUTO)
   scripts/sim.py disarm [<ns>...]
+  scripts/sim.py start rviz|goals        (restart that one stack on the running session)
+  scripts/sim.py viz [--agents a,b] [--layers l,m] [--follow] [--stop] [--snapshot PNG [--snapshot-after S]]
+                                         (the 2D viewer, sim_viz.py; --snapshot: one frame, no window)
   scripts/sim.py loadtest [--agents N] [--variant V|all ...]
   scripts/sim.py compose <docker compose args...>
   scripts/sim.py cpus gz|rest            (inside sim-gazebo: its panes' CPU split)
@@ -23,44 +26,69 @@ Enter in a pane restarts that one node.
                                 # metres on a bare floor (src/rover_sim/config/worlds.yaml)
   gui: false                    # gzclient on $DISPLAY
   mapping: fallback             # gpu (parity) | fallback (no GPU, "not parity")
-  rviz: false
-  auto_arm: false               # true: put each safety_node in AUTO once its DLIO tracks
-  agents:                       # pose: world frame, [x m, y m, yaw deg]
-    - {name: JR81, class: jr, pose: [-2.0, 0.0, 0.0]}
-    - {name: RR83, class: rr, pose: [2.0, 0.0, 180.0]}
+  rviz: false                   # RViz on $DISPLAY (<run>/rviz/session.rviz)
+  planner: true                 # mighty_hw.sh's panes per agent (default true)
+  demo: swap                    # none | swap (start <-> goals, repeatedly) | explore
+  auto_arm: true                # true: put each safety_node in AUTO once its DLIO tracks
+  agents:                       # pose: world frame, [x m, y m, yaw deg]; goals [x, y] likewise
+    - {name: JR81, class: jr, pose: [-2.0, 0.0, 0.0], goals: [[2.0, 0.0]]}
+    - {name: RR83, class: rr, pose: [2.0, 0.0, 180.0], goals: [[-2.0, 0.0]]}
 
 Agent names are a class prefix (JR, RR) plus two digits. The digits must be unique
 across classes: mighty takes its agent id from them. Each class is calibrated from one
 real robot, the one its DLIO image is built for (docker/stacks.env DLIO_<CLASS>_ROBOT).
+ROVER_SIM_AGENTS=JR81:jr,RR82:rr,... replaces the session's agents for one `up`
+(apply_agents_env). Each may carry its own pose (JR85:jr:1.0:2.0:90). The others take the
+session's places in order, with their goals; with more agents than the session places, in
+the arena (and empty) every one goes on a 4 m circle round the centre, facing it, its swap goal
+on the far side, past the opposite start (circle_goal); elsewhere the extra ones need a pose.
 
 Stacks are a registry (STACKS below). Each names its containers and builds its panes
-from the session. Phases 1-4 run `zenoh` (the router in sim-drive), `gazebo` (world,
-spawns, sensor bridges, world-><ns>/map), `drive` (teleop + safety_node, rover_description
-per agent), `frame_align` (ground-truth alignment for mighty), `dlio` (DLIO, its seed
-pose and map->odom per agent), `mapping` (global_mapper, map_fusion, persistent_map per
-agent) and, for `mapping: gpu`, `elevation` (the Orin's elevation mapper per agent).
+from the session: `zenoh` (the router in sim-drive), `gazebo` (world, spawns, sensor
+bridges, world-><ns>/map), `drive` (teleop + safety_node, rover_description per agent),
+`frame_align` (ground-truth alignment for mighty), `dlio` (DLIO, its seed pose and
+map->odom per agent), `mapping` (global_mapper, map_fusion, persistent_map per agent), for
+`mapping: gpu` `elevation` (the Orin's elevation mapper per agent), `mighty` (mighty_hw.sh's
+mighty_node, convert_odom_to_state, mpc and goal_selector per agent), with rviz `rviz`, and
+for every planner session `goals` (scripts/goal_relay.py: each agent's first drive, the session's
+goals, and RViz's SetGoal on /sim/goal, to each agent's term_goal_rviz in its own <ns>/map).
 `mapping: fallback` is NOT PARITY: no GPU, so no elevation and no map_fusion; global_mapper
-runs a sim config and grid_relay.py puts its grids on the planner's names. The others are
-placeholders that later phases fill in.
+runs a sim config and grid_relay.py puts its grids on the planner's names.
 
 `up` starts them in waves into a paused world (Stack.wave): first the router and Gazebo,
 whose spawn pane spawns every agent while nothing else is on the graph (wait_spawned; it
-fails if the pane does); then drive, frame_align and DLIO; then mapping; then elevation.
+fails if the pane does); then drive, frame_align and DLIO; then mapping; then elevation;
+then the planner (its wave counts as started only once each mpc has built its NLP:
+Pane.ready); then RViz and the goals.
 Each wave waits until its panes have started their nodes and the containers are idle
 (settle_wave) before the next one starts; a pane that ends before its node starts stops `up`
-there, with the world still paused. Then `up` unpauses physics once, over gazebo
-transport (unpause_physics). A start-up burst in the first seconds of physics costs real
-time, and session joins on a loaded graph stall zenoh delivery for everyone; both made DLIO
-diverge in the Phase 3 and 4 runs, so nothing joins once physics runs. DLIO calibrates its
-IMU only then: there is no IMU while paused.
+there, with the world still paused, and so does a planner pane whose TF gate timed out
+(wait_for_tf.py exits 0 then; <ns>/map -> <ns>/odom is on /tf while paused, so a timeout
+means it is missing). Then `up` unpauses physics once, over gazebo transport
+(unpause_physics). A start-up burst in the first seconds of physics costs real time, and
+session joins on a loaded graph stall zenoh delivery for everyone; both made DLIO diverge in
+the Phase 3 and 4 runs, so no stack joins once physics runs. That holds for RViz and for
+goal_relay.py too: the relay waits for every agent to be in AUTO before it sends a goal, so
+its first goal goes out the moment arming ends, before goal_selector's exploration has sent
+the agent anywhere. RViz's <ns>/base_link -> <ns>/lidar comes latched on /tf_static (gated by
+wait_zenoh_ready.py like every pane), everything else it draws on periodic /tf. DLIO
+calibrates its IMU only after the unpause: there is no IMU while paused.
 
 safety_node starts DISARMED, holding the agent still (zero cmd_vel) while DLIO calibrates
 its IMU, and stays so, as on the robot, until `arm` calls its /<ns>/auto_mode once DLIO
 registers scans from the seed pose. With auto_arm, `up` does that itself. From then on
 /<ns>/cmd_vel_auto drives the agent, and safety_node zeroes the command when cmd_vel_auto
 stops for 1 s. `disarm` calls /<ns>/disarm. Every call is logged to <pane-log dir>/arm.log.
-auto_arm is off by default until Phase 5's mpc publishes cmd_vel_auto: in AUTO without it,
-each safety_node logs a line every 20 ms (about 6.5 KB/s of pane log per agent).
+The planner sessions arm (auto_arm: true), and they do it before the unpause, without the
+DLIO gate: nothing commands motion until DLIO tracks (mpc publishes cmd_vel_auto at 30 Hz from
+its start, zero until mighty_node sends it a path; mighty_node, goal_selector and
+goal_relay.py act on DLIO's estimate), and the arm query's leave, which stalls the planner's
+big graph for a moment, then meets a world with no sensor data. goal_relay.py then drives each
+agent 1.2 m straight ahead in JOY mode, as the operator does before handing a rover to
+autonomy, and back to AUTO: from a cold start mighty plans no path over floor the rover never
+saw (its tilted MID-360 never sees the floor just in front of it). odom_eval runs no planner
+(planner: false): its drives publish cmd_vel_auto themselves, and mpc's zeros would be a
+second publisher there; it arms after the unpause, once DLIO registers scans.
 
 Per-run generated files go to $ROVER_SIM_RUN (default /tmp/rover_sim-<uid>/run), which
 is mounted at /rover_sim/run in every container. It must be yours and writable by no one
@@ -74,7 +102,18 @@ rmw_zenoh 0.1.9, a ROS session that leaves the loaded 4-agent mapping graph all 
 zenoh delivery for everyone for 1-3 s (Phase 4: parity_check's, a probe's, status's own before
 it left one subscription at a time, STATUS_LEAVE_GAP_S): run such tools before or after a
 window that is being graded. `status --maps` also reads the planner's grids, the multi-MB
-persistent map among them.
+persistent map among them. The same holds for any node that leaves: a restarted
+mighty_node undeclares the num_agents - 1 frame_align subscriptions it made (83 with ids up
+to 84), and closing RViz all of its displays' subscriptions. `start rviz|goals` joins the
+running graph (and its old process leaves it): do that outside a graded window too.
+
+`viz` opens scripts/sim_viz.py's live 2D view of the agents (occ_2d_topic, both HGP paths, the
+committed trajectory, the frontiers, DLIO's pose; world frame or following an agent) on $DISPLAY,
+from a container of its own (sim-viz: compose profile viz, never started by `up`; Gazebo's image,
+X like sim-gazebo, cores off gzserver's and their SMT siblings) in tmux session rsim-viz. It joins
+the running graph as `start` does, and leaves it one subscription at a time: `viz --stop` and `down`
+stop it first and wait for that, before anything else goes down (a docker stop of sim-viz waits too:
+compose.stack.yaml). `viz --snapshot PNG` writes one frame of it to PNG on this host, no window.
 
 Host needs: python3 >= 3.8 with PyYAML, tmux, the docker CLI with compose v2.
 """
@@ -83,6 +122,7 @@ import argparse
 import base64
 import copy
 import dataclasses
+import inspect
 import ipaddress
 import json
 import math
@@ -139,7 +179,8 @@ SIM_MAPPING_DIR = REPO / 'config' / 'mapping'
 SIM_MAPPING_IN = '/rover_sim/config/mapping'
 
 # Per-run files (in the run dir; contracts with the sim's own nodes).
-SPAWN_FILE = 'spawn.yaml'            # agents and spawn poses: sim_tf.py, the spawn pane
+SESSION_FILE = 'session.json'        # Session.to_json: status, arm, start, goal_relay.py
+SPAWN_FILE = 'spawn.yaml'            # agents and spawn poses: sim_tf.py, the spawn pane, goal_relay.py
 CALIB_DIR = 'sensor_calib'           # <ns>_lidar_mount.yaml, <ns>_calib.npy
 URDF_DIR = 'urdf'                    # <ns>.urdf, as spawned (xacro output)
 FRAME_ALIGN_FILE = 'frame_align.yaml'
@@ -147,6 +188,9 @@ CLASSES_FILE = 'classes.yaml'        # the checkout's classes.yaml: drive_patter
 TELEOP_FILE = 'teleop_sim.yaml'      # rover_control's teleop file + the sim agents' blocks
 DLIO_LAUNCH_FILE = 'dlio_sim.launch.py'   # the robot's DLIO launch with a per-agent map node name
 MAPPING_RUN_DIR = 'mapping'          # the fallback's param files: robot file + rover_sim overlay
+RVIZ_RUN_DIR = 'rviz'                # session.rviz, from rviz/templates/ (rviz_config)
+RVIZ_FILE = 'session.rviz'
+ARMED_SESSIONS_FILE = 'armed_sessions.json'   # {ns: DLIO session id} of each agent's last arm (arm_z_check)
 ARM_LOG = 'arm.log'                  # in the pane-log dir: every auto_mode / disarm call
 BRINGUP_LOG = 'bringup.log'          # in the pane-log dir: bring_up's waves, load samples, unpause
 RTF_LOG = 'rtf_violations.log'       # appended by livox_sim_bridge.py; any line = run invalid
@@ -159,6 +203,7 @@ TMUX_SIZE = ('220', '56')
 TMUX_HISTORY = 50000                 # scrollback lines per pane (pipe-pane logs keep it all)
 TMUX_PLACEHOLDER = '_starting'
 PANE_SLUG_OPTION = '@rsim_slug'      # tmux pane option: which pane is which (titles are display only)
+PANE_TF_GATE_OPTION = '@rsim_tf_gate'  # 'strict' on a Pane.strict_tf_gate pane: `status` reads its gate
 MAX_PANES_PER_WINDOW = 8             # beyond this tmux runs out of room to split
 
 
@@ -243,8 +288,12 @@ ROBOT_CLASSES = OrderedDict([
 ])
 CLASS_PREFIXES = OrderedDict((k, c.prefix) for k, c in ROBOT_CLASSES.items())  # class -> name prefix
 MAPPING_MODES = ('gpu', 'fallback')
+# What the goals stack does with the planner (goal_relay.py --mode): swap drives each agent
+# between its start and its goals, over and over; explore leaves the goals to goal_selector's
+# exploration (hw_goal_selector.yaml has it on), as on the robot; none sends nothing.
+DEMOS = ('none', 'swap', 'explore')
 IDENT_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_.-]*$')
-SESSION_KEYS = ('name', 'world', 'gui', 'mapping', 'rviz', 'auto_arm', 'agents')
+SESSION_KEYS = ('name', 'world', 'gui', 'mapping', 'rviz', 'auto_arm', 'planner', 'demo', 'agents')
 AGENT_KEYS = ('name', 'class', 'pose', 'goals')
 
 
@@ -281,7 +330,10 @@ class Session:
     agents: Tuple[Agent, ...]
     source: str = ''
     gui: bool = False
-    auto_arm: bool = False             # TODO(Phase 5): sessions with mpc arm; see the module docstring
+    auto_arm: bool = False             # the planner sessions arm; see the module docstring
+    planner: bool = True
+    demo: str = 'none'
+    agents_env: str = ''               # the ROVER_SIM_AGENTS this `up` took its agents from
 
     @property
     def num_agents(self) -> int:
@@ -291,16 +343,22 @@ class Session:
     def by_class(self, cls: str) -> List[Agent]:
         return [a for a in self.agents if a.cls == cls]
 
+    def settings(self) -> 'OrderedDict[str, Any]':
+        """The session's own keys, as its YAML spells them (agents aside)."""
+        return OrderedDict([('name', self.name), ('world', self.world), ('gui', self.gui), ('mapping', self.mapping),
+                            ('rviz', self.rviz), ('auto_arm', self.auto_arm), ('planner', self.planner),
+                            ('demo', self.demo)])
+
     def to_json(self) -> Dict[str, Any]:
-        return OrderedDict([
-            ('name', self.name), ('world', self.world), ('gui', self.gui), ('mapping', self.mapping),
-            ('rviz', self.rviz), ('auto_arm', self.auto_arm), ('num_agents', self.num_agents),
-            ('source', self.source),
-            ('agents', [OrderedDict([('name', a.name), ('class', a.cls), ('id', a.id),
-                                     ('pose', [a.x, a.y, a.yaw_deg]),
-                                     ('goals', [list(g) for g in a.goals])])
-                        for a in self.agents]),
-        ])
+        out = self.settings()
+        out.update([('num_agents', self.num_agents), ('source', self.source)])
+        if self.agents_env:
+            out['agents_override'] = self.agents_env
+        out['agents'] = [OrderedDict([('name', a.name), ('class', a.cls), ('id', a.id),
+                                      ('pose', [a.x, a.y, a.yaw_deg]),
+                                      ('goals', [list(g) for g in a.goals])])
+                         for a in self.agents]
+        return out
 
 
 def _is_num(v: Any) -> bool:
@@ -324,10 +382,16 @@ def validate_session(data: Any, source: str = '<session>') -> Session:
     mapping = data.get('mapping', 'gpu')
     if mapping not in MAPPING_MODES:
         errs.append('mapping: %r is not one of %s' % (mapping, ', '.join(MAPPING_MODES)))
-    flags = OrderedDict((k, data.get(k, d)) for k, d in (('rviz', False), ('gui', False), ('auto_arm', False)))
+    flags = OrderedDict((k, data.get(k, d)) for k, d in (('rviz', False), ('gui', False), ('auto_arm', False),
+                                                         ('planner', True)))
     for k, v in flags.items():
         if not isinstance(v, bool):
             errs.append('%s: %r is not true/false' % (k, v))
+    demo = data.get('demo', 'none')
+    if demo not in DEMOS:
+        errs.append('demo: %r is not one of %s' % (demo, ', '.join(DEMOS)))
+    elif demo != 'none' and flags['planner'] is False:
+        errs.append('demo: %s needs the planner (planner: true)' % demo)
 
     agents = []  # type: List[Agent]
     raw = data.get('agents')
@@ -377,9 +441,17 @@ def validate_session(data: Any, source: str = '<session>') -> Session:
         if len(errs) == before:
             agents.append(Agent(an, cls, float(pose[0]), float(pose[1]), float(pose[2]),
                                 tuple(tuple(float(v) for v in g) for g in goals)))
+    # goal_relay.py swaps each agent between its start and its goals; an agent without goals
+    # stays put (an obstacle to the others). Exploration picks its own goals.
+    if demo == 'swap' and agents and not any(a.goals for a in agents):
+        errs.append('demo: swap needs goals (each agent drives between its start and its goals)')
+    if demo == 'explore' and any(a.goals for a in agents):
+        errs.append('demo: explore takes no goals (goal_selector picks frontiers): %s'
+                    % ', '.join(a.name for a in agents if a.goals))
     if errs:
         raise SessionError('%s: invalid session:\n  - %s' % (source, '\n  - '.join(errs)))
-    return Session(name, world, mapping, flags['rviz'], tuple(agents), source, flags['gui'], flags['auto_arm'])
+    return Session(name, world, mapping, flags['rviz'], tuple(agents), source, flags['gui'], flags['auto_arm'],
+                   flags['planner'], demo)
 
 
 def session_path(arg: str) -> Path:
@@ -402,6 +474,121 @@ def load_session(arg: str) -> Session:
     except ValueError:
         source = str(path)
     return validate_session(data, source)
+
+
+def session_from_json(data: Any, where: str = SESSION_FILE) -> Session:
+    """The running session back from <run>/session.json (Session.to_json), validated again."""
+    try:
+        raw = dict((k, data[k]) for k in SESSION_KEYS if k in data and k != 'agents')
+        raw['agents'] = [dict((k, a[k]) for k in AGENT_KEYS if k in a) for a in data['agents']]
+    except (KeyError, TypeError) as e:
+        raise SessionError('%s: not a session file (%r)' % (where, e))
+    s = validate_session(raw, where)
+    return dataclasses.replace(s, source=str(data.get('source') or where),
+                               agents_env=str(data.get('agents_override', '')))
+
+
+def load_running_session(run_dir: Path) -> Session:
+    sf = run_dir / SESSION_FILE
+    try:
+        data = json.loads(sf.read_text())
+    except (OSError, ValueError) as e:
+        raise SimError('no running session (%s: %s): scripts/sim.py up <session>' % (sf, e))
+    return session_from_json(data, str(sf))
+
+
+AGENTS_ENV = 'ROVER_SIM_AGENTS'
+# Worlds with a default layout for more agents than a session places: a circle (centre x, y,
+# radius, m), the first agent at 45 degrees as in multi_agent_swap, every agent facing the
+# centre. The arena's inner obstacles stay 2.2 m or more off a 4 m circle for any count up to
+# CIRCLE_MAX_AGENTS (2.1 m apart on it); the office has no free circle.
+AGENT_CIRCLES = {'arena': (0.0, 0.0, 4.0), 'empty': (0.0, 0.0, 4.0)}
+CIRCLE_MAX_AGENTS = 12
+
+
+def parse_agents_env(text: str) -> List[Tuple[str, str, Optional[Tuple[float, float, float]]]]:
+    """ROVER_SIM_AGENTS: comma-separated NAME:class, or NAME:class:x:y:yaw_deg with a pose of
+    its own (world frame). validate_session checks the names and classes."""
+    out = []  # type: List[Tuple[str, str, Optional[Tuple[float, float, float]]]]
+    for item in (t.strip() for t in text.split(',')):
+        if not item:
+            continue
+        f = item.split(':')
+        pose = None  # type: Optional[Tuple[float, float, float]]
+        if len(f) == 5:
+            try:
+                pose = (float(f[2]), float(f[3]), float(f[4]))
+            except ValueError:
+                pose = None
+            if pose is None or not all(math.isfinite(v) for v in pose):
+                raise SessionError('%s: %r: x, y and yaw_deg must be numbers' % (AGENTS_ENV, item))
+        elif len(f) != 2:
+            raise SessionError('%s: %r is not NAME:class or NAME:class:x:y:yaw_deg (e.g. JR81:jr)' % (AGENTS_ENV, item))
+        out.append((f[0], f[1], pose))
+    if not out:
+        raise SessionError('%s is set but names no agent' % AGENTS_ENV)
+    return out
+
+
+def circle_layout(world: str, n: int) -> Optional[List[Tuple[float, float, float]]]:
+    """n poses (x, y, yaw_deg) on the world's AGENT_CIRCLES circle, or None."""
+    if world not in AGENT_CIRCLES or not 1 <= n <= CIRCLE_MAX_AGENTS:
+        return None
+    cx, cy, r = AGENT_CIRCLES[world]
+    out = []
+    for k in range(n):
+        ang = math.pi / 4 + 2 * math.pi * k / n
+        x, y = cx + r * math.cos(ang), cy + r * math.sin(ang)
+        out.append((round(x, 2), round(y, 2), round(math.degrees(math.atan2(cy - y, cx - x)), 1)))
+    return out
+
+
+# multi_agent_swap.yaml's: each goal 20 deg past the opposite start, as mighty refuses a terminal goal
+# on the cell of the agent parked there (and the paths then pass near the centre, not through it).
+SWAP_GOAL_PAST_DEG = 20.0
+SWAP_GOAL_CLEAR_M = 1.0                # circle_goal keeps every goal this far from every start
+
+
+def circle_goal(world: str, pose: Sequence[float], n: int) -> List[float]:
+    """The swap goal [x, y] of the agent at pose, one of n on the world's circle: SWAP_GOAL_PAST_DEG
+    past the point opposite it, less where n is large enough to bring that within SWAP_GOAL_CLEAR_M of
+    a start (for an even n the opposite point is a start, for an odd n it lies midway between two)."""
+    cx, cy, r = AGENT_CIRCLES[world]
+    spacing = 360.0 / n
+    clear = math.degrees(2 * math.asin(SWAP_GOAL_CLEAR_M / (2 * r)))
+    past = min(SWAP_GOAL_PAST_DEG, spacing / 2 if n % 2 == 0 else max(0.0, spacing / 2 - clear))
+    a = math.atan2(pose[1] - cy, pose[0] - cx) + math.pi + math.radians(past)
+    return [round(cx + r * math.cos(a), 2), round(cy + r * math.sin(a), 2)]
+
+
+def apply_agents_env(session: Session, text: str) -> Session:
+    """The session with ROVER_SIM_AGENTS's agents, in its order. A pose given in the variable
+    wins (and has no goals). Otherwise, with as many agents as the session places or fewer,
+    agent i takes the session's place i and its goals; with more, every one goes on the world's
+    circle (circle_layout; swap goals past the far side: circle_goal), and in a world without one the extra
+    agents need a pose."""
+    entries = parse_agents_env(text)
+    slots, n = session.agents, len(entries)
+    circle = circle_layout(session.world, n) if n > len(slots) else None
+    raw = []
+    for i, (name, cls, pose) in enumerate(entries):
+        goals = []  # type: List[List[float]]
+        if pose is None and circle is not None:
+            pose = circle[i]
+            if session.demo == 'swap':
+                goals = [circle_goal(session.world, pose, n)]
+        elif pose is None and i < len(slots):
+            pose, goals = (slots[i].x, slots[i].y, slots[i].yaw_deg), [list(g) for g in slots[i].goals]
+        elif pose is None:
+            raise SessionError('%s: %s has no pose: session %s places %d agent(s), and world %s has no default '
+                               'layout for %d (a circle in %s, up to %d agents); give it one as %s:%s:x:y:yaw_deg'
+                               % (AGENTS_ENV, name, session.name, len(slots), session.world, n,
+                                  ', '.join(sorted(AGENT_CIRCLES)), CIRCLE_MAX_AGENTS, name, cls))
+        raw.append({'name': name, 'class': cls, 'pose': list(pose), 'goals': goals})
+    data = session.settings()
+    data['agents'] = raw
+    s = validate_session(data, '%s with %s=%s' % (session.source, AGENTS_ENV, text))
+    return dataclasses.replace(s, source=session.source, agents_env=text)
 
 
 def world_problem(world: str, worlds_dir: Path = WORLDS_DIR) -> Optional[str]:
@@ -516,6 +703,8 @@ CONTAINERS = OrderedDict((c.name, c) for c in (
     # mighty-hw bakes no probe: its own mighty_hw.sh gates on the router port only.
     Container('sim-mighty', (ROS_SETUP, '/home/swarm/code/mighty_ws/install/setup.bash'),
               role='mighty_node, convert_odom_to_state, mpc, goal_selector; frame_align'),
+    # Gazebo's image (rclpy, numpy, cv2), on demand only (profile viz): `sim.py viz`.
+    Container('sim-viz', (ROS_SETUP,), role='sim_viz.py, the 2D viewer (sim.py viz; profile viz)'),
 ))
 
 # rover_description's share in the drive image (a merged colcon install): the pinned
@@ -557,6 +746,13 @@ class Pane:
     env: Tuple[Tuple[str, str], ...] = ()
     window: str = 'main'
     waits: str = ''                    # the pane's own gates (a TF, another pane), after the router's
+    # A regex the pane log shows once its node is really up (after the node marker): `up` waits
+    # for it before the wave counts as started, e.g. until mpc has built its NLP.
+    ready: str = ''
+    # Its wait_for_tf.py gate must pass. The script exits 0 on its timeout ("proceeding anyway
+    # (degraded)"), so `up` reads the pane log and stops on that line (settle_wave), and `status`
+    # flags the pane.
+    strict_tf_gate: bool = False
 
 
 def require_readable(var: str) -> str:
@@ -606,6 +802,46 @@ NODE_STARTED_RE = re.compile(r'\[rover_sim\] node starting at ' + PANE_TIME_RE)
 
 def node_marker() -> str:
     return 'echo "[rover_sim] node starting at %s"' % PANE_TIME
+
+
+def node_started(text: str, ready: str = '') -> bool:
+    """A pane log shows its node started: the node marker, and the pane's ready line after the
+    last marker (a restarted pane's log holds the earlier runs too)."""
+    marks = list(NODE_STARTED_RE.finditer(text))
+    if not marks:
+        return False
+    return not ready or re.search(ready, text[marks[-1].end():]) is not None
+
+
+# wait_for_tf.py's two outcomes (mighty's and mapping_ws's copies log the same): it exits 0 on
+# both, so only its log tells them apart.
+WAIT_FOR_TF_RE = re.compile(r'\[wait_for_tf\]: (?:(all transforms available; proceeding)'
+                            r'|TIMEOUT after \S+; still missing .*; proceeding anyway \(degraded\))')
+
+
+# A wait_for_tf.py that has logged its verdict can still exit 1: its rclpy.shutdown() raises when
+# zenoh times out closing the session ("Failed to close the session"), which happened on a loaded
+# 4-agent graph when every planner pane's gate passed in the same second and 8 sessions closed at
+# once (2026-10-20). Its && chain then ends the pane before the node starts. The verdict, not that
+# exit, is the gate's outcome (it exits 0 on a timeout too: tf_gate_result reads the log), so the
+# panes run the robot's gate inside verdict_gate: as is, but going on after a logged verdict.
+VERDICT_GATE_RE = r'\[wait_for_tf\]: .*proceeding'
+
+
+def verdict_gate(cmd: str) -> str:
+    """cmd, a wait_for_tf.py gate, passing when it exits 0 or has logged its verdict (bash, in the
+    container; its output still reaches the pane, through tee)."""
+    return ('{ g=/tmp/rsim-gate.$$; %s 2>&1 | tee $g; rc=${PIPESTATUS[0]}; [ $rc -eq 0 ] || '
+            '{ grep -q \'%s\' $g && echo "[rover_sim] the TF gate exited $rc after its verdict: going on"; }; '
+            'ok=$?; rm -f $g; [ $ok -eq 0 ]; }' % (cmd, VERDICT_GATE_RE))
+
+
+def tf_gate_result(text: str) -> Optional[str]:
+    """'ok' or 'degraded' from the last wait_for_tf.py run in a pane log; None if none ran."""
+    last = None
+    for m in WAIT_FOR_TF_RE.finditer(text):
+        last = 'ok' if m.group(1) else 'degraded'
+    return last
 
 
 def pane_inner(p: Pane) -> str:
@@ -1203,16 +1439,16 @@ def write_dlio_launch(session: Session, ctx: RunContext) -> None:
 # DLIO registers scans as soon as its 3 s IMU calibration ends, seed or not; a seed that lands
 # later leaves odom anchored at z 0 instead of the lidar height (odom.cc:844-853, 916). The
 # robot starts its three panes at once and its seed usually wins; here every stack's panes
-# start at once, and their gates finish seconds apart. So the DLIO pane first waits for its
-# seed pane's `ros2 topic pub` process (matched from the start of its command line, which no
-# pane's bash -c has), then SEED_LEAD_S for its first message.
-SEED_LEAD_S = 3
+# start at once, and their gates finish seconds apart. A running seed publisher is no proof of
+# delivery either (rmw_zenoh 0.1.9 once delayed it by ~85 s). So the DLIO pane first waits for
+# a seed message to arrive in its container (scripts/wait_for_seed.py); the seed pane keeps
+# publishing at 2 Hz through DLIO's calibration. Generous: the paused bring-up takes minutes.
+SEED_WAIT_S = 300
+WAIT_FOR_SEED = 'wait_for_seed.py'   # this repo's scripts/, mounted at SCRIPTS_IN
 
 
 def seed_wait(a: Agent) -> str:
-    return ('until pgrep -f "^[^ ]*python3 [^ ]*/ros2 topic pub -r 2 /%s/world " >/dev/null; do '
-            'echo "[rover_sim] waiting for the %s seed pose pane..."; sleep 1; done && sleep %d'
-            % (a.name, a.name, SEED_LEAD_S))
+    return 'python3 %s/%s %s --timeout %d' % (SCRIPTS_IN, WAIT_FOR_SEED, a.name, SEED_WAIT_S)
 
 
 def dlio_launch_cmd(a: Agent) -> str:
@@ -1502,14 +1738,14 @@ def mapping_panes(session: Session, ctx: RunContext) -> List[Pane]:
         if session.mapping == 'gpu':
             panes += [Pane('%s global_mapper (voxel/*)' % a.name, 'global-mapper-' + a.name, 'sim-mapping',
                            global_mapper_cmd(a, '%s/%s' % (MAPPING_CONFIG_IN, m.gm_params)), env=env, window=w,
-                           waits=tf_gate(a)),
+                           waits=verdict_gate(tf_gate(a))),
                       Pane('%s map_fusion (elev/* -> grids)' % a.name, 'map-fusion-' + a.name, 'sim-mapping',
                            map_fusion_cmd(a), env=env, window=w)]
         else:
             files = dict((node, run_path(MAPPING_RUN_DIR, out)) for node, _, _, out in fallback_files(a))
             panes += [Pane('%s global_mapper (voxel/*), FALLBACK: not parity' % a.name, 'global-mapper-' + a.name,
                            'sim-mapping', global_mapper_cmd(a, files['global_mapper_ros']), env=env, window=w,
-                           waits=tf_gate(a)),
+                           waits=verdict_gate(tf_gate(a))),
                       Pane('%s grid_relay (voxel/* -> grids)' % a.name, 'grid-relay-' + a.name, 'sim-mapping',
                            grid_relay_cmd(a), env=env, window=w)]
         if m.persistent_map:
@@ -1568,6 +1804,25 @@ def check_elevation_launch(session: Session, ctx: RunContext) -> None:
     info('elevation launch file takes param_overlays and the grid topic arguments: %s' % out)
 
 
+# cupy's compiled kernels, kept in a named volume (compose.stack.yaml cupy-kernel-cache).
+_KERNEL_CACHE_SH = 'find "${CUPY_CACHE_DIR:-$HOME/.cupy/kernel_cache}" -name "*.cubin" 2>/dev/null | wc -l'
+
+
+def check_kernel_cache(session: Session, ctx: RunContext) -> None:
+    """Warns when cupy has no compiled kernels yet (the first GPU run on this host, or a removed
+    volume): the mappers then compile them at their first cloud, right after the unpause, about a
+    minute of CPU each on the shared cores, which the unpause is staged to avoid. The next run
+    finds them."""
+    p = dexec('sim-elevation', ['bash', '-c', _KERNEL_CACHE_SH], check=False, timeout=30)
+    n = (p.stdout or '').strip()
+    if p.returncode == 0 and n.isdigit() and int(n) > 0:
+        info('cupy kernel cache: %s compiled kernels' % n)
+        return
+    warn('cupy has no compiled kernels in sim-elevation yet: the elevation mappers compile them after the '
+         'unpause (about a minute, every mapper at once), and the start-up burst can stall the graph and make '
+         'DLIO diverge; if it does, scripts/sim.py down and up again (the kernels are kept)')
+
+
 def elevation_panes(session: Session, ctx: RunContext) -> List[Pane]:
     """sim-elevation (on the robot, natively on its Orin): per agent one window with the elevation
     mapper on DLIO's deskewed cloud, its grids on <ns>/elev/* for map_fusion. Gated on the router
@@ -1578,24 +1833,199 @@ def elevation_panes(session: Session, ctx: RunContext) -> List[Pane]:
             for a in session.agents]
 
 
+# ---------------------------------------------------------------------------- planner
+
+# mighty docker/mighty_hw.sh's pane lines (start(): tf_gate, launch_base and the four
+# only_nodes:= panes), as JR02 runs them (tools/reference/jr02/processes/docker_top_hw-mighty.txt).
+# $ROBOT_NAME expands in the container from the pane's env (robot_env), as rover.env sets it
+# there. The sim appends num_agents:= (mighty_cmd) and nothing else; never use_ground_robot:=,
+# which switches the base config.
+MIGHTY_TF_GATE = 'ros2 run mighty wait_for_tf.py $ROBOT_NAME/map $ROBOT_NAME/odom'
+MIGHTY_LAUNCH = ('ros2 launch mighty onboard_mighty.launch.py x:=0.0 y:=0.0 z:=0.0 yaw:=0.0 namespace:=$ROBOT_NAME '
+                 'use_hardware:=true use_onboard_localization:=true robot_type:=red_rover depth_camera_name:=d455')
+
+
+class MightyPane(NamedTuple):
+    node: str                          # only_nodes:= key
+    slug: str
+    title: str                         # mighty_hw.sh's
+    tf_gate: bool                      # mighty_hw.sh gates it on MIGHTY_TF_GATE: it resolves <ns>/map
+    ready: str = ''
+
+
+# mpc builds its IPOPT NLP in its constructor (1.1-1.3 s of CPU with its imports, in a throwaway
+# of the mighty-hw image) and logs this line after it: its wave settles only after that, so no
+# build runs once physics does.
+MPC_READY = r'MPC controller started\.'
+MIGHTY_PANES = (MightyPane('mighty_node', 'mighty-node', 'MIGHTY planner', True),
+                MightyPane('convert_odom_to_state', 'odom-to-state', 'convert_odom_to_state', False),
+                MightyPane('mpc', 'mpc', 'MPC', True, MPC_READY),
+                MightyPane('goal_selector', 'goal-selector', 'goal_selector', False))
+
+
+def mighty_cmd(node: str, num_agents: int) -> str:
+    """The robot's pane line plus num_agents:=, the one planned planner-parameter deviation: the
+    launch argument overwrites any overlay's, and mighty_node subscribes the frame_align topics
+    of ids 1..num_agents only (allowed_deviations.yaml all.params.mighty_node.num_agents)."""
+    return '%s only_nodes:=%s num_agents:=%d' % (MIGHTY_LAUNCH, node, num_agents)
+
+
 def mighty_panes(session: Session, ctx: RunContext) -> List[Pane]:
-    """TODO(Phase 5), sim-mighty. Four panes per agent (one window each), as
-    mighty_hw.sh: onboard_mighty.launch.py only_nodes:=<mighty_node|convert_odom_to_state|
-    mpc|goal_selector> num_agents:=session.num_agents; mighty_node and mpc gated on
-    wait_for_tf.py <ns>/map <ns>/odom."""
-    raise _not_yet('mighty')
+    """sim-mighty: per agent one window with mighty_hw.sh's four panes, gated on the router
+    like every pane (mighty_hw.sh waits for the router's port). mighty_node and mpc wait for
+    <ns>/map -> <ns>/odom first, as there: dlio's map_odom_tf.py puts it on /tf at wall time,
+    so the gate passes while the world is paused, and a timeout means it is missing
+    (strict_tf_gate: `up` stops). mpc publishes cmd_vel_auto at 30 Hz from its start (zeros
+    until mighty_node sends mpc_waypoints). With ids up to num_agents, each mighty_node
+    subscribes num_agents - 1 frame_align topics, of which only the session's are published."""
+    panes = []
+    for a in session.agents:
+        for m in MIGHTY_PANES:
+            panes.append(Pane('%s %s' % (a.name, m.title), '%s-%s' % (m.slug, a.name), 'sim-mighty',
+                              mighty_cmd(m.node, session.num_agents), env=robot_env(a), window=a.name,
+                              waits=verdict_gate(MIGHTY_TF_GATE) if m.tf_gate else '', ready=m.ready,
+                              strict_tf_gate=m.tf_gate))
+    return panes
+
+
+# ---------------------------------------------------------------------------- goals
+
+GOAL_TOPIC = '/sim/goal'             # RViz SetGoal (world frame); goal_relay.py forwards it
+GOAL_RELAY = 'goal_relay.py'         # this repo's scripts/, mounted at SCRIPTS_IN
+GOAL_RELAY_FIRST_DRIVE_M = 1.2       # its --first-drive default (tests/test_sim.py checks they agree)
+GOAL_RELAY_ENTITIES = (8, 2)         # goal_relay.py ENTITIES_PER_AGENT, ENTITIES_ROOT: its paced leave's length
+
+
+def goal_relay_leave_s(n_agents: int) -> float:
+    """How long goal_relay.py takes to leave the graph (one entity per STATUS_LEAVE_GAP_S, then the
+    pause), plus a margin: what `down` and `start goals` wait before they SIGTERM it."""
+    per, root = GOAL_RELAY_ENTITIES
+    return (per * n_agents + root) * STATUS_LEAVE_GAP_S + STATUS_LEAVE_PAUSE_S + 3.0
+
+
+# goal_relay.py --mode per demo (its SESSION_DEMO_MODE): swap drives the session's goals; explore
+# and rviz only forward RViz's (goal_selector explores by itself in both).
+GOAL_MODES = OrderedDict([('swap', 'swap'), ('explore', 'explore'), ('none', 'rviz')])
+
+
+def goal_mode(session: Session) -> str:
+    return GOAL_MODES[session.demo]
+
+
+def goal_relay_cmd(session: Session) -> str:
+    """goal_selector ignores a goal's frame_id, so goals reach /<ns>/term_goal_rviz already in
+    <ns>/map: goal_relay.py turns world-frame goals (the session's, RViz's /sim/goal) into each
+    agent's map frame through <run>/spawn.yaml (world -> <ns>/map is the spawn pose, sim_tf.py)."""
+    return 'python3 %s/%s --spawn %s --session %s --mode %s' % (SCRIPTS_IN, GOAL_RELAY, run_path(SPAWN_FILE),
+                                                               run_path(SESSION_FILE), goal_mode(session))
+
+
+def check_goal_relay(session: Session, ctx: RunContext) -> None:
+    if not (REPO / 'scripts' / GOAL_RELAY).is_file():
+        raise SimError('no scripts/%s in this checkout: the goals stack runs it from %s' % (GOAL_RELAY, SCRIPTS_IN))
+
+
+def goals_panes(session: Session, ctx: RunContext) -> List[Pane]:
+    """sim-mighty, one pane for the session, in the last paused wave, with every planner: goal_relay.py
+    first drives each agent that is in AUTO off its spot in JOY mode, as an operator would, then
+    hands it back to AUTO (its FirstDrive: from a cold start mighty plans no path over floor it never
+    saw), and sends nothing before that, so no goal piles up at goal_selector while nothing moves.
+    Its container has the planner's messages."""
+    what = ('first drive, then the session\'s goals and back to the start, repeatedly; and RViz %s' % GOAL_TOPIC
+            if goal_mode(session) == 'swap' else 'first drive, then RViz %s only' % GOAL_TOPIC)
+    return [Pane('goal_relay --mode %s (%s)' % (goal_mode(session), what), 'goal-relay', 'sim-mighty',
+                 goal_relay_cmd(session), window='goals')]
+
+
+# ---------------------------------------------------------------------------- rviz
+
+RVIZ_TEMPLATES = REPO / 'rviz' / 'templates'
+RVIZ_CONFIG_IN = run_path(RVIZ_RUN_DIR, RVIZ_FILE)
+# The parts rviz_config joins: the header (panels, global displays), one agent part per agent
+# with the gpu part inside it for mapping: gpu (elev/*), then the footer (tools, view).
+RVIZ_PARTS = ('session.rviz.part', 'agent.rviz.part', 'agent_gpu.rviz.part', 'footer.rviz.part')
+RVIZ_TOKEN_RE = re.compile(r'@[A-Z_]+@')
+# One colour per agent (cloud, goal), in session order; RViz's "r; g; b".
+AGENT_COLORS = ('237; 51; 59', '53; 132; 228', '51; 209; 122', '246; 211; 45', '192; 97; 203', '255; 120; 0',
+                '0; 200; 200', '154; 153; 150')
+
+
+def fill_template(text: str, values: Dict[str, str], where: str) -> str:
+    for k, v in values.items():
+        text = text.replace('@%s@' % k, v)
+    left = sorted(set(RVIZ_TOKEN_RE.findall(text)))
+    if left:
+        raise SimError('%s: no value for %s' % (where, ', '.join(left)))
+    return text
+
+
+def rviz_view(session: Session) -> Tuple[float, float, float]:
+    """(focal x, focal y, orbit distance): from above, the centre of the agents' starts, far
+    enough to see them all, and the world's walls where it has a box (RViz's default field of
+    view shows about 0.8 x the distance across)."""
+    xs, ys = [a.x for a in session.agents], [a.y for a in session.agents]
+    span = max(max(xs) - min(xs), max(ys) - min(ys))
+    walls = world_walls(session.world)
+    if walls:
+        span = max(span, walls[2] - walls[0], walls[3] - walls[1])
+    return (sum(xs) / len(xs), sum(ys) / len(ys), max(15.0, 1.25 * span + 2.0))
+
+
+def rviz_config(session: Session, templates: Path = RVIZ_TEMPLATES) -> str:
+    """<run>/rviz/session.rviz from rviz/templates/: Fixed Frame world (sim_tf.py's), per agent
+    a display group on the robot's topics in its own frames, SetGoal on GOAL_TOPIC. Displays that
+    are off do not subscribe: the ones on are kept few (each is a subscription the graph has to
+    undeclare when RViz closes)."""
+    def read(name: str) -> str:
+        try:
+            return (templates / name).read_text()
+        except OSError as e:
+            raise SimError('RViz template %s: %s' % (templates / name, e.strerror))
+    head, agent, gpu, foot = (read(n) for n in RVIZ_PARTS)
+    out = [fill_template(head, {'SESSION': '%s (%s)' % (session.name, session.source)}, RVIZ_PARTS[0])]
+    for i, a in enumerate(session.agents):
+        values = {'NS': a.name, 'COLOR': AGENT_COLORS[i % len(AGENT_COLORS)],
+                  'EXPLORE': 'true' if session.demo == 'explore' else 'false'}
+        extra = fill_template(gpu, values, RVIZ_PARTS[2]) if session.mapping == 'gpu' else ''
+        if agent.count('@MAPPING_DISPLAYS@\n') != 1:
+            raise SimError('%s: needs one @MAPPING_DISPLAYS@ line' % RVIZ_PARTS[1])
+        out.append(fill_template(agent.replace('@MAPPING_DISPLAYS@\n', extra), values, RVIZ_PARTS[1]))
+    fx, fy, dist = rviz_view(session)
+    out.append(fill_template(foot, {'GOAL_TOPIC': GOAL_TOPIC, 'FOCAL_X': fmt_float(fx, 2), 'FOCAL_Y': fmt_float(fy, 2),
+                                    'DISTANCE': fmt_float(dist, 1)}, RVIZ_PARTS[3]))
+    text = ''.join(out)
+    try:
+        doc = yaml.safe_load(text)
+        names = [d['Name'] for d in doc['Visualization Manager']['Displays']]
+    except (yaml.YAMLError, KeyError, TypeError) as e:
+        raise SimError('rviz/templates/ make no RViz config for session %s: %s' % (session.name, e))
+    if names[-len(session.agents):] != [a.name for a in session.agents]:
+        raise SimError('rviz/templates/: the agent groups came out as %s' % names)
+    return text
+
+
+def write_rviz_config(session: Session, ctx: RunContext) -> None:
+    out = ctx.run_dir / RVIZ_RUN_DIR
+    empty_own_dir(out)
+    write_file(out / RVIZ_FILE, rviz_config(session).encode())
+    info('wrote %s/%s (Fixed Frame world, SetGoal -> %s, %s)' % (RVIZ_RUN_DIR, RVIZ_FILE, GOAL_TOPIC,
+                                                               ', '.join(a.name for a in session.agents)))
 
 
 def rviz_panes(session: Session, ctx: RunContext) -> List[Pane]:
-    """TODO(Phase 5), sim-gazebo. RViz from a config generated for the session's agents,
-    started last (zenoh late-join TF), off gzserver's cores (pin_self('rest', ctx))."""
-    raise _not_yet('rviz')
+    """sim-gazebo (rviz2 is in its image, X through /tmp/.X11-unix): off gzserver's cores, on
+    the rest with the bridges (pin_self('rest', ctx)). Without ROVER_SIM_GAZEBO_RUNTIME=nvidia it
+    renders in software, so the config draws at 10 Hz. It starts in a paused wave, before the
+    unpause, like every heavy start (module docstring)."""
+    return [Pane('RViz %s (Fixed Frame world; SetGoal -> %s)' % (RVIZ_CONFIG_IN, GOAL_TOPIC), 'rviz', 'sim-gazebo',
+                 pin_self('rest', ctx) + ' && rviz2 -d %s' % RVIZ_CONFIG_IN, window='rviz')]
 
 
-# Start order is registry order. Later phases flip `implemented` and fill in the builder.
-# Waves (Stack.wave): 0 the router and Gazebo, so the spawns run on a quiet graph (gzserver's
-# ROS services have hung under a storm of graph events); 1 what DLIO needs before it can run;
-# 2 mapping, which reads DLIO; 3 elevation, the heaviest start (cupy on the GPU).
+# Start order is registry order. Waves (Stack.wave): 0 the router and Gazebo, so the spawns run
+# on a quiet graph (gzserver's ROS services have hung under a storm of graph events); 1 what DLIO
+# needs before it can run; 2 mapping, which reads DLIO; 3 elevation, the heaviest start (cupy on
+# the GPU); 4 the planner, which reads all of them (and declares num_agents - 1 frame_align
+# subscriptions per agent); 5 RViz and the goals, which talk to the planner.
 STACKS = OrderedDict((s.name, s) for s in (
     Stack('zenoh', 1, 'zenoh router in sim-drive', ('sim-drive',), zenoh_panes, implemented=True),
     Stack('gazebo', 2, 'Gazebo world, spawns, sensor bridges, world-><ns>/map', ('sim-gazebo',), gazebo_panes,
@@ -1609,12 +2039,78 @@ STACKS = OrderedDict((s.name, s) for s in (
     Stack('mapping', 4, 'global_mapper, map_fusion, persistent_map per agent', ('sim-mapping',),
           mapping_panes, implemented=True, generate=(write_mapping_files,), wave=2),
     Stack('elevation', 4, 'GPU elevation mapping per agent', ('sim-elevation',), elevation_panes,
-          implemented=True, wanted=lambda s: s.mapping == 'gpu', generate=(check_elevation_launch,), wave=3),
+          implemented=True, wanted=lambda s: s.mapping == 'gpu', generate=(check_elevation_launch, check_kernel_cache),
+          wave=3),
     Stack('mighty', 5, 'mighty_node, convert_odom_to_state, mpc, goal_selector per agent',
-          ('sim-mighty',), mighty_panes, wave=4),
-    Stack('rviz', 5, 'RViz, started last', ('sim-gazebo',), rviz_panes, wanted=lambda s: s.rviz,
-          needs_display=_always, wave=5),
+          ('sim-mighty',), mighty_panes, implemented=True, wanted=lambda s: s.planner, wave=4),
+    Stack('rviz', 5, 'RViz on $DISPLAY, the last paused wave', ('sim-gazebo',), rviz_panes, implemented=True,
+          wanted=lambda s: s.rviz, generate=(write_rviz_config,), needs_display=_always, wave=5),
+    Stack('goals', 5, 'goal_relay.py: session and RViz goals to term_goal_rviz', ('sim-mighty',), goals_panes,
+          implemented=True, wanted=lambda s: s.planner, generate=(check_goal_relay,), wave=5),
 ))
+# Stacks `start` may (re)start alone on a running session, and the command-line text of their
+# processes (stop_processes(match=...) stops the old one first).
+RESTARTABLE = OrderedDict([('rviz', 'rviz2 -d ' + RVIZ_CONFIG_IN), ('goals', '/' + GOAL_RELAY + ' ')])
+
+
+# ---------------------------------------------------------------------------- viz (sim_viz.py)
+
+VIZ_CONTAINER = 'sim-viz'
+VIZ_PROFILE = 'viz'                  # compose profile of sim-viz: `up` never starts it
+VIZ_SCRIPT = 'sim_viz.py'            # this repo's scripts/, mounted at SCRIPTS_IN
+VIZ_LAYERS = ('occ', 'orig_hgp', 'hgp', 'traj', 'frontiers', 'pose', 'map')   # sim_viz.py LAYERS
+VIZ_MAX_PANELS = 4                   # sim_viz.py MAX_PANELS
+# Ctrl-C to the viewer, then this long for its leave (0.5 s per subscription: 4 agents x 7 layers
+# take 14.5 s) before SIGTERM. A docker stop of sim-viz gets the same: its command traps the SIGTERM,
+# Ctrl-Cs the viewer and waits, within the same 30 s (compose.stack.yaml stop_grace_period).
+VIZ_STOP_GRACE_S = 30.0
+VIZ_SNAPSHOT_IN = '/tmp/sim_viz_snapshot.png'    # in sim-viz (the run dir is read-only there); docker cp
+# Not in STACKS: `up` never starts it, `viz` does, on the running session.
+VIZ_STACK = Stack('viz', 5, 'sim_viz.py: the 2D viewer on $DISPLAY (scripts/sim.py viz)', (VIZ_CONTAINER,),
+                  lambda session, ctx: viz_panes(), implemented=True, wanted=_never, needs_display=_always)
+
+
+def viz_cmd(agents: Sequence[str] = (), layers: Sequence[str] = (), follow: bool = False) -> str:
+    cmd = ['python3', '%s/%s' % (SCRIPTS_IN, VIZ_SCRIPT), '--spawn', run_path(SPAWN_FILE)]
+    if agents:
+        cmd += ['--agents', ','.join(agents)]
+    if layers:
+        cmd += ['--layers', ','.join(layers)]
+    if follow:
+        cmd.append('--follow')
+    return shlex_join(cmd)
+
+
+def viz_snapshot_argv(agents: Sequence[str], layers: Sequence[str], after: float, follow: bool = False) -> List[str]:
+    """docker exec argv in sim-viz: the container's setup sourced (docker exec skips the entrypoint),
+    then one frame to VIZ_SNAPSHOT_IN."""
+    cmd = '%s --snapshot %s --snapshot-after %s' % (viz_cmd(agents, layers, follow), VIZ_SNAPSHOT_IN,
+                                                    fmt_float(after, 3))
+    return ['bash', '-c', '%s && exec %s' % (setup_snippet(CONTAINERS[VIZ_CONTAINER]), cmd)]
+
+
+def viz_panes(agents: Sequence[str] = (), layers: Sequence[str] = (), follow: bool = False) -> List[Pane]:
+    """sim-viz, one pane: its cores come from its cpuset (cpu_budget), its X from compose. Gated on the
+    router like every pane."""
+    return [Pane('sim_viz.py on $DISPLAY (q quits; Ctrl-C here or scripts/sim.py viz --stop: it leaves the '
+                 'graph one subscription at a time)', 'viz', VIZ_CONTAINER, viz_cmd(agents, layers, follow),
+                 window='viz')]
+
+
+def stop_viz() -> int:
+    """Ctrl-C the viewer, as in its pane, and wait out its paced leave (VIZ_STOP_GRACE_S), then close
+    rsim-viz. Returns how many processes there were."""
+    n = 0
+    if VIZ_CONTAINER in running_sim_containers():
+        n = stop_processes(VIZ_CONTAINER, grace_int=VIZ_STOP_GRACE_S, grace_term=5.0)
+        if n:
+            info('%s: stopped %d process(es); the viewer left the graph one subscription at a time '
+                 '(its pane log: "left the graph")' % (VIZ_CONTAINER, n))
+    sess = TMUX_PREFIX + VIZ_STACK.name
+    if sess in tmux_sessions():
+        tmux('kill-session', '-t', '=' + sess, check=False)
+        info('closed tmux session %s' % sess)
+    return n
 
 
 def select_stacks(session: Session, requested: Optional[Sequence[str]] = None) -> List[Stack]:
@@ -1627,8 +2123,9 @@ def select_stacks(session: Session, requested: Optional[Sequence[str]] = None) -
         if not s.implemented:
             raise _not_yet(name)
         if not s.wanted(session):
-            raise SimError('the %s stack does not apply to session %s (mapping: %s, rviz: %s, %d agent(s))'
-                           % (name, session.name, session.mapping, session.rviz, len(session.agents)))
+            raise SimError('the %s stack does not apply to session %s (mapping: %s, rviz: %s, planner: %s, demo: %s, '
+                           '%d agent(s))' % (name, session.name, session.mapping, session.rviz, session.planner,
+                                             session.demo, len(session.agents)))
     return [s for s in STACKS.values() if s.name in requested]
 
 
@@ -1686,6 +2183,14 @@ def tmux_sessions() -> List[str]:
     return [s for s in p.stdout.split() if s.startswith(TMUX_PREFIX)] if p.returncode == 0 else []
 
 
+# The panes of a stack start this far apart, not at once: a wave's 12-16 sessions joining together
+# on shared cores have made the router block on a peer that did not read (5 s per undeliverable
+# declaration, 'Unable to push non droppable network message' in router.log) for minutes, and a
+# declaration lost then never reaches the graph (2026-10-20: RR83's map_fusion subscription to
+# elev/occ_2d_topic; check_graph catches that).
+PANE_START_GAP_S = 0.25
+
+
 def start_stack(stack: Stack, panes: Sequence[Pane], log_dir: Path) -> str:
     slugs = [p.slug for p in panes]
     if len(set(slugs)) != len(slugs):
@@ -1700,6 +2205,7 @@ def start_stack(stack: Stack, panes: Sequence[Pane], log_dir: Path) -> str:
     tmux('new-session', '-d', '-s', sess, '-n', TMUX_PLACEHOLDER, '-x', TMUX_SIZE[0], '-y', TMUX_SIZE[1], 'cat')
     tmux('set-option', '-t', sess, 'history-limit', str(TMUX_HISTORY))
     windows = tmux_windows(panes)
+    started = 0
     for wname, wpanes in windows:
         # Each pane runs a fresh bash, so the typed command lands in its history:
         # Ctrl-C / Up / Enter restarts that node, gate included.
@@ -1714,11 +2220,16 @@ def start_stack(stack: Stack, panes: Sequence[Pane], log_dir: Path) -> str:
         for pid, pane in zip(ids, wpanes):
             tmux('select-pane', '-t', pid, '-T', pane.title)
             tmux('set-option', '-p', '-t', pid, PANE_SLUG_OPTION, pane.slug)
+            if pane.strict_tf_gate:
+                tmux('set-option', '-p', '-t', pid, PANE_TF_GATE_OPTION, 'strict')
             # pipe-pane taps the pane at the tmux server: nodes run under docker exec, so
             # this is the only full record of their output, across restarts too.
             tmux('pipe-pane', '-o', '-t', pid, 'cat >> ' + shlex.quote(str(stack_log / (pane.slug + '.log'))))
+            if started:
+                time.sleep(PANE_START_GAP_S)
             tmux('send-keys', '-t', pid, '-l', pane_command(pane))
             tmux('send-keys', '-t', pid, 'C-m')
+            started += 1
         tmux('select-pane', '-t', ids[0])
     tmux('kill-window', '-t', '=%s:%s' % (sess, TMUX_PLACEHOLDER))
     if windows:
@@ -1845,22 +2356,74 @@ def compose_cmd(profiles: Sequence[str] = ()) -> List[str]:
 # the remaining cores and the kernel balances them; splitting those further waits for the
 # per-stack load measured in Phase 5. ROVER_SIM_CPUSET_<NAME> overrides one service,
 # e.g. ROVER_SIM_CPUSET_GAZEBO=2-7, and an empty value leaves it unpinned.
+# sim-viz, started on demand while physics runs, gets the top VIZ_CPUS of the shared cores that
+# are not SMT siblings of gzserver's: a busy sibling thread slows the core physics runs on, and
+# the worlds' real-time budgets were measured without a viewer.
 HOST_CPUS = 2
 GAZEBO_CPUS = 4
 CPU_BUDGET_MIN = 12
+VIZ_CPUS = 4
 
 
 def cpuset_var(service: str) -> str:
     return 'ROVER_SIM_CPUSET_' + service[len('sim-'):].upper().replace('-', '_')
 
 
-def cpu_budget(ncpu: int, services: Iterable[str]) -> Dict[str, str]:
-    """service -> cpuset; {} (unpinned) on a host too small to split."""
+def parse_cpu_list(text: str) -> List[int]:
+    """'2,12' or '16-19' (sysfs, cpusets) -> [2, 12] or [16, 17, 18, 19]."""
+    out = []  # type: List[int]
+    for part in text.strip().split(','):
+        if part:
+            a, _, b = part.partition('-')
+            out += list(range(int(a), int(b or a) + 1))
+    return out
+
+
+def cpu_list(cpus: Iterable[int]) -> str:
+    """[16, 17, 18, 19, 21] -> '16-19,21'."""
+    runs = []  # type: List[List[int]]
+    for c in sorted(set(cpus)):
+        if runs and c == runs[-1][-1] + 1:
+            runs[-1].append(c)
+        else:
+            runs.append([c])
+    return ','.join('%d-%d' % (r[0], r[-1]) if len(r) > 1 else '%d' % r[0] for r in runs)
+
+
+def half_siblings(ncpu: int) -> Callable[[int], Iterable[int]]:
+    """Linux's usual numbering of 2-way SMT: CPU n and n + ncpu/2 share a core."""
+    half = ncpu // 2
+    return lambda c: {c + half if c < half else c - half}
+
+
+def host_siblings(cpu: int) -> Iterable[int]:
+    """This host's SMT siblings of a CPU (sysfs), else half_siblings's guess."""
+    try:
+        text = Path('/sys/devices/system/cpu/cpu%d/topology/thread_siblings_list' % cpu).read_text()
+        return set(parse_cpu_list(text)) - {cpu}
+    except (OSError, ValueError):
+        return half_siblings(docker_ncpu())(cpu)
+
+
+def viz_cpus(ncpu: int, siblings: Callable[[int], Iterable[int]]) -> List[int]:
+    gz = set(range(HOST_CPUS, HOST_CPUS + GAZEBO_CPUS))
+    near = gz | {s for c in gz for s in siblings(c)}
+    shared = list(range(HOST_CPUS + GAZEBO_CPUS, ncpu))
+    return [c for c in shared if c not in near][-VIZ_CPUS:] or shared
+
+
+def cpu_budget(ncpu: int, services: Iterable[str],
+               siblings: Optional[Callable[[int], Iterable[int]]] = None) -> Dict[str, str]:
+    """service -> cpuset; {} (unpinned) on a host too small to split. siblings: a CPU's SMT
+    siblings (default half_siblings)."""
     if ncpu < CPU_BUDGET_MIN:
         return {}
     gz = '%d-%d' % (HOST_CPUS, HOST_CPUS + GAZEBO_CPUS - 1)
     rest = '%d-%d' % (HOST_CPUS + GAZEBO_CPUS, ncpu - 1)
-    return OrderedDict((s, gz if s == 'sim-gazebo' else rest) for s in services)
+    out = OrderedDict((s, gz if s == 'sim-gazebo' else rest) for s in services)
+    if VIZ_CONTAINER in out:
+        out[VIZ_CONTAINER] = cpu_list(viz_cpus(ncpu, siblings or half_siblings(ncpu)))
+    return out
 
 
 _NCPU = []  # type: List[int]
@@ -1880,7 +2443,7 @@ def docker_ncpu() -> int:
 def compose_env(run_dir: Path) -> Dict[str, str]:
     env = dict(os.environ)
     env['ROVER_SIM_RUN'] = str(run_dir)
-    for svc, cpus in cpu_budget(docker_ncpu(), CONTAINERS).items():
+    for svc, cpus in cpu_budget(docker_ncpu(), CONTAINERS, host_siblings).items():
         env.setdefault(cpuset_var(svc), cpus)
     return env
 
@@ -2083,7 +2646,7 @@ def ensure_run_dir(run_dir: Path) -> None:
 def write_session_file(session: Session, run_dir: Path) -> Path:
     data = session.to_json()
     data['started'] = time.strftime('%Y-%m-%dT%H:%M:%S%z')
-    path = run_dir / 'session.json'
+    path = run_dir / SESSION_FILE
     write_file(path, (json.dumps(data, indent=2) + '\n').encode())
     return path
 
@@ -2343,9 +2906,20 @@ def stop_processes(name: str, match: Optional[str] = None, grace_int: float = 10
 
 def stop_run(remove_containers: bool = False) -> None:
     """Stop every ROS process in the sim containers and close the rsim-* sessions.
-    Processes first, so the panes still log their shutdown."""
+    Processes first, so the panes still log their shutdown. The viewer first, alone, waiting out
+    its paced leave while the router and the stacks are still up (stop_viz)."""
     names = running_sim_containers()
-    counts = parallel(stop_processes, names)
+    if VIZ_CONTAINER in names:
+        names.remove(VIZ_CONTAINER)
+        stop_viz()
+    # sim-mighty's goal_relay.py leaves one entity at a time after its Ctrl-C: wait for it.
+    try:
+        agents = len(json.loads((resolve_run_dir() / SESSION_FILE).read_text())['agents'])
+    except (OSError, ValueError, KeyError, TypeError, SimError):
+        agents = 4
+    grace = dict((n, max(10.0, goal_relay_leave_s(agents)) if n in STACKS['goals'].containers else 10.0)
+                 for n in names)
+    counts = parallel(lambda n: stop_processes(n, grace_int=grace[n]), names)
     for n, c in zip(names, counts):
         if c:
             info('%s: stopped %d process(es)' % (n, c))
@@ -2354,7 +2928,8 @@ def stop_run(remove_containers: bool = False) -> None:
         info('closed tmux session %s' % s)
     if remove_containers:
         run_dir = resolve_run_dir()
-        sh(compose_cmd([GPU_PROFILE]) + ['down', '--remove-orphans'], capture=False, env=compose_env(run_dir))
+        sh(compose_cmd([GPU_PROFILE, VIZ_PROFILE]) + ['down', '--remove-orphans'], capture=False,
+           env=compose_env(run_dir))
 
 
 # ---------------------------------------------------------------------------- tcp tables
@@ -2940,16 +3515,20 @@ def print_loadtest(summaries: Sequence[Dict[str, Any]], max_discovery: float) ->
 def print_plan(session: Session, plan: Sequence[Tuple[Stack, List[Pane]]], arm: bool = False,
                ctx: Optional[RunContext] = None) -> None:
     ctx = ctx or RunContext(run_dir=run_dir_from_env())
-    print('session %s (%s): world %s (MID-360 %d rays/scan), gui %s, mapping %s, rviz %s, num_agents %d' % (
-        session.name, session.source, session.world, world_lidar_samples(session.world),
-        'on' if session.gui else 'off', session.mapping, 'on' if session.rviz else 'off', session.num_agents))
+    print('session %s (%s): world %s (MID-360 %d rays/scan), gui %s, mapping %s, rviz %s, planner %s, demo %s, '
+          'num_agents %d' % (session.name, session.source, session.world, world_lidar_samples(session.world),
+                             'on' if session.gui else 'off', session.mapping, 'on' if session.rviz else 'off',
+                             'on' if session.planner else 'off', session.demo, session.num_agents))
     names = {stack.name for stack, _ in plan}
     print('mapping: ' + mapping_label(session.mapping, 'mapping' in names, 'not started'))
     pins = read_pins()
+    if session.agents_env:
+        print('agents from %s=%s (apply_agents_env)' % (AGENTS_ENV, session.agents_env))
     for a in session.agents:
-        print('  %s  %s  id %02d  pose (%.2f, %.2f, %.1f deg)  calibrated from %s, lidar at %.2f m' % (
+        print('  %s  %s  id %02d  pose (%.2f, %.2f, %.1f deg)  calibrated from %s, lidar at %.2f m%s' % (
             a.name, a.cls, a.id, a.x, a.y, a.yaw_deg, reference_robot(a.cls, pins),
-            ROBOT_CLASSES[a.cls].lidar_height))
+            ROBOT_CLASSES[a.cls].lidar_height,
+            '  goals %s' % ' '.join('(%s)' % ', '.join('%.2f' % v for v in g) for g in a.goals) if a.goals else ''))
     steps = generate_steps([stack for stack, _ in plan])
     if steps:
         print('before the panes: %s' % ', '.join(g.__name__ for g in steps))
@@ -2981,32 +3560,54 @@ def print_plan(session: Session, plan: Sequence[Tuple[Stack, List[Pane]]], arm: 
     if 'elevation' in names:
         print('elevation overlays: %s' % '; '.join('%s %s' % (a.name, ','.join(elevation_overlays(a, pins)) or 'none')
                                                    for a in session.agents))
+    if 'mighty' in names:
+        print('planner: mighty_hw.sh\'s four panes per agent, num_agents:=%d (the highest id; JR02 runs the launch '
+              'default 10); mighty_node and mpc wait for <ns>/map -> <ns>/odom (a timeout stops `up`); mpc\'s wave '
+              'waits for "%s"' % (session.num_agents, MPC_READY.replace('\\', '')))
+    if 'rviz' in names:
+        print('rviz: %s from %s/ on $DISPLAY (%s)' % (RVIZ_CONFIG_IN, RVIZ_TEMPLATES.relative_to(REPO),
+                                                     os.environ.get('DISPLAY') or 'unset: it will not open'))
+    if 'goals' in names and not (REPO / 'scripts' / GOAL_RELAY).is_file():
+        print('WARNING: no scripts/%s yet: the goals stack would fail' % GOAL_RELAY)
     print('start in waves; after each, wait until its panes have started their nodes (up to %d s) and the sim '
           'containers are idle (rmw_zenohd under %.0f %% and all together under %.0f %% of a core, %d samples in a '
           'row; up to %d s)' % (NODES_WAIT_S, SETTLE_ROUTER_PCT, SETTLE_STACKS_PCT_PER_AGENT * len(session.agents),
                                 SETTLE_QUIET_SAMPLES, SETTLE_TIMEOUT_S))
+
+    def show(stack: Stack, panes: Sequence[Pane]) -> None:
+        print('stack %s -> tmux session %s%s' % (stack.name, TMUX_PREFIX, stack.name))
+        for wname, wpanes in tmux_windows(panes):
+            print('  window %s' % wname)
+            for p in wpanes:
+                print('    [%s] %s%s\n      %s' % (p.slug, p.title, '  (ready: %s)' % p.ready if p.ready else '',
+                                                  pane_command(p)))
     for k, wave in enumerate(start_waves(plan)):
         print('wave %d: %s' % (k, ', '.join(s.name for s, _ in wave)))
         for stack, panes in wave:
-            print('stack %s -> tmux session %s%s' % (stack.name, TMUX_PREFIX, stack.name))
-            for wname, wpanes in tmux_windows(panes):
-                print('  window %s' % wname)
-                for p in wpanes:
-                    print('    [%s] %s\n      %s' % (p.slug, p.title, pane_command(p)))
+            show(stack, panes)
         if any(s.name == 'gazebo' for s, _ in wave):
             print('wave %d settles once the spawn pane has spawned every agent into the paused world (up to %d s; '
                   'fails if it fails)' % (k, SPAWN_WAIT_S))
+    if arm and session.planner:
+        print('after the last wave, before the unpause: arm %s: /<ns>/auto_mode at once (auto_arm; --no-arm '
+              'skips): nothing commands motion until DLIO tracks, and the query leaves a graph with no sensor data'
+              % ', '.join(a.name for a in session.agents))
     if 'gazebo' in names:
         print('after the last wave: unpause physics over gazebo transport (up to %d tries; fails if the world stays '
               'paused):\n      %s' % (UNPAUSE_TRIES, shlex_join(['docker', 'exec', 'sim-gazebo', 'bash', '-c',
                                                                   unpause_cmd(ctx)])))
-    if arm:
+    if arm and not session.planner:
         print('after the panes: arm %s: /<ns>/auto_mode once its DLIO registers scans (auto_arm; '
               '--no-arm skips)' % ', '.join(a.name for a in session.agents))
     elif session.auto_arm:
-        print('not arming: auto_arm needs the dlio and drive stacks (or --no-arm was given)')
+        print('not arming: auto_arm needs the dlio and drive stacks, and mighty in a planner session (or --no-arm '
+              'was given)')
     else:
         print('not arming: auto_arm is off, so every safety_node stays DISARMED (scripts/sim.py arm)')
+    if 'goals' in names:
+        print('goal_relay.py drives each agent in AUTO %.1f m ahead in JOY mode first%s%s' % (
+            GOAL_RELAY_FIRST_DRIVE_M, ', then starts the swap' if goal_mode(session) == 'swap' else '',
+            '' if arm else ' (after scripts/sim.py arm)'))
     pending = pending_stacks(session)
     if pending:
         print('not started yet (later phases): ' + ', '.join(pending))
@@ -3138,17 +3739,18 @@ def pane_commands() -> Optional[Dict[Tuple[str, str], str]]:
 def wait_nodes_started(plan: Sequence[Tuple[Stack, List[Pane]]], log_dir: Path, timeout: float = NODES_WAIT_S
                        ) -> Tuple[float, List[str], List[str]]:
     """Until every pane has started its node: its log has node_marker()'s line, which it prints
-    once its gates have passed. A pane whose docker exec has ended is not waited for; while tmux
-    cannot list the panes, none counts as ended.
+    once its gates have passed, and then its Pane.ready line if it has one (node_started). A pane
+    whose docker exec has ended is not waited for; while tmux cannot list the panes, none counts
+    as ended.
     Returns (seconds, panes that exited, panes still waiting at the timeout) as <stack>/<slug>."""
     t0 = time.time()
-    pending = OrderedDict(('%s/%s' % (s.name, p.slug), log_dir / s.name / (p.slug + '.log'))
+    pending = OrderedDict(('%s/%s' % (s.name, p.slug), (log_dir / s.name / (p.slug + '.log'), p.ready))
                           for s, panes in plan for p in panes)
     exited = []  # type: List[str]
     while True:
-        for key, log in list(pending.items()):
+        for key, (log, ready) in list(pending.items()):
             try:
-                if NODE_STARTED_RE.search(log.read_text(errors='replace')):
+                if node_started(log.read_text(errors='replace'), ready):
                     del pending[key]
             except FileNotFoundError:
                 pass
@@ -3240,16 +3842,38 @@ def start_waves(plan: Sequence[Tuple[Stack, List[Pane]]]) -> List[List[Tuple[Sta
     return list(waves.values())
 
 
-def settle_wave(wave: Sequence[Tuple[Stack, List[Pane]]], n_agents: int, log_dir: Path) -> List[str]:
+def degraded_tf_gates(wave: Sequence[Tuple[Stack, List[Pane]]], log_dir: Path) -> List[Tuple[str, bool]]:
+    """(<stack>/<slug>, strict) of each pane whose last wait_for_tf.py run timed out."""
+    out = []
+    for s, panes in wave:
+        for p in panes:
+            try:
+                text = (log_dir / s.name / (p.slug + '.log')).read_text(errors='replace')
+            except FileNotFoundError:
+                continue
+            if tf_gate_result(text) == 'degraded':
+                out.append(('%s/%s' % (s.name, p.slug), p.strict_tf_gate))
+    return out
+
+
+def settle_wave(wave: Sequence[Tuple[Stack, List[Pane]]], n_agents: int, log_dir: Path) -> List[Tuple[str, str]]:
     """After a wave's stacks started: until its panes have started their nodes, then until the
-    sim containers are idle. Returns the panes that ended before starting their node, at once
-    (bring_up stops there); a pane that still waits, or stacks that stay busy or whose load
-    cannot be read, are reported and do not hold `up` back for ever."""
+    sim containers are idle. Returns (pane, what went wrong) for the panes that ended before
+    starting their node and the strict_tf_gate panes whose TF gate timed out, at once (bring_up
+    stops there); a pane that still waits, or stacks that stay busy or whose load cannot be read,
+    are reported and do not hold `up` back for ever."""
     log, what = log_dir / BRINGUP_LOG, ', '.join(s.name for s, _ in wave)
     waited, exited, missing = wait_nodes_started(wave, log_dir)
     log_line(log, '%s: nodes started after %.1f s; exited %s; still waiting %s' % (what, waited, exited, missing))
-    if exited:
-        return exited
+    failed = [(k, 'ended before its node started') for k in exited]
+    for key, strict in degraded_tf_gates(wave, log_dir):
+        # The global_mapper gate always times out while paused (tf_gate); a planner gate never should.
+        log_line(log, '%s: its wait_for_tf.py gate timed out and the node started degraded%s'
+                 % (key, ' (strict: stopping)' if strict else ''))
+        if strict:
+            failed.append((key, 'its TF gate timed out (wait_for_tf.py exits 0 and starts the node anyway)'))
+    if failed:
+        return failed
     if missing:
         warn('pane(s) still waiting on their gates after %.0f s: %s; going on' % (waited, ', '.join(missing)))
     limits = (SETTLE_ROUTER_PCT, SETTLE_STACKS_PCT_PER_AGENT * n_agents)
@@ -3303,11 +3927,14 @@ def unpause_physics(ctx: RunContext, log: Optional[Path] = None) -> int:
                    'scripts/sim.py down, then up again' % (log or 'no log'))
 
 
-def bring_up(session: Session, plan: Sequence[Tuple[Stack, List[Pane]]], ctx: RunContext, log_dir: Path) -> None:
+def bring_up(session: Session, plan: Sequence[Tuple[Stack, List[Pane]]], ctx: RunContext, log_dir: Path,
+             before_unpause: Optional[Callable[[], int]] = None) -> int:
     """Starts the stacks wave by wave into the paused world, then unpauses it once (when this
     `up` started gazebo). Wave 0 holds the spawn: it settles once every agent is in. A pane that
-    ends before its node starts (a failed gate, a missing file) stops `up` after its wave, before
-    the next wave and the unpause, so a broken bring-up never looks like a working one."""
+    ends before its node starts (a failed gate, a missing file), or a planner pane whose TF gate
+    timed out, stops `up` after its wave, before the next wave and the unpause, so a broken
+    bring-up never looks like a working one. before_unpause (the planner sessions' arming) runs
+    after the last wave; its exit code is returned, and 130 (Ctrl-C) leaves the world paused."""
     log = log_dir / BRINGUP_LOG
     gazebo = any(s.name == 'gazebo' for s, _ in plan)
     waves = start_waves(plan)
@@ -3320,25 +3947,141 @@ def bring_up(session: Session, plan: Sequence[Tuple[Stack, List[Pane]]], ctx: Ru
             waited = wait_spawned(log_dir)
             log_line(log, 'every agent spawned after %.1f s' % waited)
             info('every agent spawned into the paused world after %.0f s' % waited)
-        exited = settle_wave(wave, len(session.agents), log_dir)
-        if exited:
+        failed = settle_wave(wave, len(session.agents), log_dir)
+        if failed:
             later = [s.name for w in waves[k + 1:] for s, _ in w]
-            log_line(log, 'stopping: pane(s) ended before starting their node: %s' % ', '.join(exited))
+            what = '; '.join('%s %s' % kw for kw in failed)
+            log_line(log, 'stopping: %s' % what)
             raise SimError(
-                'pane(s) ended before starting their node: %s (pane logs in %s; scripts/sim.py attach %s). '
-                '`up` stops here%s%s; every safety_node stays DISARMED. Fix it, then scripts/sim.py down and up '
-                'again' % (', '.join(exited), log_dir, exited[0].split('/', 1)[0],
-                           ': the world stays paused' if gazebo else '',
-                           ', and %s did not start' % ', '.join(later) if later else ''))
+                'pane(s) failed in wave %d: %s (pane logs in %s; scripts/sim.py attach %s). `up` stops here%s%s; '
+                'every safety_node stays DISARMED. Fix it, then scripts/sim.py down and up again'
+                % (k, what, log_dir, failed[0][0].split('/', 1)[0], ': the world stays paused' if gazebo else '',
+                   ', and %s did not start' % ', '.join(later) if later else ''))
+    missing = check_graph(session, [s.name for s, _ in plan])
+    if missing:
+        log_line(log, 'graph check: ' + '; '.join(missing))
+        raise SimError(
+            'graph check: %d edge(s) of the agents\' data path are missing from the graph:\n  - %s\n'
+            'A declaration was lost while the stacks started (router.log has \'Unable to push\' then); those '
+            'nodes would never get their input. `up` stops here%s; every safety_node stays DISARMED. '
+            'scripts/sim.py down and up again' % (len(missing), '\n  - '.join(missing),
+                                                  ': the world stays paused' if gazebo else ''))
+    log_line(log, 'graph check: %d edge(s) in the graph' % len(graph_edges(session, [s.name for s, _ in plan])))
+    rc = before_unpause() if before_unpause else 0
+    if rc == 130:
+        log_line(log, 'interrupted before the unpause: the world stays paused')
+        return rc
     if gazebo:
         attempt = unpause_physics(ctx, log)
         log_line(log, 'physics unpaused')
         info('physics unpaused at %s%s; DLIO calibrates its IMU now' % (
             time.strftime(HOST_TIME_FMT), '' if attempt == 1 else ' (try %d)' % attempt))
+    return rc
+
+
+# What each agent's stacks need of each other, as (topic under /<ns>/, the subscribing node, the stacks
+# both ends run in, the mapping mode it is for or None): the data path, end to end. A declaration
+# the router lost while starting (PANE_START_GAP_S) leaves a node unsubscribed for good, and the
+# agent never moves while everything looks up; check_graph sees it before the unpause.
+GRAPH_EDGES = (
+    ('livox/lidar', 'dlio_odom_node', ('gazebo', 'dlio'), None),
+    ('dlio/odom_node/odom', 'convert_odom_to_state', ('dlio', 'mighty'), None),
+    ('dlio/odom_node/pose', 'mpc', ('dlio', 'mighty'), None),
+    ('dlio/odom_node/pose', 'global_mapper_ros', ('dlio', 'mapping'), None),
+    ('dlio/odom_node/pointcloud/deskewed', 'global_mapper_ros', ('dlio', 'mapping'), None),
+    ('dlio/odom_node/pointcloud/deskewed', 'elevation_mapping_node', ('dlio', 'elevation'), None),
+    ('elev/occ_2d_topic', 'map_fusion_node', ('elevation', 'mapping'), 'gpu'),
+    ('voxel/occ_2d_topic', 'map_fusion_node', ('mapping',), 'gpu'),
+    ('persistent_map/grid', 'map_fusion_node', ('mapping',), 'gpu'),
+    ('live/occ_2d_topic', 'persistent_map_node', ('mapping',), None),
+    ('occ_2d_topic', 'mighty_node', ('mapping', 'mighty'), None),
+    ('occ_2d_topic', 'goal_selector', ('mapping', 'mighty'), None),
+    ('esdf_2d_topic', 'mighty_node', ('mapping', 'mighty'), None),
+    ('persistent_map/grid', 'goal_selector', ('mapping', 'mighty'), None),
+    ('state', 'mighty_node', ('mighty',), None),
+    ('term_goal', 'mighty_node', ('mighty',), None),
+    ('mpc_waypoints', 'mpc', ('mighty',), None),
+    ('cmd_vel_auto', 'safety_node', ('mighty', 'drive'), None),
+    ('term_goal_rviz', 'goal_selector', ('mighty', 'goals'), None),
+)
+GRAPH_CHECK_S = 30            # discovery: entries that are late come within seconds; lost ones never
+
+
+def graph_edges(session: Session, stacks: Iterable[str]) -> List[Tuple[str, str]]:
+    """(topic, subscriber FQN) of every GRAPH_EDGES edge the running stacks make, per agent."""
+    names = set(stacks)
+    return [('/%s/%s' % (a.name, topic), '/%s/%s' % (a.name, node)) for a in session.agents
+            for topic, node, need, mode in GRAPH_EDGES
+            if set(need) <= names and mode in (None, session.mapping)]
+
+
+# One rclpy node with no publisher or subscription of its own (only the graph cache): leaving costs
+# nothing. Arguments <deadline s> then <topic>|<subscriber FQN>; it re-reads until every edge has its
+# subscriber and a publisher, or the deadline: '@@ <topic> <subscriber> ok|nosub|nopub' each.
+_GRAPH_PY = r"""
+import sys, time
+import rclpy
+from rclpy.node import Node
+from rclpy.signals import SignalHandlerOptions
+end = time.time() + float(sys.argv[1])
+want = [tuple(a.split('|', 1)) for a in sys.argv[2:]]
+rclpy.init(args=[], signal_handler_options=SignalHandlerOptions.NO)
+node = Node('rover_sim_graph_check', namespace='/sim', enable_rosout=False, start_parameter_services=False)
+
+def state(topic, sub):
+    subs = {(i.node_namespace.rstrip('/') + '/' + i.node_name) for i in node.get_subscriptions_info_by_topic(topic)}
+    return 'nosub' if sub not in subs else 'ok' if node.get_publishers_info_by_topic(topic) else 'nopub'
+
+seen = {}
+while True:
+    rclpy.spin_once(node, timeout_sec=0.5)
+    seen = dict((w, state(*w)) for w in want)
+    if all(v == 'ok' for v in seen.values()) or time.time() > end:
+        break
+for (topic, sub), v in seen.items():
+    print('@@ %s %s %s' % (topic, sub, v), flush=True)
+node.destroy_node()
+time.sleep(0.5)
+rclpy.try_shutdown()
+"""
+
+
+def check_graph(session: Session, stacks: Iterable[str]) -> List[str]:
+    """The GRAPH_EDGES that are not in the graph ('<sub> is not subscribed to <topic>', or no
+    publisher), from one graph-only rclpy process in sim-drive; [] if every edge is."""
+    edges = graph_edges(session, stacks)
+    if not edges:
+        return []
+    inner = ' && '.join([setup_snippet(CONTAINERS[QUERY_CONTAINER]),
+                         'exec timeout -k 2 %d python3 -c "$SIM_GRAPH_PY" "$@"' % (GRAPH_CHECK_S + 10)])
+    p = dexec(QUERY_CONTAINER, ['bash', '-c', inner, 'graph', str(GRAPH_CHECK_S)] + ['%s|%s' % e for e in edges],
+              check=False, timeout=GRAPH_CHECK_S + 20, env=(('SIM_GRAPH_PY', _GRAPH_PY),))
+    got = dict(((f[1], f[2]), f[3]) for f in (l.split() for l in (p.stdout or '').splitlines())
+               if len(f) == 4 and f[0] == '@@')
+    out = []
+    for topic, sub in edges:
+        v = got.get((topic, sub))
+        if v != 'ok':
+            out.append('%s is not subscribed to %s' % (sub, topic) if v == 'nosub' else
+                       'no publisher of %s (for %s)' % (topic, sub) if v == 'nopub' else
+                       '%s on %s: not checked (query exit %s)' % (sub, topic, p.returncode))
+    return out
+
+
+def load_up_session(arg: str) -> Session:
+    """The session `up` runs: its file, with ROVER_SIM_AGENTS's agents when that is set."""
+    session = load_session(arg)
+    agents = os.environ.get(AGENTS_ENV, '').strip()
+    return apply_agents_env(session, agents) if agents else session
+
+
+START_WAIT_S = 60             # `start`: the restarted stack's panes to their node marker (no settle)
 
 
 def cmd_up(args: argparse.Namespace) -> int:
-    session = load_session(args.session)
+    session = load_up_session(args.session)
+    if args.rviz:
+        session = dataclasses.replace(session, rviz=True)       # this run only; session.json says so
     stacks = select_stacks(session, args.stacks)
     run_dir = run_dir_from_env()
     ctx = RunContext(run_dir=run_dir, rust_log=os.environ.get('RUST_LOG_ZENOH', 'zenoh=info'),
@@ -3400,35 +4143,205 @@ def cmd_up(args: argparse.Namespace) -> int:
     ctx = dataclasses.replace(ctx, log_dir=log_dir)
     for step in generate_steps(stacks):
         step(session, ctx)
-    info('session %s: %s' % (session.name, ', '.join('%s (%s)' % (a.name, a.cls) for a in session.agents)))
+    info('session %s: %s%s' % (session.name, ', '.join('%s (%s)' % (a.name, a.cls) for a in session.agents),
+                               ' (%s=%s)' % (AGENTS_ENV, session.agents_env) if session.agents_env else ''))
     if any(s.name == 'mapping' for s in stacks):
         (warn if session.mapping == 'fallback' else info)('mapping: ' + mapping_label(session.mapping))
+    if any(s.name == 'rviz' for s in stacks) and len(session.agents) > 2:
+        # 2026-10-20, multi_agent_swap with RViz: demo_eval's probe joining (29 subscriptions) stalled
+        # delivery for 29 s, then 58 s, and every DLIO diverged; without RViz the same probe is harmless.
+        warn('RViz is on with %d agents: run no probe or graded tool (demo_eval, status, parity_check, '
+             'start) while it is: a session joining has stalled the whole graph for tens of seconds then'
+             % len(session.agents))
     pending = pending_stacks(session)
     if pending:
         info('not started yet (later phases): ' + ', '.join(pending))
     info('pane logs: %s' % log_dir)
     info('run dir:   %s' % run_dir)
-    bring_up(session, plan, ctx, log_dir)
-    if not arm:
-        if session.auto_arm and not args.no_arm:
-            info('not arming: the dlio and drive stacks are not both started (scripts/sim.py arm)')
-        elif not session.auto_arm:
-            info('not arming: auto_arm is off; every safety_node stays DISARMED until scripts/sim.py arm')
+    # The planner sessions arm while paused: the arm query's leave stalls the planner's big graph
+    # (STATUS_LEAVE_GAP_S), harmless while nothing flows. It is safe then: nothing commands motion
+    # before DLIO tracks (mighty, goal_selector and goal_relay.py act on its estimate, mpc sends zeros
+    # without a path), so the agents stay still through DLIO's IMU calibration as before.
+    paused = arm and session.planner
+    # Gate 'session': the arm records each agent's DLIO session, so a later re-arm in it is not
+    # held to the seed height after DLIO has drifted (arm_z_check). wait_for_seed.py has made sure
+    # the seed reached DLIO's container before DLIO started, which is what that check guards.
+    rc = bring_up(session, plan, ctx, log_dir, before_unpause=(
+        lambda: arm_after_up(session, log_dir, 'session', run_dir=run_dir)) if paused else None)
+    if rc == 130:
+        return rc
+    if arm and not paused:
+        rc = arm_after_up(session, log_dir, run_dir=run_dir)
+    elif session.auto_arm and not args.no_arm and not arm:
+        info('not arming: the dlio and drive stacks (and mighty, in a planner session) are not all started '
+             '(scripts/sim.py arm)')
+    elif not session.auto_arm:
+        info('not arming: auto_arm is off; every safety_node stays DISARMED until scripts/sim.py arm')
+    if not arm and any(s.name == 'goals' for s in stacks):
+        info('goal_relay.py first drives each agent once it is in AUTO, then %s: scripts/sim.py arm'
+             % ('starts the swap' if goal_mode(session) == 'swap' else 'relays RViz goals'))
+    return rc
+
+
+def rotate_pane_logs(stack_log: Path, panes: Sequence[Pane]) -> None:
+    """A restarted stack's pane logs start empty (the old ones keep their time in the name), so
+    its node markers are the new run's."""
+    stamp = time.strftime('%Y%m%d_%H%M%S')
+    for p in panes:
+        f = stack_log / (p.slug + '.log')
+        if f.is_file():
+            f.rename(stack_log / ('%s.%s.log' % (p.slug, stamp)))
+
+
+def cmd_start(args: argparse.Namespace) -> int:
+    """(Re)start one last-wave stack alone on the running session: its old process is
+    stopped, its files regenerated, its panes started in the run's pane-log dir. It joins (and the
+    old one leaves) a running graph: the module docstring's stall caveat applies. Fails closed like
+    status: with isolation broken it starts nothing (exit 3)."""
+    stack = STACKS[args.stack]
+    container = stack.containers[0]
+    if container not in running_sim_containers():
+        raise SimError('%s of project %s is not running (scripts/sim.py up <session>)' % (container, PROJECT))
+    run_dir = resolve_run_dir()
+    session = load_running_session(run_dir)
+    if stack.name == 'rviz':
+        session = dataclasses.replace(session, rviz=True)       # asked for: the session's flag aside
+    if stack.name == 'goals' and not session.planner:
+        raise SimError('session %s runs no planner (planner: false): nothing reads goals' % session.name)
+    problems = check_isolation()
+    if problems:
+        print('isolation: BROKEN\n  - ' + '\n  - '.join(problems))
+        print('not starting %s: no ROS session is opened while isolation is broken' % stack.name)
+        return 3
+    if stack.name == 'goals' and TMUX_PREFIX + 'mighty' not in tmux_sessions():
+        warn('no %smighty session: goal_relay.py will have no goal_selector to talk to' % TMUX_PREFIX)
+    warn('%s joins the running graph (and its old process leaves it): zenoh delivery may stall for a '
+         'moment; do not do this in a window that is being graded' % stack.name)
+    n = stop_processes(container, match=RESTARTABLE[stack.name], grace_term=3,
+                       grace_int=max(5.0, goal_relay_leave_s(len(session.agents))) if stack.name == 'goals' else 5)
+    if n:
+        info('%s: stopped %d process(es) of the old %s' % (container, n, stack.name))
+    latest = LOG_ROOT / 'latest'
+    log_dir = latest.resolve() if latest.is_dir() else make_log_dir()
+    ctx = RunContext(run_dir=run_dir, log_dir=log_dir, gz_spare_cpus=gz_spare_from_env())
+    for step in stack.generate:
+        step(session, ctx)
+    if stack.needs_display(session):
+        grant_x_access()
+    panes = stack.panes(session, ctx)
+    (log_dir / stack.name).mkdir(parents=True, exist_ok=True)
+    rotate_pane_logs(log_dir / stack.name, panes)
+    sess = start_stack(stack, panes, log_dir)
+    info('%-11s up: tmux attach -t %s   (scripts/sim.py attach %s)' % (stack.name, sess, stack.name))
+    waited, exited, missing = wait_nodes_started([(stack, panes)], log_dir, timeout=START_WAIT_S)
+    if exited or missing:
+        warn('%s: pane(s) %s %s (pane logs in %s)' % (stack.name, ', '.join(exited + missing),
+                                                     'ended before starting their node' if exited
+                                                     else 'still waiting after %.0f s' % waited, log_dir / stack.name))
+        return 1
+    info('%s: its node started after %.0f s' % (stack.name, waited))
+    if stack.name == 'rviz' and TMUX_PREFIX + 'goals' not in tmux_sessions():
+        info('RViz SetGoal publishes %s: scripts/sim.py start goals relays it to the agents' % GOAL_TOPIC)
+    return 0
+
+
+def cmd_viz(args: argparse.Namespace) -> int:
+    """Start sim_viz.py on the running session in sim-viz (compose profile viz, so `up` never starts
+    it), or stop it (--stop). A running viewer leaves first: one viewer at a time, and compose may
+    recreate the container (a new image or $DISPLAY), which would cut a running leave short. Fails
+    closed like start: with isolation broken it opens no ROS session (exit 3)."""
+    if args.stop:
+        if not stop_viz():
+            info('no viewer was running')
         return 0
-    return arm_after_up(session, log_dir)
+    if ROUTER_CONTAINER not in running_sim_containers():
+        raise SimError('%s of project %s is not running (scripts/sim.py up <session>)' % (ROUTER_CONTAINER, PROJECT))
+    run_dir = resolve_run_dir()
+    names = session_agents(run_dir, args.agents or ())
+    if len(names) > VIZ_MAX_PANELS:
+        raise SimError('%d agents (%s): pick up to %d with --agents' % (len(names), ', '.join(names), VIZ_MAX_PANELS))
+    bad = [l for l in args.layers or () if l not in VIZ_LAYERS + ('default', 'all')]
+    if bad:
+        raise SimError('unknown layer(s) %s (layers: %s, default, all)' % (', '.join(bad), ', '.join(VIZ_LAYERS)))
+    if not (run_dir / SPAWN_FILE).is_file():
+        raise SimError('no %s in %s: scripts/sim.py up <session>' % (SPAWN_FILE, run_dir))
+    if args.snapshot:
+        return viz_snapshot(args, run_dir)
+    if not os.environ.get('DISPLAY'):
+        raise SimError('no DISPLAY: the viewer opens a window on it (headless: scripts/sim.py viz --snapshot <png>)')
+    stop_viz()
+    sh(compose_cmd([VIZ_PROFILE]) + ['up', '-d', VIZ_CONTAINER], capture=False, env=compose_env(run_dir))
+    wait_running([VIZ_CONTAINER])
+    problems = check_isolation()
+    if problems:
+        print('isolation: BROKEN\n  - ' + '\n  - '.join(problems))
+        print('not starting the viewer: no ROS session is opened while isolation is broken')
+        return 3
+    info('isolation OK: %s is internal and reaches nothing on this host' % NETWORK)
+    grant_x_access()
+    warn('the viewer joins the running graph (and leaves it on q / viz --stop, one subscription at a time): zenoh '
+         'delivery may stall for a moment; do not do this in a window that is being graded')
+    latest = LOG_ROOT / 'latest'
+    log_dir = latest.resolve() if latest.is_dir() else make_log_dir()
+    panes = viz_panes(args.agents or (), args.layers or (), args.follow)
+    (log_dir / VIZ_STACK.name).mkdir(parents=True, exist_ok=True)
+    rotate_pane_logs(log_dir / VIZ_STACK.name, panes)
+    sess = start_stack(VIZ_STACK, panes, log_dir)
+    info('%-11s up: tmux attach -t %s   (scripts/sim.py attach viz; scripts/sim.py viz --stop closes it)'
+         % (VIZ_STACK.name, sess))
+    waited, exited, missing = wait_nodes_started([(VIZ_STACK, panes)], log_dir, timeout=START_WAIT_S)
+    if exited or missing:
+        warn('viz: pane %s (log %s)' % ('ended before starting the viewer' if exited else
+                                         'still waiting after %.0f s' % waited, log_dir / VIZ_STACK.name / 'viz.log'))
+        return 1
+    info('viz: the viewer started after %.0f s (log %s)' % (waited, log_dir / VIZ_STACK.name / 'viz.log'))
+    return 0
 
 
-def arm_after_up(session: Session, log_dir: Path) -> int:
-    """auto_arm: every agent's safety_node to AUTO once its DLIO is past the IMU calibration.
-    Isolation is checked again first: no ROS session is opened on a broken network."""
+def viz_snapshot(args: argparse.Namespace, run_dir: Path) -> int:
+    """One frame of the viewer to args.snapshot on this host: in sim-viz (a running viewer's container
+    is used as it is: a recreate would stop it), after the same isolation check, then docker cp."""
+    if args.snapshot_after < 0:
+        raise SimError('--snapshot-after must be >= 0')
+    if VIZ_CONTAINER not in running_sim_containers():
+        sh(compose_cmd([VIZ_PROFILE]) + ['up', '-d', VIZ_CONTAINER], capture=False, env=compose_env(run_dir))
+        wait_running([VIZ_CONTAINER])
+    problems = check_isolation()
+    if problems:
+        print('isolation: BROKEN\n  - ' + '\n  - '.join(problems))
+        print('not taking the snapshot: no ROS session is opened while isolation is broken')
+        return 3
+    info('isolation OK: %s is internal and reaches nothing on this host' % NETWORK)
+    warn('the snapshot joins the running graph for %.0f s and leaves it one subscription at a time'
+         % args.snapshot_after)
+    # The leave is at most VIZ_STOP_GRACE_S; past the timeout only this exec ends, the viewer leaves anyway.
+    p = dexec(VIZ_CONTAINER, viz_snapshot_argv(args.agents or (), args.layers or (), args.snapshot_after, args.follow),
+              check=False, timeout=args.snapshot_after + VIZ_STOP_GRACE_S + 30)
+    sys.stdout.write(p.stdout or '')
+    sys.stderr.write(p.stderr or '')
+    if p.returncode != 0:
+        raise SimError('sim_viz.py --snapshot exited %d' % p.returncode)
+    out = Path(args.snapshot).resolve()
+    out.parent.mkdir(parents=True, exist_ok=True)
+    sh(['docker', 'cp', '%s:%s' % (sim_only(VIZ_CONTAINER), VIZ_SNAPSHOT_IN), str(out)])
+    info('viz: wrote %s' % out)
+    return 0
+
+
+def arm_after_up(session: Session, log_dir: Path, gate: str = 'dlio', run_dir: Optional[Path] = None) -> int:
+    """auto_arm: every agent's safety_node to AUTO once its DLIO is past the IMU calibration (gate
+    dlio), or at once, recording each DLIO session (gate session: the planner sessions, before
+    the unpause). Isolation is checked
+    again first: no ROS session is opened on a broken network."""
     names = [a.name for a in session.agents]
     problems = check_isolation()
     if problems:
         raise SimError('NOT ARMING: the sim is not isolated from this host:\n  - ' + '\n  - '.join(problems))
-    info('arming %s once each DLIO registers scans (auto_arm; Ctrl-C stops and disarms them; later: '
-         'scripts/sim.py arm)' % ', '.join(names))
+    info('arming %s %s (auto_arm; Ctrl-C stops and disarms them; later: scripts/sim.py arm)' % (
+        ', '.join(names), 'once each DLIO registers scans' if gate == 'dlio' else
+        'now, before the unpause: nothing commands motion until DLIO tracks'))
     try:
-        res = arm_agents(names, 'auto_mode', 'dlio', ARM_TIMEOUT_UP_S, log_dir / ARM_LOG)
+        res = arm_agents(names, 'auto_mode', gate, ARM_TIMEOUT_UP_S, log_dir / ARM_LOG, run_dir=run_dir)
     except ArmInterrupted as e:
         report_interrupted(e)
         return 130
@@ -3459,8 +4372,12 @@ def cmd_arm(args: argparse.Namespace) -> int:
         warn('no %sdrive session: is safety_node running?' % TMUX_PREFIX)
     latest = LOG_ROOT / 'latest'
     gate = 'dlio' if service == 'auto_mode' and not args.now else 'none'
+    z_check = not getattr(args, 'no_z_check', False)
+    if not z_check and gate == 'dlio':
+        warn('--no-z-check: arming without the DLIO odom height check (logged in %s)' % ARM_LOG)
     try:
-        res = arm_agents(names, service, gate, args.timeout, latest / ARM_LOG if latest.is_dir() else None)
+        res = arm_agents(names, service, gate, args.timeout, latest / ARM_LOG if latest.is_dir() else None,
+                         run_dir=run_dir, z_check=z_check)
     except ArmInterrupted as e:
         report_interrupted(e)
         return 130
@@ -3494,6 +4411,18 @@ def cmd_attach(args: argparse.Namespace) -> int:
     return 0  # not reached
 
 
+def pane_gate_note(stack: str, slug: str) -> str:
+    """For a strict_tf_gate pane: its last TF gate's outcome, from this run's pane log (a pane
+    restarted later may have proceeded degraded, which `up` cannot see)."""
+    try:
+        result = tf_gate_result((LOG_ROOT / 'latest' / stack / (slug + '.log')).read_text(errors='replace'))
+    except OSError:
+        return ''
+    if result == 'degraded':
+        return '  (TF gate TIMED OUT: the node started without <ns>/map -> <ns>/odom)'
+    return '  (TF gate passed)' if result == 'ok' else ''
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     up = running_sim_containers()
     print('containers (project %s, network %s):' % (PROJECT, NETWORK))
@@ -3517,16 +4446,17 @@ def cmd_status(args: argparse.Namespace) -> int:
               % (ROUTER_HOST, ROUTER_PORT, 'listening' if router_up() else 'DOWN', links['router'],
                  links['p2p'], links['listen'], links['syn_sent']))
     p = tmux('list-panes', '-a', '-F', '#{session_name}\t#{window_name}\t#{pane_index}\t#{pane_title}\t'
-             '#{pane_current_command}', check=False)
-    rows = [l.split('\t') for l in (p.stdout or '').splitlines() if l.startswith(TMUX_PREFIX)]
+             '#{pane_current_command}\t#{%s}\t#{%s}' % (PANE_SLUG_OPTION, PANE_TF_GATE_OPTION), check=False)
+    rows = [(l.split('\t') + ['', ''])[:7] for l in (p.stdout or '').splitlines() if l.startswith(TMUX_PREFIX)]
     print('tmux:%s' % ('' if rows else ' no rsim-* sessions'))
-    for sess, win, idx, title, cmd in rows:
+    for sess, win, idx, title, cmd, slug, gate in rows:
         # The pane's bash is back at its prompt once its docker exec has ended.
-        print('  %s:%s.%s  %-9s %s' % (sess, win, idx, 'running' if cmd == 'docker' else 'EXITED', title))
+        print('  %s:%s.%s  %-9s %s%s' % (sess, win, idx, 'running' if cmd == 'docker' else 'EXITED', title,
+                                         pane_gate_note(sess[len(TMUX_PREFIX):], slug) if gate == 'strict' else ''))
     run_dir = resolve_run_dir() if up else run_dir_from_env()
-    sf = run_dir / 'session.json'
+    sf = run_dir / SESSION_FILE
     s = json.loads(sf.read_text()) if sf.is_file() else None
-    stacks = {r[0][len(TMUX_PREFIX):] for r in rows} & {'gazebo', 'dlio', 'drive', 'mapping'}
+    stacks = {r[0][len(TMUX_PREFIX):] for r in rows} & {'gazebo', 'dlio', 'drive', 'mapping', 'mighty'}
     if s:
         print('session: %s (%s), world %s, agents %s' % (
             s['name'], s.get('source', ''), s['world'], ', '.join(a['name'] for a in s['agents'])))
@@ -3547,10 +4477,11 @@ def cmd_status(args: argparse.Namespace) -> int:
                 print('  ' + line)
         else:
             print('sim time: n/a (the gazebo stack is not running)')
-        if stacks & {'dlio', 'drive', 'mapping'}:
+        if stacks & {'dlio', 'drive', 'mapping', 'mighty'}:
             fallback = s.get('mapping') == 'fallback' and 'mapping' in stacks
-            print('agents (DLIO%s over %g s; safety_node mode%s%s%s):' % (
+            print('agents (DLIO%s over %g s; safety_node mode%s%s%s%s):' % (
                 ' and maps' if maps else '', RATE_WINDOW_S, '' if s.get('auto_arm', False) else '; auto_arm off',
+                '; planner: mpc\'s cmd_vel_auto, mighty_node\'s map_hold' if 'mighty' in stacks else '',
                 '; maps not read (status --maps)' if 'mapping' in stacks and not maps else '',
                 '; maps from the fallback, NOT PARITY' if fallback else ''))
             for line in agent_lines(names, vals, stacks, maps):
@@ -3581,7 +4512,14 @@ ODOM_MAX_AGE_S = 1.0                   # an older DLIO odom stamp: no IMU is rea
 # all destroyed at once, then a pause: 0.7 s. One every 0.1 s, with no rosout and no parameter
 # services on its node (entities its close would otherwise undeclare in a burst): none, the
 # clouds' worst inter-arrival 141-205 ms, as without a query (Phase 4 review, 4 runs of each).
-STATUS_LEAVE_GAP_S = 0.1
+# With the planner up the graph is several times bigger (mighty_node alone has ~145 entities, 83 of
+# them frame_align subscriptions with ids up to 84), and each undeclaration then holds the router a
+# full core for ~0.3 s: clouds 440-530 ms apart for one subscription or client, 820-900 ms for 4
+# at 0.1 s, 1.9 s for 8, about 3 s for the arm query's 16 (DLIO diverged). Spread out they do not
+# add up: 1 s apart, worst 461 ms for 4; 0.5 s apart (status, parity_check, demo_eval's recorder on
+# the driving 4-agent swap), the IMU at most 0.47-0.54 s late, no re-anchor. Client-mode sessions
+# cost the same (Phase 5, both measured).
+STATUS_LEAVE_GAP_S = 0.5
 STATUS_LEAVE_PAUSE_S = 0.5
 # Both queries run in sim-drive, on the cores the non-Gazebo stacks share, not on the core of
 # sim-gazebo where the sensor bridges run: DLIO odom is 100 Hz per agent.
@@ -3599,19 +4537,22 @@ QUERY_CONTAINER = ROUTER_CONTAINER
 #   grid   nav_msgs/OccupancyGrid: as odom, its stamp read from the serialised header (a grid
 #          is not deserialised: the persistent map grows to megabytes)
 #   change a grid published only when it changed (persistent_map/grid): as grid, not waited for
+#   twist  geometry_msgs/Twist: rate, count, last linear.x and angular.z  '@@ <topic> <Hz> <n> <v> <w>'
+#   bool   std_msgs/Bool, last value                        '@@ <topic> true|false'
 # or '@@ <topic>' if nothing came. It stops when every one-shot value is in and every rate
 # but a `change` one (unless only those were asked for) has RATE_WINDOW_S of samples, or at
 # the deadline. Subscriptions are best effort, so the publishers' KEEP_LAST queues never wait
-# for this reader; safety_node's mode is TRANSIENT_LOCAL but also re-published at 2 Hz, so no
-# late-joiner delivery is needed.
+# for this reader; safety_node's mode is TRANSIENT_LOCAL but also re-published at 2 Hz, and
+# mighty_node's map_hold at 1 Hz, so no late-joiner delivery is needed.
 _STATUS_PY = r"""
 import struct, sys, time
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy
+from geometry_msgs.msg import Twist
 from nav_msgs.msg import OccupancyGrid, Odometry
 from sensor_msgs.msg import PointCloud2
-from std_msgs.msg import Float64, String
+from std_msgs.msg import Bool, Float64, String
 end, window = time.time() + float(sys.argv[1]), float(sys.argv[2])
 specs = [a.split(':', 1) for a in sys.argv[3:]]
 LEAVE_GAP_S, LEAVE_PAUSE_S = @LEAVE@
@@ -3619,8 +4560,9 @@ rclpy.init(args=[])
 node = Node('sim_status_%d' % (time.time_ns() % 1000000), enable_rosout=False, start_parameter_services=False)
 qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
 TYPES = {'f64': Float64, 'str': String, 'odom': Odometry, 'count': PointCloud2, 'grid': OccupancyGrid,
-         'change': OccupancyGrid}
+         'change': OccupancyGrid, 'twist': Twist, 'bool': Bool}
 RAW = ('count', 'grid', 'change')
+ONCE = ('f64', 'str', 'bool')
 times, last = {t: [] for _, t in specs}, {}
 def raw_stamp(b):
     # Little-endian CDR: a 4-byte encapsulation header, then header.stamp (int32 sec, uint32 nsec).
@@ -3633,17 +4575,19 @@ def cb(kind, topic):
         times[topic].append(time.time())
         if kind == 'f64':
             last.setdefault(topic, m.data)
-        elif kind == 'str':
+        elif kind in ('str', 'bool'):
             last[topic] = m.data
         elif kind == 'odom':
             last[topic] = m.header.stamp.sec + m.header.stamp.nanosec * 1e-9
         elif kind in ('grid', 'change'):
             last[topic] = raw_stamp(m)
+        elif kind == 'twist':
+            last[topic] = (m.linear.x, m.angular.z)
     return f
 subs = [node.create_subscription(TYPES[k], t, cb(k, t), qos, raw=(k in RAW)) for k, t in specs]
 waited = [(k, t) for k, t in specs if k != 'change'] or specs
 def complete():
-    return all((t in last) if k in ('f64', 'str') else (times[t] and times[t][-1] - times[t][0] >= window)
+    return all((t in last) if k in ONCE else (times[t] and times[t][-1] - times[t][0] >= window)
                for k, t in waited)
 while time.time() < end and not complete():
     rclpy.spin_once(node, timeout_sec=0.05)
@@ -3655,10 +4599,14 @@ for k, t in specs:
     r = times[t]
     if not r:
         out.append('@@ %s' % t)
+    elif k == 'bool':
+        out.append('@@ %s %s' % (t, 'true' if last[t] else 'false'))
     elif k in ('f64', 'str'):
         out.append('@@ %s %s' % (t, last[t]))
     elif k in ('odom', 'grid', 'change'):
         out.append('@@ %s %s %.3f %d' % (t, rate(r), now - last[t] if last[t] else float('inf'), len(r)))
+    elif k == 'twist':
+        out.append('@@ %s %s %d %.3f %.3f' % ((t, rate(r), len(r)) + last[t]))
     else:
         out.append('@@ %s %s %d' % (t, rate(r), len(r)))
 print('\n'.join(out), flush=True)
@@ -3700,10 +4648,22 @@ def grid_topic(n: str, grid: str) -> str:
     return '/%s/%s' % (n, grid)
 
 
+# The planner's liveness, in two subscriptions per agent and types sim-drive has: mpc's command
+# (30 Hz from its start, zero until a path) and mighty_node's map-age hold (1 Hz from its own
+# timer, goal or not). Their goal topics are one-shot (term_goal, at a commit) or mighty's own
+# message types, which the query container does not have.
+def cmd_vel_auto_topic(n: str) -> str:
+    return '/%s/cmd_vel_auto' % n
+
+
+def map_hold_topic(n: str) -> str:
+    return '/%s/map_hold' % n
+
+
 def status_specs(names: Sequence[str], stacks: Iterable[str], maps: bool = False) -> List[str]:
     """What `status` reads for the stacks that run: the bridges' sim/rtf and
-    sim/time_offset, DLIO's odom and deskewed scans, safety_node's mode, and with maps the
-    planner's grids."""
+    sim/time_offset, DLIO's odom and deskewed scans, safety_node's mode, the planner's
+    liveness, and with maps the planner's grids."""
     stacks = set(stacks)
     out = []  # type: List[str]
     for n in names:
@@ -3713,6 +4673,8 @@ def status_specs(names: Sequence[str], stacks: Iterable[str], maps: bool = False
             out += ['odom:' + odom_topic(n), 'count:' + scans_topic(n)]
         if 'drive' in stacks:
             out.append('str:/%s/mode' % n)
+        if 'mighty' in stacks:
+            out += ['twist:' + cmd_vel_auto_topic(n), 'bool:' + map_hold_topic(n)]
         if maps and 'mapping' in stacks:
             out += ['%s:%s' % (kind, grid_topic(n, g)) for g, _, kind in MAP_GRIDS]
     return out
@@ -3785,10 +4747,31 @@ def agent_lines(names: Sequence[str], vals: Dict[str, List[str]], stacks: Iterab
         if 'drive' in stacks:
             mode = (vals.get('/%s/mode' % n) or [None])[0]
             parts.append('safety %s' % mode if mode else 'safety: no /%s/mode (scripts/sim.py attach drive)' % n)
+        if 'mighty' in stacks:
+            parts.append(planner_part(n, vals))
         if maps and 'mapping' in stacks:
             parts.append(map_part(n, vals))
         out.append('%s  %s' % (n, ',  '.join(parts)))
     return out
+
+
+def planner_part(n: str, vals: Dict[str, List[str]]) -> str:
+    """mpc's cmd_vel_auto (rate, last command) and mighty_node's map_hold of one agent."""
+    t = cmd_vel_auto_topic(n)
+    hz, v, w = _num(vals, t), _num(vals, t, 2), _num(vals, t, 3)
+    if hz is None:
+        cmd = 'cmd_vel_auto: none in %d s (mpc running? scripts/sim.py attach mighty)' % ECHO_TIMEOUT_S
+    else:
+        cmd = 'cmd_vel_auto %.0f Hz (v %s m/s, w %s rad/s)' % (hz, '-' if v is None else '%.2f' % v,
+                                                              '-' if w is None else '%.2f' % w)
+    hold = (vals.get(map_hold_topic(n)) or [None])[0]
+    if hold is None:
+        held = 'no map_hold in %d s (mighty_node running? scripts/sim.py attach mighty)' % ECHO_TIMEOUT_S
+    elif hold == 'true':
+        held = 'map_hold ON: mighty holds the agent, its maps are stale'
+    else:
+        held = 'map_hold off'
+    return 'planner: %s, %s' % (cmd, held)
 
 
 def map_part(n: str, vals: Dict[str, List[str]]) -> str:
@@ -3809,48 +4792,104 @@ def map_part(n: str, vals: Dict[str, List[str]]) -> str:
     return 'maps: ' + ', '.join(grids)
 
 
+def dlio_session_id(data: str) -> Optional[str]:
+    """The id in a /<ns>/dlio/session payload (dlio_ws scripts/dlio_session.py: JSON with an
+    "id" that changes exactly when DLIO restarts), or None for anything else. One word: the
+    arm query prints it in a line of words."""
+    try:
+        sid = json.loads(data).get('id')
+    except (TypeError, ValueError, AttributeError):
+        return None
+    return sid if isinstance(sid, str) and sid.split() == [sid] else None
+
+
+def arm_z_check(n: str, z: float, height: float, z_tol: float, session: Optional[str], armed: Optional[str],
+                check: bool = True) -> Tuple[Optional[str], Optional[str]]:
+    """(blocker, warning) for agent n's DLIO odom z at an arm. The check catches a seed that
+    came too late (odom anchored at z 0), which the first arm of a DLIO session sees; later in
+    a session z drifts legitimately (0.51 against 0.36 after a long run), so an agent armed
+    before in the same session (armed: the id recorded then, session: the one it publishes
+    now) only gets a warning. A new session (DLIO restarted), or none seen, is checked again.
+    The arm query runs this source too (_ARM_PY)."""
+    off = z - height
+    if not check or abs(off) <= z_tol:
+        return None, None
+    # The late-seed signature first: odom anchored at 0 blocks in any session, also one a paused arm
+    # recorded (gate session checks no z), so that record cannot excuse it later.
+    if abs(z) <= z_tol:
+        return ('DLIO odom z %.2f, expected %.2f: the seed pose came too late; restart its dlio pane '
+                '(scripts/sim.py attach dlio: Ctrl-C, Up, Enter)' % (z, height)), None
+    if session is not None and session == armed:
+        return None, 'odometry z drifted %+.2f m since its DLIO session started; not blocking' % off
+    why = ('no /%s/dlio/session seen' % n if session is None else
+           'first arm in this DLIO session' if armed is None else 'DLIO restarted since its last arm')
+    return ('DLIO odom z %.2f, expected %.2f (offset %+.2f; %s): restart its dlio pane (resets that agent\'s '
+            'maps) or scripts/sim.py arm --no-z-check %s' % (z, height, off, why, n)), None
+
+
 # Arming. One rclpy process for every agent, in sim-drive next to the safety_nodes. For
 # auto_mode it waits, per agent, until DLIO is past its IMU calibration (fresh odom stamps
 # and at least one deskewed scan: DLIO registers scans only once calibrated), its odom sits
-# at the seed height (DLIO registers scans seeded or not, odom.cc:913-916, and a seed that
-# came too late leaves odom at z 0) and safety_node reports its mode; an agent already in
-# AUTO is left alone. Then it calls the Trigger and waits for safety_node to report the new
-# mode. disarm calls at once. A call with no answer is repeated: both services are
-# idempotent. Prints '[arm] ...' progress and one '@@ <ns> ok|refused|timeout mode=<mode>
-# <message>' per agent. The marker in the first line lets `stop_processes(match=...)` find
-# it: a killed docker exec client leaves its process running in the container.
+# at the seed height on the agent's first arm in its DLIO session (DLIO registers scans
+# seeded or not, odom.cc:913-916, and a seed that came too late leaves odom at z 0;
+# arm_z_check) and safety_node reports its mode; an agent already in AUTO is left alone.
+# Then it calls the Trigger and waits for safety_node to report the new mode. disarm calls
+# at once, and checks no z. A call with no answer is repeated: both services are idempotent.
+# Prints '[arm] ...' progress, '@@ <ns> session <id>' with the DLIO session an agent was
+# called in, and one '@@ <ns> ok|refused|timeout mode=<mode> <message>' per agent. The marker
+# in the first line lets `stop_processes(match=...)` find it: a killed docker exec client
+# leaves its process running in the container. It leaves the graph as the status query does
+# (no rosout, no parameter services, one entity at a time; up to 20 subscriptions and clients
+# with 4 agents), since it runs on a loaded graph too.
 ARM_MARKER = 'rover_sim arm query'
 _ARM_PY = r"""# rover_sim arm query
-import sys, time
+import json, signal, sys, time
+from typing import Optional, Tuple
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy
+from rclpy.signals import SignalHandlerOptions
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import PointCloud2
 from std_msgs.msg import String
 from std_srvs.srv import Trigger
 service, gate, max_age, z_tol = sys.argv[1], sys.argv[2], float(sys.argv[4]), float(sys.argv[5])
-end = time.time() + float(sys.argv[3])
-height = dict((n, float(h)) for n, h in (a.split('=', 1) for a in sys.argv[6:]))
+z_check = sys.argv[6] == '1'
+start = time.time()
+end = start + float(sys.argv[3])
+agents = [a.split('=', 2) for a in sys.argv[7:]]           # <ns>=<seed height>[=<armed in session>]
+height = dict((a[0], float(a[1])) for a in agents)
+armed = dict((a[0], a[2]) for a in agents if len(a) > 2)
 names = list(height)
 WANT = {'auto_mode': 'AUTO', 'disarm': 'DISARMED'}[service]
-CALL_S, CONFIRM_S, REPORT_S = 5.0, 2.0, 15.0
-rclpy.init(args=[])
-node = Node('sim_arm_%d' % (time.time_ns() % 1000000))
+CALL_S, CONFIRM_S, REPORT_S, SESSION_WAIT_S, SESSION_WAIT_UP_S = 5.0, 2.0, 15.0, 3.0, 15.0
+@Z_CHECK@
+LEAVE_GAP_S, LEAVE_PAUSE_S = @LEAVE@
+# Ctrl-C / SIGTERM end the wait, not the process: the leave below is paced either way.
+rclpy.init(args=[], signal_handler_options=SignalHandlerOptions.NO)
+stop = []
+signal.signal(signal.SIGINT, lambda *_: stop.append(1))
+signal.signal(signal.SIGTERM, lambda *_: stop.append(1))
+node = Node('sim_arm_%d' % (time.time_ns() % 1000000), enable_rosout=False, start_parameter_services=False)
 qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
-st = {}
+st, subs = {}, []
 def setter(s, key, fn):
     def cb(m):
         s[key] = fn(s, m)
     return cb
 for n in names:
-    s = st[n] = {'mode': None, 'odom': None, 'scans': 0, 'call': None, 'sent': 0.0, 'answer': None, 'why': 'starting'}
-    node.create_subscription(String, '/%s/mode' % n, setter(s, 'mode', lambda s, m: m.data), qos)
+    s = st[n] = {'mode': None, 'odom': None, 'scans': 0, 'call': None, 'sent': 0.0, 'answer': None, 'why': 'starting',
+                 'session': None, 'warn': None, 'warned': False}
+    subs.append(node.create_subscription(String, '/%s/mode' % n, setter(s, 'mode', lambda s, m: m.data), qos))
     if gate == 'dlio':
-        node.create_subscription(Odometry, '/%s/dlio/odom_node/odom' % n, setter(
-            s, 'odom', lambda s, m: (m.header.stamp.sec + m.header.stamp.nanosec * 1e-9, m.pose.pose.position.z)), qos)
-        node.create_subscription(PointCloud2, '/%s/dlio/odom_node/pointcloud/deskewed' % n, setter(
-            s, 'scans', lambda s, m: s['scans'] + 1), qos, raw=True)
+        subs.append(node.create_subscription(Odometry, '/%s/dlio/odom_node/odom' % n, setter(
+            s, 'odom', lambda s, m: (m.header.stamp.sec + m.header.stamp.nanosec * 1e-9, m.pose.pose.position.z)), qos))
+        subs.append(node.create_subscription(PointCloud2, '/%s/dlio/odom_node/pointcloud/deskewed' % n, setter(
+            s, 'scans', lambda s, m: s['scans'] + 1), qos, raw=True))
+    if gate in ('dlio', 'session'):
+        # 1 Hz, reliable (best effort matches): tells a re-arm from the first arm of a DLIO session.
+        subs.append(node.create_subscription(String, '/%s/dlio/session' % n, setter(
+            s, 'session', lambda s, m: dlio_session_id(m.data) or s['session']), qos))
     s['client'] = node.create_client(Trigger, '/%s/%s' % (n, service))
 def blocker(n, s, now):
     if gate == 'dlio':
@@ -3863,9 +4902,13 @@ def blocker(n, s, now):
             return 'DLIO odom stamp %.1f s old: no IMU is reaching DLIO' % (now - stamp)
         if not s['scans']:
             return 'DLIO registers no scans yet (IMU calibration, seed pose or lidar)'
-        if abs(z - height[n]) > z_tol:
-            return ('DLIO odom z %.2f, expected %.2f: the seed pose came too late; restart its dlio pane '
-                    '(scripts/sim.py attach dlio: Ctrl-C, Up, Enter)' % (z, height[n]))
+        why, s['warn'] = arm_z_check(n, z, height[n], z_tol, s['session'], armed.get(n), z_check)
+        if why:
+            return why
+        if s['session'] is None and now - start < SESSION_WAIT_S:
+            return 'no /%s/dlio/session yet (the arm records it)' % n
+    if gate == 'session' and s['session'] is None and now - start < SESSION_WAIT_UP_S:
+        return 'no /%s/dlio/session yet (the arm records it)' % n
     if service == 'auto_mode' and s['mode'] is None:
         return 'no /%s/mode yet (safety_node not running?)' % n
     if not s['client'].service_is_ready():
@@ -3874,7 +4917,7 @@ def blocker(n, s, now):
 pending, last_report = list(names), time.time()
 print('[arm] %s: /<ns>/%s%s, for up to %.0f s' % (' '.join(names), service,
       ' once DLIO registers scans' if gate == 'dlio' else '', end - time.time()), flush=True)
-while pending and time.time() < end:
+while pending and time.time() < end and not stop:
     rclpy.spin_once(node, timeout_sec=0.05)
     now = time.time()
     for n in list(pending):
@@ -3896,23 +4939,37 @@ while pending and time.time() < end:
         else:
             s['why'] = blocker(n, s, now)
             if s['why'] is None:
+                if s['warn'] and not s['warned']:
+                    s['warned'] = True
+                    print('[arm] %s: WARNING: %s' % (n, s['warn']), flush=True)
+                if s['session']:
+                    print('@@ %s session %s' % (n, s['session']), flush=True)
                 s['call'], s['sent'] = s['client'].call_async(Trigger.Request()), now
     if pending and now - last_report >= REPORT_S:
         last_report = now
         for n in pending:
             print('[arm] %s: waiting: %s' % (n, st[n]['why'] or 'for the answer'), flush=True)
 for n in pending:
-    print('@@ %s timeout mode=%s %s' % (n, st[n]['mode'], st[n]['why'] or 'no answer'), flush=True)
+    print('@@ %s timeout mode=%s %s' % (n, st[n]['mode'], 'interrupted' if stop else st[n]['why'] or 'no answer'),
+          flush=True)
+for e in subs + [st[n]['client'] for n in names]:
+    (node.destroy_subscription if e in subs else node.destroy_client)(e)
+    rclpy.spin_once(node, timeout_sec=0)
+    time.sleep(LEAVE_GAP_S)
+time.sleep(LEAVE_PAUSE_S)
 node.destroy_node()
 rclpy.try_shutdown()
-"""
+""".replace('@LEAVE@', '%r, %r' % (STATUS_LEAVE_GAP_S, STATUS_LEAVE_PAUSE_S)).replace(
+    '@Z_CHECK@', '\n'.join(inspect.getsource(f) for f in (dlio_session_id, arm_z_check)))
 ARM_SERVICES = OrderedDict([('arm', 'auto_mode'), ('disarm', 'disarm')])   # CLI verb -> Trigger
 ARM_ENV = (('SIM_ARM_PY', _ARM_PY), ('RUST_LOG', 'zenoh=error'))
+ARM_ENTITIES_PER_AGENT = 5   # the arm query's mode, odom, scan and session subscriptions and its client
 ARM_TIMEOUT_UP_S = 180       # up's wait: gzserver, spawns, DLIO's start and its 3 s IMU calibration
 ARM_TIMEOUT_S = 60           # `sim.py arm`'s
 ARM_UNDO_S = 30              # the disarm after a Ctrl-C (ArmInterrupted)
 # Seeded odom sits at the lidar height (measured 0.359-0.361 JR, 0.398-0.403 RR); a missed seed
-# leaves it at 0. The worlds are flat, so a drive does not move it far either.
+# leaves it at 0. The worlds are flat, but DLIO drifts in z over a long run (+0.15 m seen), so
+# the check binds only on an agent's first arm in a DLIO session (arm_z_check).
 ARM_Z_TOL_M = 0.1
 
 
@@ -3921,6 +4978,7 @@ class ArmResult(NamedTuple):
     status: str              # ok | refused | timeout | lost
     mode: str                # safety_node's mode afterwards, as it reported it
     message: str
+    session: str = ''        # the DLIO session id it was called in ('' if none was seen)
 
 
 ALREADY_AUTO = 'already in AUTO: not called'
@@ -3938,12 +4996,47 @@ class ArmInterrupted(KeyboardInterrupt):
 
 
 def parse_arm(out: str) -> Dict[str, ArmResult]:
-    res = OrderedDict()  # type: Dict[str, ArmResult]
+    res, sessions = OrderedDict(), {}  # type: Dict[str, ArmResult], Dict[str, str]
     for line in out.splitlines():
         parts = line.split(None, 4)
-        if len(parts) >= 4 and parts[0] == '@@' and parts[3].startswith('mode='):
+        if len(parts) == 4 and parts[0] == '@@' and parts[2] == 'session':
+            sessions[parts[1]] = parts[3]
+        elif len(parts) >= 4 and parts[0] == '@@' and parts[3].startswith('mode='):
             res[parts[1]] = ArmResult(parts[1], parts[2], parts[3][len('mode='):], parts[4] if len(parts) > 4 else '')
-    return res
+    return OrderedDict((n, r._replace(session=sessions.get(n, ''))) for n, r in res.items())
+
+
+def armed_sessions_after(armed: Dict[str, str], res: Dict[str, ArmResult]) -> Dict[str, str]:
+    """The record after an arm query: each agent it switched to AUTO, with the DLIO session it saw
+    then (z checked, or waived with --no-z-check). An agent found in AUTO was not checked here."""
+    out = dict(armed)
+    for r in res.values():
+        if r.status == 'ok' and r.mode == 'AUTO' and r.message != ALREADY_AUTO and r.session:
+            out[r.name] = r.session
+    return out
+
+
+def load_armed_sessions(run_dir: Path) -> Dict[str, str]:
+    """<run>/armed_sessions.json. Missing or unreadable is no record: every arm is a first arm."""
+    path = run_dir / ARMED_SESSIONS_FILE
+    try:
+        data = json.loads(path.read_text())
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as e:
+        warn('ignoring %s (%s): every agent gets the first-arm z check' % (path, e))
+        return {}
+    if not isinstance(data, dict):
+        warn('ignoring %s (not an object): every agent gets the first-arm z check' % path)
+        return {}
+    return {k: v for k, v in data.items() if isinstance(k, str) and isinstance(v, str)}
+
+
+def save_armed_sessions(run_dir: Path, armed: Dict[str, str]) -> None:
+    try:
+        write_file(run_dir / ARMED_SESSIONS_FILE, (json.dumps(armed, indent=1, sort_keys=True) + '\n').encode())
+    except (OSError, SimError) as e:
+        warn('cannot record the armed DLIO sessions in %s: %s (a re-arm checks z again)' % (run_dir, e))
 
 
 def lidar_height_of(name: str) -> float:
@@ -3951,13 +5044,21 @@ def lidar_height_of(name: str) -> float:
     return next(ROBOT_CLASSES[c].lidar_height for c, p in CLASS_PREFIXES.items() if name.startswith(p))
 
 
-def arm_args(service: str, gate: str, timeout: float, names: Sequence[str]) -> List[str]:
+def arm_budget(timeout: float, n_agents: int) -> int:
+    """Seconds the arm query may take in its container: rclpy's start, its own timeout, then its
+    paced leave of up to 5 entities per agent (4 subscriptions and a client)."""
+    return int(math.ceil(timeout + 6 + 5 * n_agents * STATUS_LEAVE_GAP_S + STATUS_LEAVE_PAUSE_S))
+
+
+def arm_args(service: str, gate: str, timeout: float, names: Sequence[str],
+             armed: Optional[Dict[str, str]] = None, z_check: bool = True) -> List[str]:
     """docker exec arguments of the arm query in sim-drive (the script itself goes in $SIM_ARM_PY):
-    each agent as <ns>=<seed height>."""
-    run = 'exec timeout -k 2 %d python3 -c "$SIM_ARM_PY" "$@"' % (int(timeout) + 6)
+    each agent as <ns>=<seed height>, and =<session id> when it was armed before (armed)."""
+    armed = armed or {}
+    run = 'exec timeout -k 2 %d python3 -c "$SIM_ARM_PY" "$@"' % arm_budget(timeout, len(names))
     return (['bash', '-c', ' && '.join([setup_snippet(CONTAINERS[QUERY_CONTAINER]), run]), 'arm', service, gate,
-             '%g' % timeout, '%g' % ODOM_MAX_AGE_S, '%g' % ARM_Z_TOL_M]
-            + ['%s=%s' % (n, fmt_float(lidar_height_of(n))) for n in names])
+             '%g' % timeout, '%g' % ODOM_MAX_AGE_S, '%g' % ARM_Z_TOL_M, '1' if z_check else '0']
+            + ['%s=%s%s' % (n, fmt_float(lidar_height_of(n)), '=' + armed[n] if n in armed else '') for n in names])
 
 
 def dexec_lines(name: str, args: Sequence[str], timeout: float, env: Sequence[Tuple[str, str]],
@@ -3992,29 +5093,40 @@ def log_line(path: Optional[Path], text: str) -> None:
 
 
 def arm_agents(names: Sequence[str], service: str, gate: str, timeout: float,
-               log: Optional[Path] = None) -> Dict[str, ArmResult]:
+               log: Optional[Path] = None, run_dir: Optional[Path] = None,
+               z_check: bool = True) -> Dict[str, ArmResult]:
     """Calls /<ns>/<service> (std_srvs/Trigger) for each agent through the arm query; with
-    gate 'dlio', each once its DLIO is past the IMU calibration. The caller has checked
+    gate 'dlio', each once its DLIO is past the IMU calibration (and, on its first arm in a DLIO
+    session, at the seed height unless z_check is off: arm_z_check). With run_dir it reads and
+    updates <run>/armed_sessions.json. The caller has checked
     isolation. Every line goes to log. Ctrl-C stops the query inside the container too and
     raises ArmInterrupted. An auto_mode query fails closed: it may have armed agents by then,
     including some whose answer never reached this client (Ctrl-C ends the docker exec client
     at once, the query only when stop_processes gets to it), so every agent it did not find
     in AUTO already is disarmed again."""
     lines = []  # type: List[str]
+    checked = service == 'auto_mode' and gate in ('dlio', 'session')    # records the DLIO session armed in
+    armed = load_armed_sessions(run_dir) if checked and run_dir is not None else {}
 
     def on_line(line: str) -> None:
         lines.append(line)
         log_line(log, line)
-        if not line.startswith('@@ '):
-            info(line[len('[arm] '):] if line.startswith('[arm] ') else '  ' + line)
+        if line.startswith('[arm] '):
+            ns, sep, rest = line[len('[arm] '):].partition(': WARNING: ')
+            warn(ns + ': ' + rest) if sep else info(line[len('[arm] '):])
+        elif not line.startswith('@@ '):
+            info('  ' + line)
 
-    log_line(log, 'arm query: %s %s, gate %s, timeout %g s' % (service, ' '.join(names), gate, timeout))
+    log_line(log, 'arm query: %s %s, gate %s, timeout %g s%s' % (
+        service, ' '.join(names), gate, timeout, '' if z_check or not checked else ', NO z check (--no-z-check)'))
     try:
         # Its stderr is shown (a traceback matters); zenoh's own start-up warnings are not.
-        rc = dexec_lines(QUERY_CONTAINER, arm_args(service, gate, timeout, names), timeout + 20,
-                         ARM_ENV, on_line)
+        rc = dexec_lines(QUERY_CONTAINER, arm_args(service, gate, timeout, names, armed, z_check),
+                         arm_budget(timeout, len(names)) + 14, ARM_ENV, on_line)
     except KeyboardInterrupt:
-        stop_processes(QUERY_CONTAINER, match=ARM_MARKER, grace_int=2, grace_term=2)
+        # Ctrl-C reached the query too (the pane's process group): it ends its wait and leaves paced.
+        stop_processes(QUERY_CONTAINER, match=ARM_MARKER, grace_term=2,
+                       grace_int=ARM_ENTITIES_PER_AGENT * len(names) * STATUS_LEAVE_GAP_S + STATUS_LEAVE_PAUSE_S + 2)
         log_line(log, 'interrupted: the arm query was stopped')
         seen = parse_arm('\n'.join(lines))
         undo = None  # type: Optional[Dict[str, ArmResult]]
@@ -4034,6 +5146,11 @@ def arm_agents(names: Sequence[str], service: str, gate: str, timeout: float,
                       for n in names)
     for r in res.values():
         log_line(log, '%s: %s, mode %s: %s' % (r.name, r.status, r.mode, r.message))
+    if checked and run_dir is not None:
+        known = load_armed_sessions(run_dir)       # again: another arm may have recorded meanwhile
+        after = armed_sessions_after(known, res)
+        if after != known:
+            save_armed_sessions(run_dir, after)
     return res
 
 
@@ -4073,14 +5190,17 @@ def report_interrupted(e: ArmInterrupted) -> None:
 
 def will_arm(session: Session, stacks: Sequence['Stack'], no_arm: bool = False) -> bool:
     """`up` arms when the session asks for it and starts both the agents' DLIO and their
-    safety_nodes."""
-    return session.auto_arm and not no_arm and {'dlio', 'drive'} <= {s.name for s in stacks}
+    safety_nodes, and for a planner session the planner too: armed, safety_node expects commands
+    on cmd_vel_auto, which only mpc sends there (odom_eval.py --drive in planner: false)."""
+    names = {s.name for s in stacks}
+    return (session.auto_arm and not no_arm and {'dlio', 'drive'} <= names
+            and (not session.planner or 'mighty' in names))
 
 
 def session_agents(run_dir: Path, requested: Sequence[str] = ()) -> List[str]:
     """The running session's agents (<run>/session.json), or the requested ones, which must
     be among them: these commands never call a service of a name the sim did not start."""
-    sf = run_dir / 'session.json'
+    sf = run_dir / SESSION_FILE
     try:
         s = json.loads(sf.read_text())
         names = [a['name'] for a in s['agents']]
@@ -4209,17 +5329,32 @@ def build_parser() -> argparse.ArgumentParser:
     up.add_argument('--stacks', type=_csv, help='comma-separated subset of the stacks (default: all ready)')
     up.add_argument('--partial', action='store_true', help='start only the containers those stacks use')
     up.add_argument('--no-arm', action='store_true', help='leave every safety_node DISARMED (auto_arm off)')
+    up.add_argument('--rviz', action='store_true',
+                    help="also start RViz on $DISPLAY (as the session's rviz: true), in the last paused wave")
     up.add_argument('--dry-run', action='store_true', help='print the panes and commands; touch nothing')
     down = sub.add_parser('down', help='stop every node and close the rsim-* tmux sessions')
     down.add_argument('--containers', action='store_true', help='also remove the containers and network')
     att = sub.add_parser('attach', help='attach to rsim-<stack>')
-    att.add_argument('stack', nargs='?', choices=list(STACKS))
+    att.add_argument('stack', nargs='?', choices=list(STACKS) + [VIZ_STACK.name])
     st = sub.add_parser('status', help='containers, isolation, router links, panes, sim time, DLIO, safety modes '
                         '(one ROS session, which leaves the graph one subscription at a time: all at once stalled '
                         'a loaded graph for a second)')
     st.add_argument('--maps', action='store_true',
                     help="also read the planner's grids (occ_2d_topic, esdf_2d_topic, persistent_map/grid): 3 more "
                          'subscriptions per agent, one of them the megabyte persistent map')
+    sta = sub.add_parser('start', help='(re)start one stack alone on the running session: rviz (RViz on $DISPLAY, '
+                         'even if the session has rviz: false) or goals (goal_relay.py); it joins the running graph')
+    sta.add_argument('stack', choices=list(RESTARTABLE))
+    viz = sub.add_parser('viz', help='open sim_viz.py, the live 2D view of the agents (occ grid, HGP paths, committed '
+                         'traj, frontiers, pose), on $DISPLAY from sim-viz; it joins the running graph')
+    viz.add_argument('--agents', type=_csv, help='comma-separated agents (default: all, up to %d)' % VIZ_MAX_PANELS)
+    viz.add_argument('--layers', type=_csv, help='comma-separated layers to subscribe: %s (default: all but map, '
+                     'the megabyte persistent map)' % ', '.join(VIZ_LAYERS))
+    viz.add_argument('--follow', action='store_true', help='start in the follow view (f toggles)')
+    viz.add_argument('--stop', action='store_true', help='stop the viewer, waiting for its paced leave')
+    viz.add_argument('--snapshot', metavar='PNG', help='no window: one frame to PNG on this host')
+    viz.add_argument('--snapshot-after', type=float, default=8.0, metavar='S',
+                     help='--snapshot: seconds of listening first (default 8: frontiers come every 2 s)')
     for verb, what in (('arm', 'put safety_nodes in AUTO (/<ns>/auto_mode) once their DLIO tracks'),
                        ('disarm', 'put safety_nodes in DISARMED (/<ns>/disarm)')):
         a = sub.add_parser(verb, help=what)
@@ -4228,6 +5363,9 @@ def build_parser() -> argparse.ArgumentParser:
         if verb == 'arm':
             a.add_argument('--now', action='store_true',
                            help='do not wait for DLIO (the agent may then move during its IMU calibration)')
+            a.add_argument('--no-z-check', action='store_true',
+                           help='arm even if DLIO odom z is off the seed height on the first arm of its DLIO '
+                                'session (checked to catch a late seed; logged)')
     lt = sub.add_parser('loadtest', help='zenoh discovery and link-count test with dummy agents')
     lt.add_argument('--agents', type=int, default=4, help='dummy agents JR81, RR82, ... (default 4)')
     lt.add_argument('--session', help='take the agents from this session instead')
@@ -4260,7 +5398,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return cmd_compose(argv[1:])
         args = build_parser().parse_args(argv)
         return {'up': cmd_up, 'down': cmd_down, 'attach': cmd_attach, 'status': cmd_status, 'arm': cmd_arm,
-                'disarm': cmd_arm, 'loadtest': cmd_loadtest, 'cpus': cmd_cpus}[args.cmd](args)
+                'disarm': cmd_arm, 'start': cmd_start, 'viz': cmd_viz, 'loadtest': cmd_loadtest,
+                'cpus': cmd_cpus}[args.cmd](args)
     except SimError as e:
         print('[sim] ERROR: %s' % e, file=sys.stderr)
         return 1

@@ -4,13 +4,26 @@
 Usage: parity_check.py <ns> [--ref JR02] [--nodes mighty_node,mpc,...] [--mapping gpu|fallback]
        parity_check.py <ns> --show-ref <node>   print the reference params, renamed to <ns>
        parity_check.py <ns> --selftest          check the checker on the fixtures alone (no docker)
+       parity_check.py <ns> --local             query from this process (inside a sim container)
 
-Runs on the host (python3.8 + PyYAML + docker CLI). For each reference node that is up, it
-runs `ros2 param dump` and `ros2 node info` (all with --no-daemon) inside that node's sim
-container, and `ros2 topic info -v` for every reference topic one of them touches, then diffs
-the results against tools/reference/<ref>/ (see its README.md) with the robot's name (JR02)
-replaced by <ns>. What the sim changes on purpose is listed, with the reason, in
-tools/reference/<ref>/allowed_deviations.yaml and shows up as ALLOWED.
+Runs on the host (python3.8 + PyYAML + docker CLI). One rclpy session in one sim container
+(--container, default sim-drive) answers every query: the node list, each reference node's
+parameters (its list_parameters and get_parameters services, as `ros2 param dump` reads them),
+its publishers and subscriptions (the graph, as `ros2 node info`) and each reference topic's
+endpoints with their QoS (as `ros2 topic info -v`). The results are diffed against
+tools/reference/<ref>/ (see its README.md) with the robot's name (JR02) replaced by <ns>. What
+the sim changes on purpose is listed, with the reason, in tools/reference/<ref>/
+allowed_deviations.yaml and shows up as ALLOWED.
+
+That session joins and leaves the graph gently: its node has no rosout publisher and no
+parameter services, and it closes its service clients one at a time, then waits before it
+closes. With rmw_zenoh 0.1.9 a session that undeclares many entities at once stalls zenoh
+delivery for everyone; a ros2 CLI per query did that (Phase 4: all four parked DLIOs diverged
+after one run). It is still one more session on the graph: run it before or after a window
+that is being graded, not during one.
+
+--mapping defaults to the running session's (<run>/session.json, scripts/sim.py's run dir:
+$ROVER_SIM_RUN or /tmp/rover_sim-<uid>/run), else $ROVER_SIM_MAPPING, else gpu.
 
 Nodes that are not running (or whose container is down) are reported as NOT RUNNING and do
 not fail the check unless --require-running is given, so it can be run while the stacks are
@@ -22,8 +35,9 @@ or, with --require-running, nodes not running; 2 bad usage or reference.
 It only ever docker-execs into the sim's own containers (sim-* of compose project
 rover-sim-stack, the names scripts/sim.py registers); any other --container, --graph-container
 or manifest container is refused with exit 2. The fleet's containers share this host, and a
-ros2 CLI call in one of them (acl-c2-*) would query the live robots. Never point this at a
-robot: the reference was captured without any ros2 CLI call.
+query in one of them (acl-c2-*) would reach the live robots. Never point this at a robot: the
+reference was captured without any ros2 CLI call. --local skips docker and queries from this
+process: only inside a sim container (ZENOH_SESSION_CONFIG_URI the sim's, config/sim.env).
 
 Reference files from private repos are not copied into tools/reference/ (this repo is public).
 manifest.yaml names each by repo, commit and path; they are read from the pinned checkouts
@@ -32,7 +46,6 @@ the GitLab/GitHub key the image builds use), and refused unless their content ma
 hash of the robot's copy.
 """
 import argparse
-import concurrent.futures
 import fnmatch
 import glob
 import hashlib
@@ -40,9 +53,9 @@ import json
 import math
 import os
 import re
-import shlex
 import subprocess
 import sys
+import time
 import xml.etree.ElementTree as ET
 
 import yaml
@@ -53,7 +66,7 @@ NAME_RE = re.compile(r'^([A-Z]{2})([0-9]{2})$')
 # The sim's containers (scripts/sim.py CONTAINERS, compose project rover-sim-stack). Nothing
 # else is ever exec'd into: acl-c2-* on this host are attached to the live fleet graph.
 SIM_CONTAINERS = ('sim-gazebo', 'sim-drive', 'sim-dlio-jr', 'sim-dlio-rr', 'sim-mapping',
-                  'sim-elevation', 'sim-mighty')
+                  'sim-elevation', 'sim-mighty', 'sim-viz')
 SIM_PROJECT = 'rover-sim-stack'
 # Introspection needs no workspace message types, so whichever install the image has will
 # do (mighty_ws, mapping_ws, dlio_ws, rover_ws or rover_sim_ws), else plain Humble.
@@ -61,9 +74,15 @@ SETUP = ('for f in /home/swarm/code/*/install/setup.bash /opt/ros/humble/setup.b
          '[ -f "$f" ] && . "$f" && break; done; export ROS_LOG_DIR=/tmp/rover_sim_parity_log; ')
 # Every node has these; they say nothing about parity.
 GRAPH_TOPICS_IGNORED = ('/parameter_events', '/rosout')
-# zenoh's Rust logger writes to stdout, in colour, interleaved with the CLI's own output.
-ANSI_RE = re.compile(r'\x1b\[[0-9;]*m')
-ZENOH_LOG_RE = re.compile(r'^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?Z\s+(?:TRACE|DEBUG|INFO|WARN|ERROR)\s')
+# The query session (query()): this file as the sim containers mount it, the line its answer is
+# on (zenoh's Rust logger writes to the same stdout), and its paced leave (scripts/sim.py
+# STATUS_LEAVE_GAP_S, STATUS_LEAVE_PAUSE_S).
+QUERY_IN = '/rover_sim/scripts/parity_check.py'
+QUERY_MARK = '@@PARITY@@ '
+LEAVE_GAP_S, LEAVE_PAUSE_S = 0.5, 0.5
+DEFAULT_QUERY_CONTAINER = 'sim-drive'
+SIM_SESSION_URI = '/rover_sim/zenoh/session.json5'     # config/sim.env
+RUN_DIR_DEFAULT = '/tmp/rover_sim-%d/run' % os.getuid()  # scripts/sim.py's
 
 OK, NOTE, NO_REF, ALLOWED, NOT_RUNNING, ERROR, DIFF = (
     'OK', 'NOTE', 'NO REF', 'ALLOWED', 'NOT RUNNING', 'ERROR', 'DIFF')
@@ -393,50 +412,126 @@ class Reference:
         return fqn.startswith('/%s/' % self.ns) or fqn in self.renames.values()
 
 
-# ---------------------------------------------------------------------------------- sim access
-def parse_node_list(text):
-    return {line.strip() for line in text.splitlines() if line.startswith('/')}
+# ---------------------------------------------------------------------------------- the query session
+def param_value(v):
+    """rcl_interfaces/ParameterValue -> the value `ros2 param dump` writes (None when not set)."""
+    t = v.type
+    return {1: lambda: v.bool_value, 2: lambda: v.integer_value, 3: lambda: v.double_value,
+            4: lambda: v.string_value, 5: lambda: [int(b) for b in v.byte_array_value],
+            6: lambda: list(v.bool_array_value), 7: lambda: list(v.integer_array_value),
+            8: lambda: list(v.double_array_value), 9: lambda: list(v.string_array_value)}.get(t, lambda: None)()
 
 
-def parse_node_info(text):
-    """`ros2 node info` -> {'publishers': {topic: type}, 'subscribers': {topic: type}}."""
-    out, sect = {'publishers': {}, 'subscribers': {}}, None
-    for line in text.splitlines():
-        m = re.match(r'^  (\w[\w ]*):\s*$', line)
-        if m:
-            sect = {'Subscribers': 'subscribers', 'Publishers': 'publishers'}.get(m.group(1))
-            continue
-        m = re.match(r'^    (\S+): (.+)$', line)
-        if m and sect:
-            out[sect][m.group(1)] = m.group(2).strip()
+def split_fqn(fqn):
+    ns, _, name = fqn.rpartition('/')
+    return name, ns or '/'
+
+
+def query(spec, rclpy=None):
+    """The sim's answers to spec ({params, info, topics: [...], timeout, spin}) from one rclpy
+    session: the node list, the params of the spec's running nodes through their parameter
+    services, their pub/sub edges and the topics' endpoints from the graph. The node has no
+    rosout and no parameter services; each service client is destroyed right after its call, a
+    LEAVE_GAP_S apart, and the node LEAVE_PAUSE_S after the last, so the session never
+    undeclares many entities at once (rmw_zenoh 0.1.9 stalls delivery graph-wide for that)."""
+    if rclpy is None:
+        import rclpy
+    from rclpy.node import Node
+    from rcl_interfaces.srv import GetParameters, ListParameters
+
+    timeout = float(spec.get('timeout', 30))
+    rclpy.init()
+    node = Node('parity_check_%d' % os.getpid(), enable_rosout=False, start_parameter_services=False)
+
+    def spin_for(secs):
+        end = time.time() + secs
+        while time.time() < end:
+            rclpy.spin_once(node, timeout_sec=min(0.1, max(0.0, end - time.time())))
+
+    def call(srv, name, request):
+        client = node.create_client(srv, name)
+        try:
+            if not client.wait_for_service(timeout_sec=timeout):
+                raise RuntimeError('no %s service within %.0f s' % (name, timeout))
+            fut = client.call_async(request)
+            rclpy.spin_until_future_complete(node, fut, timeout_sec=timeout)
+            if not fut.done() or fut.result() is None:
+                raise RuntimeError('%s did not answer within %.0f s' % (name, timeout))
+            return fut.result()
+        finally:
+            node.destroy_client(client)
+            spin_for(LEAVE_GAP_S)
+
+    out = {'nodes': [], 'params': {}, 'info': {}, 'topics': {}}
+    try:
+        spin_for(float(spec.get('spin', 2.0)))
+        out['nodes'] = sorted({(ns.rstrip('/') + '/' + n) for n, ns in node.get_node_names_and_namespaces()})
+        for fqn in spec.get('params') or []:
+            if fqn not in out['nodes']:
+                continue
+            try:
+                names = call(ListParameters, fqn + '/list_parameters', ListParameters.Request()).result.names
+                req = GetParameters.Request()
+                req.names = list(names)
+                values = call(GetParameters, fqn + '/get_parameters', req).values
+                out['params'][fqn] = {'flat': {n: param_value(v) for n, v in zip(names, values)}}
+            except RuntimeError as exc:
+                out['params'][fqn] = {'error': str(exc)}
+        for fqn in spec.get('info') or []:
+            if fqn not in out['nodes']:
+                continue
+            name, ns = split_fqn(fqn)
+            out['info'][fqn] = {
+                'publishers': {t: ', '.join(ty) for t, ty in node.get_publisher_names_and_types_by_node(name, ns)},
+                'subscribers': {t: ', '.join(ty) for t, ty in node.get_subscriber_names_and_types_by_node(name, ns)}}
+        for topic in spec.get('topics') or []:
+            eps, types = [], []
+            for kind, infos in (('PUBLISHER', node.get_publishers_info_by_topic(topic)),
+                                ('SUBSCRIPTION', node.get_subscriptions_info_by_topic(topic))):
+                for e in infos:
+                    types.append(e.topic_type)
+                    eps.append({'node': e.node_namespace.rstrip('/') + '/' + e.node_name, 'kind': kind,
+                                'reliability': e.qos_profile.reliability.name,
+                                'durability': e.qos_profile.durability.name})
+            out['topics'][topic] = {'type': types[0] if types else None, 'endpoints': eps}
+    finally:
+        time.sleep(LEAVE_PAUSE_S)
+        node.destroy_node()
+        rclpy.try_shutdown()
     return out
 
 
-def parse_topic_info(text):
-    """`ros2 topic info -v` -> (type, [{node, kind, reliability, durability}])."""
-    t = re.search(r'^Type: (\S+)', text, re.M)
-    eps = []
-    for block in re.split(r'^(?=Node name:)', text, flags=re.M)[1:]:
-        f = dict(re.findall(r'^\s*([A-Za-z][A-Za-z ()]*?):[ \t]*(.*?)[ \t]*$', block, re.M))
-        ns = f.get('Node namespace', '/')
-        eps.append({'node': ns.rstrip('/') + '/' + f.get('Node name', '?'), 'kind': f.get('Endpoint type', '?'),
-                    'reliability': f.get('Reliability', '?'), 'durability': f.get('Durability', '?')})
-    return (t.group(1) if t else None), eps
+def query_budget(spec):
+    """Seconds the query session may take: rclpy's start, discovery, two calls per node (each may wait
+    up to timeout for its service, then up to timeout for its answer: call()), the leave."""
+    n = len(spec.get('params') or [])
+    return int(math.ceil(10 + float(spec.get('spin', 2.0)) + n * (4 * float(spec.get('timeout', 30)) + 2 * LEAVE_GAP_S)
+                         + LEAVE_PAUSE_S))
+
+
+def require_sim_session():
+    uri = os.environ.get('ZENOH_SESSION_CONFIG_URI')
+    if uri != SIM_SESSION_URI:
+        die('--local / --query only inside a sim container (ZENOH_SESSION_CONFIG_URI=%r, the sim\'s is %s)'
+            % (uri, SIM_SESSION_URI))
 
 
 class Sim:
-    """ros2 CLI introspection through `docker exec` into the sim containers."""
+    """The query session, run through `docker exec` in one sim container (or here, local)."""
 
-    def __init__(self, timeout, spin, save_dir=None):
-        self.timeout, self.spin, self.save_dir = timeout, spin, save_dir
+    def __init__(self, timeout, spin, save_dir=None, local=False):
+        self.timeout, self.spin, self.save_dir, self.local = timeout, spin, save_dir, local
         self._up = {}
 
     def running(self, container):
         """Whether the sim container is up. A container of that name from another compose
         project is not the sim's: exit 2 rather than query it."""
+        sim_container(container)
+        if self.local:
+            return True
         if container not in self._up:
             p = subprocess.run(['docker', 'inspect', '-f', '{{.State.Running}} {{index .Config.Labels '
-                                '"com.docker.compose.project"}}', sim_container(container)],
+                                '"com.docker.compose.project"}}', container],
                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, universal_newlines=True)
             state, _, project = p.stdout.strip().partition(' ')
             if p.returncode == 0 and project != SIM_PROJECT:
@@ -445,55 +540,39 @@ class Sim:
             self._up[container] = p.returncode == 0 and state == 'true'
         return self._up[container]
 
-    def ros2(self, container, args, save_as):
-        """(ok, stdout, stderr). `timeout` runs inside the container because killing the
-        docker exec client would leave a hung CLI behind (param dump has hung under zenoh)."""
-        if not self.running(container):  # also checks it is the sim's (exit 2 if not)
-            return False, '', 'container %s is not running' % container
-        args = args[:2] + ['--no-daemon', '--spin-time', str(self.spin)] + args[2:]
-        cmd = SETUP + 'exec timeout -k 2 %d ros2 %s' % (self.timeout, ' '.join(map(shlex.quote, args)))
-        try:
-            p = subprocess.run(['docker', 'exec', sim_container(container), 'bash', '-c', cmd], stdout=subprocess.PIPE,
-                               stderr=subprocess.PIPE, universal_newlines=True, timeout=self.timeout + 15)
-        except subprocess.TimeoutExpired:
-            return False, '', 'docker exec did not return'
+    def collect(self, container, spec):
+        """query(spec) in the container: {nodes, params, info, topics} or {error}."""
+        spec = dict(spec, timeout=self.timeout, spin=self.spin)
+        sim_container(container)
+        if self.local:
+            out = query(spec)
+        elif not self.running(container):
+            return {'error': 'container %s is not running' % container}
+        else:
+            budget = query_budget(spec)
+            # `timeout` runs inside the container: killing the docker exec client would leave a hung
+            # session behind, which keeps the router waiting until its socket closes.
+            cmd = SETUP + 'exec timeout -k 2 %d python3 %s --query "$1"' % (budget, QUERY_IN)
+            try:
+                p = subprocess.run(['docker', 'exec', container, 'bash', '-c', cmd, 'parity', json.dumps(spec)],
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True,
+                                   timeout=budget + 15)
+            except subprocess.TimeoutExpired:
+                return {'error': 'docker exec did not return'}
+            line = next((l for l in reversed(p.stdout.splitlines()) if l.startswith(QUERY_MARK)), None)
+            if line is None:
+                err = (p.stderr.strip().splitlines() or ['no answer'])[-1]
+                return {'error': ('timed out after %ds' % budget if p.returncode in (124, 137) else
+                                  'query failed (exit %d): %s' % (p.returncode, err[-200:]))}
+            try:
+                out = json.loads(line[len(QUERY_MARK):])
+            except ValueError as exc:          # another line interleaved with the answer
+                return {'error': 'unparsable answer (%s): %s' % (exc, line[:120])}
         if self.save_dir:
-            path = os.path.join(self.save_dir, save_as)
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path, 'w') as f:
-                f.write(p.stdout)  # raw, logs included
-        out = '\n'.join(l for l in ANSI_RE.sub('', p.stdout).splitlines() if not ZENOH_LOG_RE.match(l))
-        err = p.stderr.strip()
-        if p.returncode in (124, 137):
-            err = 'timed out after %ds%s' % (self.timeout, ': ' + err[-200:] if err else '')
-        return p.returncode == 0, out + '\n', err
-
-    @staticmethod
-    def _file(fqn):
-        return fqn.strip('/').replace('/', '__')
-
-    def _call(self, container, args, save_as):
-        ok, out, err = self.ros2(container, args, save_as)
-        if not ok:
-            raise RuntimeError('ros2 %s: %s' % (' '.join(args[:2]), (err or 'failed').splitlines()[-1]))
+            os.makedirs(self.save_dir, exist_ok=True)
+            with open(os.path.join(self.save_dir, 'query.json'), 'w') as f:
+                json.dump(out, f, indent=1, sort_keys=True)
         return out
-
-    def node_list(self, container):
-        return parse_node_list(self._call(container, ['node', 'list'], 'node_list.txt'))
-
-    def param_dump(self, container, fqn):
-        return dump_params(self._call(container, ['param', 'dump', fqn], 'params/%s.yaml' % self._file(fqn)))[1]
-
-    def node_info(self, container, fqn):
-        return parse_node_info(self._call(container, ['node', 'info', fqn], 'node_info/%s.txt' % self._file(fqn)))
-
-    def topic_info(self, container, topic):
-        ok, out, err = self.ros2(container, ['topic', 'info', '-v', topic], 'topic_info/%s.txt' % self._file(topic))
-        if not ok and 'Unknown topic' in out + err:
-            return None, []  # nobody has it: every live reference endpoint is missing
-        if not ok:
-            raise RuntimeError('ros2 topic info: %s' % (err or 'failed').splitlines()[-1])
-        return parse_topic_info(out)
 
 
 class FixtureSim(Sim):
@@ -506,33 +585,32 @@ class FixtureSim(Sim):
     def running(self, container):
         return True
 
-    def node_list(self, container):
-        return {e['sim_fqn'] for e in self.nodes.values()}
-
-    def param_dump(self, container, fqn):
-        name, entry = next((n, e) for n, e in self.nodes.items() if e['sim_fqn'] == fqn)
-        flat = dict(self.ref.params(entry)[1])
-        if entry['params'].get('urdf_key'):
-            flat[entry['params']['urdf_key']] = joints_to_urdf(self.ref.tf_joints())
-        if name == 'mighty_node':
-            flat['num_agents'] = 84  # whitelisted
-            if self.drift:
-                flat['horizon'] += 1  # 1 DIFF
-        return flat
-
-    def node_info(self, container, fqn):
-        info = {k: dict(v) for k, v in self.edges['nodes'][fqn].items()}
-        if self.drift and fqn.endswith('/mpc'):
-            info['publishers'].pop('/%s/cmd_vel_auto' % self.ref.ns)  # 1 DIFF
-        return info
-
-    def topic_info(self, container, topic):
-        spec = self.edges['topics'][topic]
-        eps = [dict(ep) for ep in spec['endpoints'] if self.ref.node_class(ep['node']) != 'absent']
-        if self.drift and topic.endswith('/term_goal'):
-            for ep in eps:
-                ep['durability'] = 'TRANSIENT_LOCAL'  # 2 DIFFs (goal_selector pub, mighty_node sub)
-        return spec['type'], eps
+    def collect(self, container, spec):
+        by_fqn = {e['sim_fqn']: (n, e) for n, e in self.nodes.items()}
+        out = {'nodes': sorted(by_fqn), 'params': {}, 'info': {}, 'topics': {}}
+        for fqn in spec['params']:
+            name, entry = by_fqn[fqn]
+            flat = dict(self.ref.params(entry)[1])
+            if entry['params'].get('urdf_key'):
+                flat[entry['params']['urdf_key']] = joints_to_urdf(self.ref.tf_joints())
+            if name == 'mighty_node':
+                flat['num_agents'] = 84  # whitelisted
+                if self.drift:
+                    flat['horizon'] += 1  # 1 DIFF
+            out['params'][fqn] = {'flat': flat}
+        for fqn in spec['info']:
+            info = {k: dict(v) for k, v in self.edges['nodes'][fqn].items()}
+            if self.drift and fqn.endswith('/mpc'):
+                info['publishers'].pop('/%s/cmd_vel_auto' % self.ref.ns)  # 1 DIFF
+            out['info'][fqn] = info
+        for topic in spec['topics']:
+            t = self.edges['topics'][topic]
+            eps = [dict(ep) for ep in t['endpoints'] if self.ref.node_class(ep['node']) != 'absent']
+            if self.drift and topic.endswith('/term_goal'):
+                for ep in eps:
+                    ep['durability'] = 'TRANSIENT_LOCAL'  # 2 DIFFs (goal_selector pub, mighty_node sub)
+            out['topics'][topic] = {'type': t['type'], 'endpoints': eps}
+        return out
 
 
 FIXTURE_DRIFT_DIFFS = 4
@@ -665,34 +743,44 @@ def check_topic(ref, topic, spec, considered, scope, running, sim_type, sim_eps)
     return Result('graph', topic, worst(lines), summary, lines)
 
 
+def query_container(args, sim, nodes):
+    """Where the query session runs: --container / --graph-container, else sim-drive (with the
+    status and arm queries, on the cores the non-Gazebo stacks share), else any sim container up."""
+    chosen = args.container or args.graph_container
+    if chosen:
+        return sim_container(chosen)
+    order = [DEFAULT_QUERY_CONTAINER] + sorted({e['container'] for e in nodes.values()} - {DEFAULT_QUERY_CONTAINER})
+    return next((c for c in order if sim.running(c)), None)
+
+
 def run_checks(ref, sim, selected, args):
     nodes = ref.nodes()
-    if args.container:
-        for e in nodes.values():
-            e['container'] = args.container
     containers = sorted({nodes[n]['container'] for n in selected})
-    graph_c = args.graph_container or next(
-        (c for c in ['sim-drive'] + sorted({e['container'] for e in nodes.values()}) if sim.running(c)), None)
-    hdr = ['containers: ' + ', '.join('%s %s' % (c, 'up' if sim.running(c) else 'DOWN') for c in containers)]
-    results, running, graph_ok = [], set(), False
-    if graph_c is None:
+    qc = query_container(args, sim, nodes)
+    hdr = ['containers: ' + ('not checked (--local)' if sim.local else
+                             ', '.join('%s %s' % (c, 'up' if sim.running(c) else 'DOWN') for c in containers))]
+    where = 'this process (--local)' if sim.local else qc
+    edges = ref.edges() if args.graph else {'nodes': {}, 'topics': {}}
+    results, running, graph_ok, snap = [], set(), False, {}
+    if qc is None:
         hdr.append('graph: no sim container is running (stack down: make stack-up)')
     else:
-        try:
-            running, graph_ok = sim.node_list(graph_c), True
-            hdr.append('graph (via %s): %d nodes, %d of them %s%s' % (
-                graph_c, len(running), sum(ref.mine(n) for n in running), ref.ns,
-                '' if running else ' -- empty: no stack nodes up, or no zenoh router (scripts/sim.py status)'))
-        except RuntimeError as exc:
+        spec = {'params': [nodes[n]['sim_fqn'] for n in selected if args.params and nodes[n].get('params')],
+                'info': [nodes[n]['sim_fqn'] for n in selected if nodes[n]['sim_fqn'] in edges['nodes']],
+                'topics': sorted(edges['topics'])}
+        snap = sim.collect(qc, spec)
+        if 'error' in snap:
             # A down router usually shows up as an empty graph instead: rmw_zenoh gives up
-            # on the router after one check and the CLI then sees only itself.
-            msg = '%s (is the zenoh router up in sim-drive? scripts/sim.py status)' % exc
-            hdr.append('graph (via %s): ERROR %s' % (graph_c, msg))
+            # on the router after one check and the session then sees only itself.
+            msg = '%s (is the zenoh router up in sim-drive? scripts/sim.py status)' % snap['error']
+            hdr.append('graph (via %s): ERROR %s' % (where, msg))
             results.append(Result('nodes', 'node list', ERROR, msg))
-    edges = ref.edges() if args.graph else {'nodes': {}, 'topics': {}}
+        else:
+            running, graph_ok = set(snap['nodes']), True
+            hdr.append('graph (via one query session in %s): %d nodes, %d of them %s%s' % (
+                where, len(running), sum(ref.mine(n) for n in running), ref.ns,
+                '' if running else ' -- empty: no stack nodes up, or no zenoh router (scripts/sim.py status)'))
 
-    pool = concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.jobs))
-    jobs = {}
     for name in selected:
         e = nodes[name]
         if e['sim_fqn'] not in running:
@@ -704,34 +792,28 @@ def run_checks(ref, sim, selected, args):
             continue
         results.append(Result('nodes', name, OK, '%s (%s)' % (e['sim_fqn'], e['container'])))
         if args.params and e.get('params'):
-            jobs[pool.submit(sim.param_dump, e['container'], e['sim_fqn'])] = ('params', name, e)
+            got = snap['params'].get(e['sim_fqn']) or {'error': 'no answer'}
+            results.append(check_params(ref, name, e, got['flat']) if 'flat' in got else
+                           Result('params', name, ERROR, 'parameters: %s' % got['error']))
         elif args.params:
             results.append(Result('params', name, NO_REF, e.get('note', 'no param reference')))
         if e['sim_fqn'] in edges['nodes']:
-            jobs[pool.submit(sim.node_info, e['container'], e['sim_fqn'])] = ('node', name, edges['nodes'][e['sim_fqn']])
+            info = snap['info'].get(e['sim_fqn'])
+            results.append(check_node_edges(ref, name, edges['nodes'][e['sim_fqn']], info) if info is not None else
+                           Result('graph', 'node ' + name, ERROR, 'no edges from the query'))
     scope = {nodes[n]['sim_fqn'] for n in selected}
     everything = set(selected) == set(nodes)
     for topic, spec in edges['topics'].items():
         considered = [ep for ep in spec['endpoints'] if ref.node_class(ep['node']) != 'ignore'
                       and (everything or ep['node'] in scope)]
-        if any(ep['node'] in running and ref.node_class(ep['node']) != 'absent' for ep in considered):
-            jobs[pool.submit(sim.topic_info, graph_c, topic)] = ('topic', topic, (spec, considered))
-    scope = None if everything else scope
-    for fut in concurrent.futures.as_completed(jobs):
-        kind, name, extra = jobs[fut]
-        try:
-            value = fut.result()
-        except Exception as exc:  # report it and keep checking the rest
-            label = name if kind != 'node' else 'node ' + name
-            results.append(Result('params' if kind == 'params' else 'graph', label, ERROR, str(exc)))
+        if not any(ep['node'] in running and ref.node_class(ep['node']) != 'absent' for ep in considered):
             continue
-        if kind == 'params':
-            results.append(check_params(ref, name, extra, value))
-        elif kind == 'node':
-            results.append(check_node_edges(ref, name, extra, value))
-        else:
-            results.append(check_topic(ref, name, extra[0], extra[1], scope, running, *value))
-    pool.shutdown()
+        got = snap['topics'].get(topic)
+        if got is None:
+            results.append(Result('graph', topic, ERROR, 'no endpoints from the query'))
+            continue
+        results.append(check_topic(ref, topic, spec, considered, None if everything else scope, running,
+                                   got['type'], got['endpoints']))
     n_topics = len(edges['topics'])
     if args.graph and n_topics:
         checked = sum(1 for r in results if r.section == 'graph' and not r.name.startswith('node '))
@@ -758,7 +840,7 @@ def report(results, verbose, out=sys.stdout):
 
 def selftest(ref, selected, args):
     """Fixtures vs themselves must pass; with injected drift exactly that drift must fail."""
-    args.container, args.graph_container = None, 'fixture'
+    args.container = args.graph_container = None
     ok = True
     for drift in (False, True):
         if drift and set(selected) != set(ref.nodes()):
@@ -782,29 +864,69 @@ def selftest(ref, selected, args):
     return 0 if ok else 1
 
 
+def session_mapping(ns, run_dir=None):
+    """(mapping mode, note) of the running session (sim.py's <run>/session.json), or (None, why)."""
+    run_dir = run_dir or os.environ.get('ROVER_SIM_RUN') or RUN_DIR_DEFAULT
+    path = os.path.join(run_dir, 'session.json')
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except (OSError, ValueError) as exc:
+        return None, 'no session.json (%s)' % exc
+    mode = data.get('mapping')
+    if mode not in ('gpu', 'fallback'):
+        return None, '%s has no mapping mode' % path
+    agents = [a.get('name') for a in data.get('agents') or []]
+    note = 'session %s (%s)' % (data.get('name'), path)
+    if ns not in agents:
+        note += '; %s is not one of its agents (%s)' % (ns, ', '.join(map(str, agents)))
+    return mode, note
+
+
+def query_main(arg):
+    """--query: run query() on the JSON spec and print its answer (inside a sim container)."""
+    require_sim_session()
+    out = query(json.loads(arg))
+    print(QUERY_MARK + json.dumps(out, sort_keys=True), flush=True)
+    return 0
+
+
 def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    if argv[:1] == ['--query']:
+        return query_main(argv[1] if len(argv) > 1 else '{}')
     doc_head, doc_rest = __doc__.split('\n', 1)
     p = argparse.ArgumentParser(description=doc_head, epilog=doc_rest,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('ns', help='sim agent namespace, e.g. JR81')
     p.add_argument('--ref', default='JR02', help='reference robot, a directory under tools/reference/ (default JR02)')
     p.add_argument('--nodes', action='append', metavar='LIST', help='only these nodes (comma-separated, repeatable)')
-    p.add_argument('--mapping', choices=('gpu', 'fallback'), default=os.environ.get('ROVER_SIM_MAPPING', 'gpu'),
-                   help="the session's mapping mode; fallback allows its documented non-parity keys (default gpu)")
+    p.add_argument('--mapping', choices=('gpu', 'fallback'), default=None,
+                   help="the session's mapping mode; fallback allows its documented non-parity keys (default: the "
+                        "running session's, else $ROVER_SIM_MAPPING, else gpu)")
+    p.add_argument('--run-dir', help='scripts/sim.py\'s run dir (default $ROVER_SIM_RUN or %s)' % RUN_DIR_DEFAULT)
     p.add_argument('--no-params', dest='params', action='store_false', help='skip the param dumps')
     p.add_argument('--no-graph', dest='graph', action='store_false', help='skip the graph edges')
     p.add_argument('--require-running', action='store_true', help='fail when a reference node is not running')
-    p.add_argument('--container', help='run every query in this one container instead of per node')
-    p.add_argument('--graph-container', help='container for node list / topic info (default sim-drive, else any up)')
-    p.add_argument('--timeout', type=int, default=30, help='seconds per ros2 CLI call (default 30)')
-    p.add_argument('--spin-time', type=float, default=2.0, help='ros2 CLI discovery spin time (default 2)')
-    p.add_argument('--jobs', type=int, default=6, help='queries in parallel (default 6)')
-    p.add_argument('--save', metavar='DIR', help='also write the raw sim outputs under DIR')
+    p.add_argument('--container', help='the sim container the query session runs in (default sim-drive, else any up)')
+    p.add_argument('--graph-container', help='the same as --container (kept for older command lines)')
+    p.add_argument('--local', action='store_true', help='run the query session in this process (in a sim container)')
+    p.add_argument('--timeout', type=int, default=30, help='seconds per parameter service call (default 30)')
+    p.add_argument('--spin-time', type=float, default=2.0, help='graph discovery time before the queries (default 2)')
+    p.add_argument('--jobs', type=int, default=1, help='ignored: one query session asks everything in turn')
+    p.add_argument('--save', metavar='DIR', help='also write the query session\'s answer under DIR')
     p.add_argument('-v', '--verbose', action='store_true', help='also print allowed and not-running details')
     p.add_argument('--show-ref', metavar='NODE', help='print the reference params of NODE, renamed to <ns>, and exit')
     p.add_argument('--selftest', action='store_true', help='check the checker on the fixtures alone and exit')
     args = p.parse_args(argv)
 
+    mapping_note = 'given'
+    if args.mapping is None:
+        args.mapping, mapping_note = session_mapping(args.ns, args.run_dir)
+        if args.mapping is None:
+            env = os.environ.get('ROVER_SIM_MAPPING')
+            args.mapping = env if env in ('gpu', 'fallback') else 'gpu'
+            mapping_note += '; %s' % ('$ROVER_SIM_MAPPING' if env in ('gpu', 'fallback') else 'default')
     ref = Reference(args.ref, args.ns, args.mapping)
     nodes = ref.nodes()
     if args.show_ref:
@@ -823,14 +945,19 @@ def main(argv=None):
     if not args.selftest:
         for c in sorted({args.container, args.graph_container} - {None} | {e['container'] for e in nodes.values()}):
             sim_container(c)
+        if args.local:
+            require_sim_session()
+            if not os.path.isdir(os.path.join(REPO, 'tools', 'reference')):
+                die('--local needs this checkout\'s tools/reference/, which the sim containers do not mount '
+                    '(only scripts/): run parity_check.py on the host, which queries from a sim container')
     for rel in ref.files(nodes[n] for n in selected):
         ref.path(rel)  # fetch private-repo files now, not halfway through the checks
     if args.selftest:
         return selftest(ref, selected, args)
 
-    print('parity_check: %s (class %s, %s mapping) vs %s (%s)'
-          % (args.ns, ref.cls, args.mapping, args.ref, os.path.relpath(ref.dir, REPO)))
-    hdr, results = run_checks(ref, Sim(args.timeout, args.spin_time, args.save), selected, args)
+    print('parity_check: %s (class %s, %s mapping: %s) vs %s (%s)'
+          % (args.ns, ref.cls, args.mapping, mapping_note, args.ref, os.path.relpath(ref.dir, REPO)))
+    hdr, results = run_checks(ref, Sim(args.timeout, args.spin_time, args.save, local=args.local), selected, args)
     for line in hdr:
         print('  ' + line)
     counts = report(results, args.verbose)

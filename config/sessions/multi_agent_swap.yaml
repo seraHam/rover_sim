@@ -1,8 +1,15 @@
 # Position swap: two P3-DX (JR) and two P3-AT (RR) on a circle of 8 m diameter in the
 # arena (the empty world walled in: DLIO drifts on a bare floor), each facing the centre,
-# each sent to the start of the agent opposite it.
-# All four paths cross at the centre and the opposite pairs are cross-class, so this
-# exercises mighty's multi-agent avoidance over /trajs with ground-truth frame_align.
+# each sent across it to the circle 20 deg past the start of the agent opposite it.
+# All four paths pass within 0.7 m of the centre and the opposite pairs are cross-class, so
+# this exercises mighty's multi-agent avoidance over /trajs with ground-truth frame_align.
+# Not the opposite start itself: the agent parked there is in every map, and mighty refuses a
+# terminal goal on an occupied cell (its fallback subgoal is the goal too, within its 15 m
+# horizon), so all four would wait for goal_selector to give up on their goals. 20 deg leaves
+# 1.4 m to that start and over 2.2 m to any box.
+# demo: swap: every agent is armed (auto_arm), driven 1.2 m off its spot (goal_relay.py's first
+# drive: a parked rover has never seen the floor in front of it), then scripts/goal_relay.py
+# sends each to its goal and, once there, back to its start, over and over.
 #
 #   scripts/sim.py up multi_agent_swap
 #
@@ -12,8 +19,10 @@ world: arena
 gui: false
 mapping: gpu
 rviz: false
+demo: swap
+auto_arm: true
 agents:
-  - {name: JR81, class: jr, pose: [2.83, 2.83, -135.0], goals: [[-2.83, -2.83]]}
-  - {name: JR82, class: jr, pose: [-2.83, 2.83, -45.0], goals: [[2.83, -2.83]]}
-  - {name: RR83, class: rr, pose: [-2.83, -2.83, 45.0], goals: [[2.83, 2.83]]}
-  - {name: RR84, class: rr, pose: [2.83, -2.83, 135.0], goals: [[-2.83, 2.83]]}
+  - {name: JR81, class: jr, pose: [2.83, 2.83, -135.0], goals: [[-1.69, -3.63]]}
+  - {name: JR82, class: jr, pose: [-2.83, 2.83, -45.0], goals: [[3.63, -1.69]]}
+  - {name: RR83, class: rr, pose: [-2.83, -2.83, 45.0], goals: [[1.69, 3.63]]}
+  - {name: RR84, class: rr, pose: [2.83, -2.83, 135.0], goals: [[-3.63, 1.69]]}

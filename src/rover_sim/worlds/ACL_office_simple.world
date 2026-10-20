@@ -2,7 +2,9 @@
 <!-- The ACL office (static walls only), from blakete/mighty feature/rover_sim 4e09544
      worlds/ACL_office_simple.world (unchanged in 6caed38), for launch/world.launch.py
      world:=ACL_office_simple. Changed: physics on (no disable_physics plugin) with the rover_sim
-     physics block, no gazebo_ros_state plugin (nothing reads /plug/*), standard gravity. -->
+     physics block, no gazebo_ros_state plugin (nothing reads /plug/*), standard gravity. Added, sim
+     only (models at the end, which say why): corridor pilasters, hall shelves and a ceiling over
+     the corridors. -->
 <sdf version='1.7'>
   <world name='default'>
     <light name='sun' type='directional'>
@@ -3995,6 +3997,180 @@
         <kinematic>0</kinematic>
       </link>
       <static>1</static>
+    </model>
+    <!-- Sim only (rover_sim), for DLIO at the sim's lidar density (src/rover_sim/config/worlds.yaml):
+         the bare office has long featureless walls and no ceiling, and with ~1400 rays a scan an RR's
+         DLIO slid 7-100 m along the 1.4 m west corridor, a JR's up to 13 m along the hall, and z wandered
+         9-16 cm on the floor alone. Each box adds ray-cast time to every scan (48 pilasters on all the
+         long walls lost real time with the shared cores busy), so these are few. -->
+    <!-- Pilasters (0.3 m wide, 0.1 m proud of each face) on the corridor walls, 2.5-4 m apart: structure
+         along the corridor axis. One link each, as the walls: ODE culls rays per link. -->
+    <model name='rover_sim_pilasters'>
+      <static>1</static>
+      <link name='p0'>
+        <pose>-5.970 -16.000 1.25 0 0 1.57080</pose>
+        <collision name='c'><geometry><box><size>0.3 0.35 2.5</size></box></geometry></collision>
+        <visual name='v'><geometry><box><size>0.3 0.35 2.5</size></box></geometry></visual>
+      </link>
+      <link name='p1'>
+        <pose>-5.970 -13.000 1.25 0 0 1.57080</pose>
+        <collision name='c'><geometry><box><size>0.3 0.35 2.5</size></box></geometry></collision>
+        <visual name='v'><geometry><box><size>0.3 0.35 2.5</size></box></geometry></visual>
+      </link>
+      <link name='p2'>
+        <pose>-5.970 -9.000 1.25 0 0 1.57080</pose>
+        <collision name='c'><geometry><box><size>0.3 0.35 2.5</size></box></geometry></collision>
+        <visual name='v'><geometry><box><size>0.3 0.35 2.5</size></box></geometry></visual>
+      </link>
+      <link name='p3'>
+        <pose>-5.970 -6.500 1.25 0 0 1.57080</pose>
+        <collision name='c'><geometry><box><size>0.3 0.35 2.5</size></box></geometry></collision>
+        <visual name='v'><geometry><box><size>0.3 0.35 2.5</size></box></geometry></visual>
+      </link>
+      <link name='p4'>
+        <pose>-5.970 -1.000 1.25 0 0 1.57080</pose>
+        <collision name='c'><geometry><box><size>0.3 0.35 2.5</size></box></geometry></collision>
+        <visual name='v'><geometry><box><size>0.3 0.35 2.5</size></box></geometry></visual>
+      </link>
+      <link name='p5'>
+        <pose>-5.970 2.500 1.25 0 0 1.57080</pose>
+        <collision name='c'><geometry><box><size>0.3 0.35 2.5</size></box></geometry></collision>
+        <visual name='v'><geometry><box><size>0.3 0.35 2.5</size></box></geometry></visual>
+      </link>
+      <link name='p6'>
+        <pose>-4.590 -7.700 1.25 0 0 1.57080</pose>
+        <collision name='c'><geometry><box><size>0.3 0.35 2.5</size></box></geometry></collision>
+        <visual name='v'><geometry><box><size>0.3 0.35 2.5</size></box></geometry></visual>
+      </link>
+      <link name='p7'>
+        <pose>-4.460 -14.100 1.25 0 0 1.57080</pose>
+        <collision name='c'><geometry><box><size>0.3 0.35 2.5</size></box></geometry></collision>
+        <visual name='v'><geometry><box><size>0.3 0.35 2.5</size></box></geometry></visual>
+      </link>
+      <link name='p8'>
+        <pose>7.000 -11.950 1.25 0 0 0.00000</pose>
+        <collision name='c'><geometry><box><size>0.3 0.35 2.5</size></box></geometry></collision>
+        <visual name='v'><geometry><box><size>0.3 0.35 2.5</size></box></geometry></visual>
+      </link>
+      <link name='p9'>
+        <pose>10.500 -11.950 1.25 0 0 0.00000</pose>
+        <collision name='c'><geometry><box><size>0.3 0.35 2.5</size></box></geometry></collision>
+        <visual name='v'><geometry><box><size>0.3 0.35 2.5</size></box></geometry></visual>
+      </link>
+      <link name='p10'>
+        <pose>14.000 -11.950 1.25 0 0 0.00000</pose>
+        <collision name='c'><geometry><box><size>0.3 0.35 2.5</size></box></geometry></collision>
+        <visual name='v'><geometry><box><size>0.3 0.35 2.5</size></box></geometry></visual>
+      </link>
+      <link name='p11'>
+        <pose>-1.000 -18.020 1.25 0 0 0.00000</pose>
+        <collision name='c'><geometry><box><size>0.3 0.35 2.5</size></box></geometry></collision>
+        <visual name='v'><geometry><box><size>0.3 0.35 2.5</size></box></geometry></visual>
+      </link>
+      <link name='p12'>
+        <pose>1.500 -18.020 1.25 0 0 0.00000</pose>
+        <collision name='c'><geometry><box><size>0.3 0.35 2.5</size></box></geometry></collision>
+        <visual name='v'><geometry><box><size>0.3 0.35 2.5</size></box></geometry></visual>
+      </link>
+      <link name='p13'>
+        <pose>11.000 -17.770 1.25 0 0 0.00000</pose>
+        <collision name='c'><geometry><box><size>0.3 0.35 2.5</size></box></geometry></collision>
+        <visual name='v'><geometry><box><size>0.3 0.35 2.5</size></box></geometry></visual>
+      </link>
+      <link name='p14'>
+        <pose>14.500 -17.770 1.25 0 0 0.00000</pose>
+        <collision name='c'><geometry><box><size>0.3 0.35 2.5</size></box></geometry></collision>
+        <visual name='v'><geometry><box><size>0.3 0.35 2.5</size></box></geometry></visual>
+      </link>
+      <link name='p15'>
+        <pose>17.500 -17.770 1.25 0 0 0.00000</pose>
+        <collision name='c'><geometry><box><size>0.3 0.35 2.5</size></box></geometry></collision>
+        <visual name='v'><geometry><box><size>0.3 0.35 2.5</size></box></geometry></visual>
+      </link>
+      <link name='p16'>
+        <pose>18.130 -10.500 1.25 0 0 1.57080</pose>
+        <collision name='c'><geometry><box><size>0.3 0.35 2.5</size></box></geometry></collision>
+        <visual name='v'><geometry><box><size>0.3 0.35 2.5</size></box></geometry></visual>
+      </link>
+      <link name='p17'>
+        <pose>18.130 -7.000 1.25 0 0 1.57080</pose>
+        <collision name='c'><geometry><box><size>0.3 0.35 2.5</size></box></geometry></collision>
+        <visual name='v'><geometry><box><size>0.3 0.35 2.5</size></box></geometry></visual>
+      </link>
+      <link name='p18'>
+        <pose>16.580 -7.600 1.25 0 0 1.57080</pose>
+        <collision name='c'><geometry><box><size>0.3 0.35 2.5</size></box></geometry></collision>
+        <visual name='v'><geometry><box><size>0.3 0.35 2.5</size></box></geometry></visual>
+      </link>
+    </model>
+    <!-- Shelves (1.2 x 0.4 x 1.4 m) against the hall's walls: a JR's pitched MID-360 sees low objects
+         near the floor best. -->
+    <model name='rover_sim_shelves'>
+      <static>1</static>
+      <link name='s0'>
+        <pose>-1.000 5.005 0.7 0 0 0.00000</pose>
+        <collision name='c'><geometry><box><size>1.2 0.4 1.4</size></box></geometry></collision>
+        <visual name='v'><geometry><box><size>1.2 0.4 1.4</size></box></geometry></visual>
+      </link>
+      <link name='s1'>
+        <pose>3.500 5.005 0.7 0 0 0.00000</pose>
+        <collision name='c'><geometry><box><size>1.2 0.4 1.4</size></box></geometry></collision>
+        <visual name='v'><geometry><box><size>1.2 0.4 1.4</size></box></geometry></visual>
+      </link>
+      <link name='s2'>
+        <pose>8.000 5.005 0.7 0 0 0.00000</pose>
+        <collision name='c'><geometry><box><size>1.2 0.4 1.4</size></box></geometry></collision>
+        <visual name='v'><geometry><box><size>1.2 0.4 1.4</size></box></geometry></visual>
+      </link>
+      <link name='s3'>
+        <pose>12.500 5.005 0.7 0 0 0.00000</pose>
+        <collision name='c'><geometry><box><size>1.2 0.4 1.4</size></box></geometry></collision>
+        <visual name='v'><geometry><box><size>1.2 0.4 1.4</size></box></geometry></visual>
+      </link>
+      <link name='s4'>
+        <pose>-1.000 -3.685 0.7 0 0 0.00000</pose>
+        <collision name='c'><geometry><box><size>1.2 0.4 1.4</size></box></geometry></collision>
+        <visual name='v'><geometry><box><size>1.2 0.4 1.4</size></box></geometry></visual>
+      </link>
+      <link name='s5'>
+        <pose>4.000 -4.385 0.7 0 0 0.00000</pose>
+        <collision name='c'><geometry><box><size>1.2 0.4 1.4</size></box></geometry></collision>
+        <visual name='v'><geometry><box><size>1.2 0.4 1.4</size></box></geometry></visual>
+      </link>
+      <link name='s6'>
+        <pose>8.000 -4.385 0.7 0 0 0.00000</pose>
+        <collision name='c'><geometry><box><size>1.2 0.4 1.4</size></box></geometry></collision>
+        <visual name='v'><geometry><box><size>1.2 0.4 1.4</size></box></geometry></visual>
+      </link>
+      <link name='s7'>
+        <pose>13.300 -3.065 0.7 0 0 0.00000</pose>
+        <collision name='c'><geometry><box><size>1.2 0.4 1.4</size></box></geometry></collision>
+        <visual name='v'><geometry><box><size>1.2 0.4 1.4</size></box></geometry></visual>
+      </link>
+      <link name='s8'>
+        <pose>-5.695 0.500 0.7 0 0 1.57080</pose>
+        <collision name='c'><geometry><box><size>1.2 0.4 1.4</size></box></geometry></collision>
+        <visual name='v'><geometry><box><size>1.2 0.4 1.4</size></box></geometry></visual>
+      </link>
+      <link name='s9'>
+        <pose>17.855 0.500 0.7 0 0 1.57080</pose>
+        <collision name='c'><geometry><box><size>1.2 0.4 1.4</size></box></geometry></collision>
+        <visual name='v'><geometry><box><size>1.2 0.4 1.4</size></box></geometry></visual>
+      </link>
+    </model>
+    <!-- A ceiling at the walls' top (2.5 m) over the corridors and rooms south of the hall (y < -3.4),
+         where the RRs' z wandered with only the floor to hold it. None over the hall: there it made a
+         JR slide along the hall instead (likely DLIO's adaptive mode: with a median range under 5 m it
+         matches within 0.25 m instead of 1 m). Collision only, so gzclient still looks in from above.
+         Its bottom is 2.5 m up: tools that take boxes for walls should skip boxes over the robots. The
+         elevation mapper drops points more than max_height_range (0.5 m) above the sensor, and the 2D
+         grids came out as before. -->
+    <model name='rover_sim_ceiling'>
+      <static>1</static>
+      <pose>7.8 -12.75 2.55 0 0 0</pose>
+      <link name='ceiling'>
+        <collision name='c'><geometry><box><size>28.4 18.7 0.1</size></box></geometry></collision>
+      </link>
     </model>
     <gui fullscreen='0'>
       <camera name='user_camera'>
