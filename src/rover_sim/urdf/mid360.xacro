@@ -1,0 +1,133 @@
+<?xml version="1.0"?>
+<!-- Livox MID-360 and its built-in IMU, as mounted on the JR02-parity models. Started from
+     docker/overrides/mid360.xacro (the legacy path's copy), changed:
+     - the link and the ray sensor are both named 'lidar': the livox plugin stamps
+       <namespace>/<sensor name> (livox_points_plugin.cpp:209), so the cloud is in <ns>/lidar,
+       the frame rover_description publishes;
+     - each scan covers the pattern window a real frame does: the 20000 consecutive csv points
+       of one 100 ms frame (num_phases 1), the robot's ~20k points per scan. 'samples' is the
+       most rays a scan casts: every k-th point of that window (the plugin's downsample), with
+       k = ceil(20000 / samples), so ceil(20000 / k) rays (3000 casts 2858, 1500 casts 1429)
+       and a cheaper scan stays spread over the whole field of view; max range 40 m;
+     - rays are cast from the sensor origin (<range><min> 0) and the link has no collision. The
+       plugin reports each range short by <min>: its LivoxOdeMultiRayShape::Init() replaces
+       MultiRayShape::Init(), which is what sets the base's minRange (left 0), so GetRange()
+       = 0 + the length from the ray start at <min>. Measured: <min> 0.1 / 0.3 read walls
+       0.100 / 0.300 m short. livox_sim_bridge drops returns inside the MID-360's 0.1 m;
+     - the plugin's <ray><scan> grid is 1x1. The plugin casts its csv pattern; the grid only
+       sizes a LaserScan it refills every scan (100x360 = 36000 zeros);
+     - the sensor carries its own 1-ray <ray>: without one, Gazebo's RaySensor casts its SDF
+       default of 640 rays every update;
+     - no <gravity>0</gravity>: the lidar link is lumped into the chassis, which took the
+       setting with it;
+     - the IMU: gazebo_ros_imu_sensor at the lidar origin in the lidar's orientation (DLIO's
+       baselink2imu is the lidar's rotation, t = 0), 200 Hz, m/s^2 including the gravity
+       reaction, on <ns>/sim/imu_raw. livox_sim_bridge turns it into <ns>/livox/imu. -->
+<robot xmlns:xacro="http://ros.org/wiki/xacro">
+
+  <!-- Specific force and rate noise of an ICM-40609-class part with some vibration on top,
+       stddev per sample at 200 Hz. Gazebo draws each bias once at load, with a random sign. -->
+  <xacro:property name="gyro_noise" value="2e-3"/>     <!-- rad/s -->
+  <xacro:property name="gyro_bias" value="5e-4"/>      <!-- rad/s -->
+  <xacro:property name="accel_noise" value="2e-2"/>    <!-- m/s^2 -->
+  <xacro:property name="accel_bias" value="1e-2"/>     <!-- m/s^2 -->
+
+  <xacro:macro name="imu_noise" params="stddev bias">
+    <noise type="gaussian">
+      <mean>0</mean>
+      <stddev>${stddev}</stddev>
+      <bias_mean>${bias}</bias_mean>
+      <bias_stddev>${bias / 4}</bias_stddev>
+    </noise>
+  </xacro:macro>
+
+  <!-- MID-360: 65 x 65 x 60 mm, 265 g, 200k points/s. -->
+  <xacro:property name="frame_points" value="20000"/>  <!-- pattern points per 100 ms frame -->
+  <xacro:macro name="mid360" params="namespace parent *origin samples:=20000 num_phases:=1
+                                     update_rate:=10 max_range:=40.0 imu_rate:=200">
+
+    <link name="lidar">
+      <inertial>
+        <mass value="0.265"/>
+        <inertia ixx="${0.265 / 12 * (0.065**2 + 0.06**2)}" ixy="0" ixz="0"
+                 iyy="${0.265 / 12 * (0.065**2 + 0.06**2)}" iyz="0"
+                 izz="${0.265 / 12 * (2 * 0.065**2)}"/>
+      </inertial>
+      <visual>
+        <geometry><box size="0.065 0.065 0.06"/></geometry>
+        <material name="lidar_grey"><color rgba="0.2 0.2 0.2 1"/></material>
+      </visual>
+      <!-- No collision: the rays start inside it (see above). -->
+    </link>
+
+    <joint name="base_to_lidar" type="fixed">
+      <parent link="${parent}"/>
+      <child link="lidar"/>
+      <xacro:insert_block name="origin"/>
+    </joint>
+
+    <gazebo reference="lidar">
+      <material>Gazebo/DarkGrey</material>
+
+      <sensor type="ray" name="lidar">
+        <pose>0 0 0 0 0 0</pose>
+        <always_on>true</always_on>
+        <visualize>false</visualize>
+        <update_rate>${update_rate}</update_rate>
+        <ray>
+          <scan>
+            <horizontal><samples>1</samples><resolution>1</resolution><min_angle>0</min_angle><max_angle>0</max_angle></horizontal>
+          </scan>
+          <range><min>0.1</min><max>0.2</max></range>
+        </ray>
+        <plugin name="livox" filename="libros2_livox.so">
+          <ros><namespace>/${namespace}</namespace></ros>
+          <namespace>${namespace}</namespace>   <!-- the plugin's frame prefix -->
+          <topic>mid360</topic>                 <!-- CustomMsg; PointCloud2 on mid360_PointCloud2 -->
+          <ray>
+            <scan>
+              <horizontal><samples>1</samples><resolution>1</resolution><min_angle>0</min_angle><max_angle>${2 * pi}</max_angle></horizontal>
+              <vertical><samples>1</samples><resolution>1</resolution><min_angle>${radians(-7.22)}</min_angle><max_angle>${radians(55.22)}</max_angle></vertical>
+            </scan>
+            <range><min>0</min><max>${max_range}</max><resolution>0.01</resolution></range>
+          </ray>
+          <visualize>false</visualize>
+          <samples>${frame_points}</samples>
+          <downsample>${max(1, int(ceil(frame_points / float(samples))))}</downsample>
+          <accumulate_scans>1</accumulate_scans>
+          <num_phases>${num_phases}</num_phases>
+          <csv_file_name>$(find ros2_livox_simulation)/scan_mode/mid360.csv</csv_file_name>
+        </plugin>
+      </sensor>
+
+      <sensor type="imu" name="imu">
+        <pose>0 0 0 0 0 0</pose>
+        <always_on>true</always_on>
+        <visualize>false</visualize>
+        <update_rate>${imu_rate}</update_rate>
+        <imu>
+          <angular_velocity>
+            <x><xacro:imu_noise stddev="${gyro_noise}" bias="${gyro_bias}"/></x>
+            <y><xacro:imu_noise stddev="${gyro_noise}" bias="${gyro_bias}"/></y>
+            <z><xacro:imu_noise stddev="${gyro_noise}" bias="${gyro_bias}"/></z>
+          </angular_velocity>
+          <linear_acceleration>
+            <x><xacro:imu_noise stddev="${accel_noise}" bias="${accel_bias}"/></x>
+            <y><xacro:imu_noise stddev="${accel_noise}" bias="${accel_bias}"/></y>
+            <z><xacro:imu_noise stddev="${accel_noise}" bias="${accel_bias}"/></z>
+          </linear_acceleration>
+        </imu>
+        <plugin name="imu" filename="libgazebo_ros_imu_sensor.so">
+          <ros>
+            <namespace>/${namespace}</namespace>
+            <remapping>~/out:=sim/imu_raw</remapping>
+          </ros>
+          <frame_name>${namespace}/lidar</frame_name>
+          <initial_orientation_as_reference>false</initial_orientation_as_reference>
+        </plugin>
+      </sensor>
+    </gazebo>
+
+  </xacro:macro>
+
+</robot>

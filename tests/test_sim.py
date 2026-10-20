@@ -2,11 +2,18 @@
 
     python3 -m unittest discover -s tests -v
 """
+import base64
+import contextlib
+import dataclasses
 import importlib.util
+import io
 import ipaddress
 import json
+import math
 import os
+import random
 import shlex
+import shutil
 import socket
 import stat
 import subprocess
@@ -14,8 +21,10 @@ import sys
 import tempfile
 import threading
 import unittest
+import xml.etree.ElementTree as ET
 from collections import OrderedDict
 from pathlib import Path
+from unittest import mock
 
 import yaml
 
@@ -49,6 +58,7 @@ class SessionValidation(unittest.TestCase):
         self.assertEqual(s.world, 'empty')
         self.assertEqual(s.mapping, 'fallback')
         self.assertFalse(s.rviz)
+        self.assertFalse(s.gui)
         self.assertEqual([(a.name, a.cls, a.id) for a in s.agents], [('JR81', 'jr', 81), ('RR83', 'rr', 83)])
         self.assertEqual(s.num_agents, 83)
         self.assertEqual(s.source, 'config/sessions/smoke.yaml')
@@ -61,7 +71,20 @@ class SessionValidation(unittest.TestCase):
         d = session()
         del d['mapping'], d['rviz']
         s = sim.validate_session(d)
-        self.assertEqual((s.mapping, s.rviz), ('gpu', False))
+        self.assertEqual((s.mapping, s.rviz, s.gui), ('gpu', False, False))
+        self.assertTrue(sim.validate_session(session(gui=True)).gui)
+        self.assertTrue(sim.validate_session(session(gui=True)).to_json()['gui'])
+
+    def test_yaw_radians(self):
+        def yaw(deg):
+            return sim.Agent('JR81', 'jr', 0.0, 0.0, deg).yaw
+        self.assertEqual(yaw(0.0), 0.0)
+        self.assertEqual(yaw(-135.0), math.radians(-135.0))      # exact inside [-180, 180]
+        self.assertEqual(yaw(180.0), math.pi)
+        self.assertAlmostEqual(yaw(270.0), -math.pi / 2)
+        self.assertAlmostEqual(yaw(-450.0), -math.pi / 2)
+        for deg in range(-720, 721, 15):
+            self.assertLessEqual(abs(yaw(float(deg))), math.pi)  # spawn_agent.launch.py refuses |yaw| > 2 pi
 
     def test_valid_with_goals(self):
         d = session()
@@ -110,8 +133,8 @@ class SessionValidation(unittest.TestCase):
             self.assertIn('is not [x, y, yaw_deg]', errors_of(d), pose)
 
     def test_top_level(self):
-        e = errors_of(session(mapping='cpu', rviz='yes', world='bad world', extra=1))
-        for want in ("mapping: 'cpu'", "rviz: 'yes'", "world: 'bad world'", 'unknown key(s): extra'):
+        e = errors_of(session(mapping='cpu', rviz='yes', gui=1, world='bad world', extra=1))
+        for want in ("mapping: 'cpu'", "rviz: 'yes'", 'gui: 1 is not', "world: 'bad world'", 'unknown key(s): extra'):
             self.assertIn(want, e)
         self.assertIn('need a non-empty list', errors_of(session(agents=[])))
         self.assertIn('top level', errors_of([1, 2]))
@@ -244,33 +267,52 @@ class Panes(unittest.TestCase):
 
 class Stacks(unittest.TestCase):
     def test_registry(self):
-        self.assertEqual(list(sim.STACKS),
-                         ['zenoh', 'gazebo', 'drive', 'dlio', 'mapping', 'elevation', 'mighty', 'rviz'])
-        self.assertEqual([s.name for s in sim.STACKS.values() if s.implemented], ['zenoh'])
+        self.assertEqual(list(sim.STACKS), ['zenoh', 'gazebo', 'drive', 'frame_align', 'dlio', 'mapping',
+                                            'elevation', 'mighty', 'rviz'])
+        self.assertEqual([s.name for s in sim.STACKS.values() if s.implemented],
+                         ['zenoh', 'gazebo', 'drive', 'frame_align'])
         for s in sim.STACKS.values():
             for c in s.containers:
                 self.assertIn(c, sim.CONTAINERS)
-        # Only stacks that open windows get X access (xhost +SI:localuser:root).
-        self.assertEqual([s.name for s in sim.STACKS.values() if s.needs_display], ['rviz'])
+        self.assertEqual(sim.STACKS['frame_align'].containers, ('sim-mighty',))
+        # Only stacks that open windows get X access (xhost +SI:localuser:root): gazebo
+        # only for gzclient.
+        plain, gui = sim.validate_session(session()), sim.validate_session(session(gui=True))
+        self.assertEqual([s.name for s in sim.STACKS.values() if s.needs_display(plain)], ['rviz'])
+        self.assertEqual([s.name for s in sim.STACKS.values() if s.needs_display(gui)], ['gazebo', 'rviz'])
 
     def test_select_default(self):
         s = sim.validate_session(session())
-        self.assertEqual([x.name for x in sim.select_stacks(s)], ['zenoh'])
-        self.assertEqual(sim.pending_stacks(s), ['gazebo (Phase 2)', 'drive (Phase 2)', 'dlio (Phase 3)',
-                                                 'mapping (Phase 4)', 'mighty (Phase 5)'])
+        self.assertEqual([x.name for x in sim.select_stacks(s)], ['zenoh', 'gazebo', 'drive', 'frame_align'])
+        self.assertEqual(sim.pending_stacks(s), ['dlio (Phase 3)', 'mapping (Phase 4)', 'mighty (Phase 5)'])
         gpu = sim.validate_session(session(mapping='gpu', rviz=True))
         self.assertIn('elevation (Phase 4)', sim.pending_stacks(gpu))
         self.assertIn('rviz (Phase 5)', sim.pending_stacks(gpu))
         self.assertEqual(sim.session_profiles(gpu), ['gpu'])
         self.assertEqual(sim.session_profiles(s), [])
+        # One agent: nothing to align.
+        one = sim.validate_session(session(agents=[{'name': 'JR81', 'class': 'jr', 'pose': [0, 0, 0]}]))
+        self.assertEqual([x.name for x in sim.select_stacks(one)], ['zenoh', 'gazebo', 'drive'])
 
     def test_select_requested(self):
         s = sim.validate_session(session())
         self.assertEqual([x.name for x in sim.select_stacks(s, ['zenoh'])], ['zenoh'])
-        with self.assertRaisesRegex(sim.SimError, 'Phase 2'):
-            sim.select_stacks(s, ['gazebo'])
+        self.assertEqual([x.name for x in sim.select_stacks(s, ['drive', 'gazebo'])], ['gazebo', 'drive'])
+        with self.assertRaisesRegex(sim.SimError, 'Phase 3'):
+            sim.select_stacks(s, ['dlio'])
         with self.assertRaisesRegex(sim.SimError, 'unknown stack'):
             sim.select_stacks(s, ['nope'])
+        one = sim.validate_session(session(agents=[{'name': 'JR81', 'class': 'jr', 'pose': [0, 0, 0]}]))
+        with self.assertRaisesRegex(sim.SimError, r'frame_align stack does not apply .*1 agent'):
+            sim.select_stacks(one, ['frame_align'])
+
+    def test_generate_steps_once_each(self):
+        st = sim.STACKS
+        self.assertEqual(sim.generate_steps([st['zenoh'], st['gazebo'], st['drive'], st['frame_align']]),
+                         [sim.write_agent_files, sim.link_calib])
+        self.assertEqual(sim.generate_steps([st['drive']]), [sim.write_agent_files, sim.link_calib])
+        self.assertEqual(sim.generate_steps([st['gazebo']]), [sim.write_agent_files])
+        self.assertEqual(sim.generate_steps([st['zenoh']]), [])
 
     def test_placeholders_raise(self):
         s = sim.validate_session(session(mapping='gpu', rviz=True))
@@ -279,6 +321,655 @@ class Stacks(unittest.TestCase):
             if not st.implemented:
                 with self.assertRaisesRegex(sim.SimError, 'Phase %d' % st.phase):
                     st.panes(s, ctx)
+
+
+def inner_of(p):
+    """The in-container command of a pane, as docker exec receives it."""
+    return shlex.split(sim.pane_command(p))[-1]
+
+
+def launch_args(cmd, verb):
+    """k:=v arguments of the first `verb ...` step of an && chain."""
+    part = next(c for c in cmd.split(' && ') if c.startswith(verb))
+    return OrderedDict(t.split(':=', 1) for t in shlex.split(part) if ':=' in t)
+
+
+def pose(x, y, yaw):
+    """3x3 homogeneous 2D transform."""
+    c, s = math.cos(yaw), math.sin(yaw)
+    return [[c, -s, x], [s, c, y], [0.0, 0.0, 1.0]]
+
+
+def mul(a, b):
+    return [[sum(a[i][k] * b[k][j] for k in range(3)) for j in range(3)] for i in range(3)]
+
+
+class FakeProc:
+    def __init__(self, returncode=0, stdout='', stderr=''):
+        self.returncode, self.stdout, self.stderr = returncode, stdout, stderr
+
+
+SWAP = sim.load_session('multi_agent_swap')
+
+
+class ShippedSessions(unittest.TestCase):
+    def test_multi_agent_swap(self):
+        s = SWAP
+        self.assertEqual([(a.name, a.cls) for a in s.agents],
+                         [('JR81', 'jr'), ('JR82', 'jr'), ('RR83', 'rr'), ('RR84', 'rr')])
+        self.assertEqual((s.world, s.mapping, s.rviz, s.gui), ('empty', 'gpu', False, False))
+        for a in s.agents:
+            self.assertAlmostEqual(math.hypot(a.x, a.y), 4.0, delta=0.01)          # an 8 m circle
+            facing = math.degrees(math.atan2(-a.y, -a.x))
+            self.assertAlmostEqual(math.remainder(a.yaw_deg - facing, 360.0), 0.0, delta=0.5)
+            opposite = [o for o in s.agents if math.hypot(o.x + a.x, o.y + a.y) < 1e-6]
+            self.assertEqual(len(opposite), 1, a.name)
+            self.assertEqual(a.goals, ((opposite[0].x, opposite[0].y),), a.name)
+            self.assertNotEqual(opposite[0].cls, a.cls)                         # crossings are cross-class
+
+    def test_office_explore(self):
+        s = sim.load_session('office_explore')
+        self.assertEqual([(a.name, a.cls) for a in s.agents], [(a.name, a.cls) for a in SWAP.agents])
+        self.assertEqual((s.world, s.mapping, s.rviz, s.gui), ('ACL_office_simple', 'gpu', False, False))
+        self.assertTrue(all(not a.goals for a in s.agents))
+        world = REPO / 'src' / 'rover_sim' / 'worlds' / 'ACL_office_simple.world'
+        if not world.is_file():
+            self.skipTest('no %s' % world)
+        boxes = world_boxes(world)
+        self.assertGreater(len(boxes), 50)
+        for a in s.agents:
+            # Free: over 1 m from every wall, and inside the building (a wall in each of
+            # four directions).
+            self.assertGreater(min(box_distance(a.x, a.y, b) for b in boxes), 1.0, a.name)
+            for ang in (0.0, math.pi / 2, math.pi, -math.pi / 2):
+                self.assertTrue(any(min(box_distance(a.x + r * 0.1 * math.cos(ang), a.y + r * 0.1 * math.sin(ang), b)
+                                        for b in boxes) == 0.0 for r in range(1, 300)), (a.name, ang))
+        for a in s.agents:
+            for o in s.agents:
+                if o is not a:
+                    self.assertGreater(math.hypot(a.x - o.x, a.y - o.y), 5.0)
+
+
+def world_boxes(path):
+    """2D footprints (cx, cy, yaw, sx, sy) of the box collisions of a Gazebo world."""
+    def pose_of(el):
+        p = el.find('pose')
+        v = [float(t) for t in p.text.split()] if p is not None and p.text else [0.0] * 6
+        return v[0], v[1], v[5]
+
+    def compose(a, b):
+        c, s = math.cos(a[2]), math.sin(a[2])
+        return a[0] + c * b[0] - s * b[1], a[1] + s * b[0] + c * b[1], a[2] + b[2]
+
+    out = []
+    for m in ET.parse(str(path)).getroot().find('world').findall('model'):
+        for link in m.findall('link'):
+            lp = compose(pose_of(m), pose_of(link))
+            for col in link.findall('collision'):
+                size = col.find('geometry/box/size')
+                if size is not None:
+                    sx, sy, _ = (float(t) for t in size.text.split())
+                    out.append(compose(lp, pose_of(col)) + (sx, sy))
+    return out
+
+
+def box_distance(x, y, b):
+    cx, cy, yaw, sx, sy = b
+    c, s = math.cos(yaw), math.sin(yaw)
+    lx, ly = c * (x - cx) + s * (y - cy), -s * (x - cx) + c * (y - cy)
+    return math.hypot(max(abs(lx) - sx / 2, 0.0), max(abs(ly) - sy / 2, 0.0))
+
+
+class FrameAlign(unittest.TestCase):
+    def test_transform_composes(self):
+        # T_world_ego * T_ego_other == T_world_other, for any two spawn poses.
+        rnd = random.Random(7)
+        for _ in range(200):
+            e = sim.Agent('JR81', 'jr', rnd.uniform(-20, 20), rnd.uniform(-20, 20), rnd.uniform(-360, 360))
+            o = sim.Agent('RR83', 'rr', rnd.uniform(-20, 20), rnd.uniform(-20, 20), rnd.uniform(-360, 360))
+            tx, ty, tz, qx, qy, qz, qw = sim.frame_align_transform(e, o)
+            self.assertEqual((tz, qx, qy), (0.0, 0.0, 0.0))
+            self.assertGreaterEqual(qw, 0.0)
+            self.assertAlmostEqual(qz * qz + qw * qw, 1.0)
+            got = mul(pose(e.x, e.y, e.yaw), pose(tx, ty, 2 * math.atan2(qz, qw)))
+            want = pose(o.x, o.y, o.yaw)
+            for i in range(2):
+                for j in range(3):
+                    self.assertAlmostEqual(got[i][j], want[i][j], places=9)
+
+    def test_known_pair(self):
+        # Ego facing +y at the origin; other at (1, 2) facing +x: 2 m ahead, 1 m to the right.
+        e, o = sim.Agent('JR81', 'jr', 0.0, 0.0, 90.0), sim.Agent('RR83', 'rr', 1.0, 2.0, 0.0)
+        t = sim.frame_align_transform(e, o)
+        for got, want in zip(t, (2.0, -1.0, 0.0, 0.0, 0.0, -math.sqrt(0.5), math.sqrt(0.5))):
+            self.assertAlmostEqual(got, want)
+
+    def test_names_cross_class(self):
+        jr, rr = sim.Agent('JR81', 'jr', 0, 0, 0), sim.Agent('RR83', 'rr', 1, 0, 0)
+        self.assertEqual(sim.frame_align_name(jr, rr), 'JR83')     # ego's prefix, other's digits
+        self.assertEqual(sim.frame_align_name(rr, jr), 'RR81')
+        s = sim.validate_session(session())
+        table = sim.frame_align_table(s)['pairs']
+        self.assertEqual([(p['ego'], p['other'], p['topic'], p['node']) for p in table],
+                         [('JR81', 'RR83', '/frame_align/JR81/JR83', 'frame_align_JR81_RR83'),
+                          ('RR83', 'JR81', '/frame_align/RR83/RR81', 'frame_align_RR83_JR81')])
+        self.assertEqual(list(table[0])[4:], list(sim.FRAME_ALIGN_KEYS))
+
+    def test_pairs(self):
+        pairs = sim.frame_align_pairs(SWAP)
+        self.assertEqual(len(pairs), 12)
+        self.assertEqual(len({(e.name, o.name) for e, o in pairs}), 12)
+        self.assertFalse([1 for e, o in pairs if e.name == o.name])
+
+    def test_panes(self):
+        ctx = sim.RunContext(run_dir=Path('/tmp/x'))
+        panes = sim.frame_align_panes(SWAP, ctx)
+        self.assertEqual(len(panes), 12)
+        self.assertEqual(len({p.slug for p in panes}), 12)
+        self.assertEqual([w for w, _ in sim.tmux_windows(panes)], ['align-JR81', 'align-JR82', 'align-RR83',
+                                                                   'align-RR84'])
+        by_slug = {p.slug: p for p in panes}
+        p = by_slug['frame-align-JR82-RR84']
+        self.assertEqual(p.container, 'sim-mighty')
+        argv = shlex.split(p.cmd)
+        self.assertEqual(argv[:6], ['ros2', 'run', 'mighty', 'frame_align_publisher.py', '--ros-args', '-r'])
+        self.assertEqual(argv[6], '__node:=frame_align_JR82_RR84')
+        params = OrderedDict(argv[i + 1].split(':=', 1) for i in range(7, len(argv), 2) if argv[i] == '-p')
+        self.assertEqual(list(params), ['ego_name', 'other_name'] + list(sim.FRAME_ALIGN_KEYS))
+        self.assertEqual((params['ego_name'], params['other_name']), ('JR82', 'JR84'))
+        # Doubles: a bare integer would be refused by the publisher's double parameters.
+        for k in sim.FRAME_ALIGN_KEYS:
+            self.assertIn('.', params[k], k)
+        jr82, rr84 = SWAP.agents[1], SWAP.agents[3]
+        for k, v in zip(sim.FRAME_ALIGN_KEYS, sim.frame_align_transform(jr82, rr84)):
+            self.assertAlmostEqual(float(params[k]), v, places=8)
+        subprocess.run(['bash', '-n', '-c', inner_of(p)], check=True)
+
+    def test_fmt_float(self):
+        for v, want in ((1.0, '1.0'), (-2.5, '-2.5'), (0.0, '0.0'), (-0.0, '0.0'), (-1e-12, '0.0'),
+                        (5.656854249492, '5.656854249'), (1e-5, '0.00001'), (123456.0, '123456.0')):
+            self.assertEqual(sim.fmt_float(v), want)
+
+
+class CpuSplit(unittest.TestCase):
+    def test_split(self):
+        self.assertEqual(sim.split_cpus([2, 3, 4, 5]), ([2, 3, 4], [5]))     # sim-gazebo's cpu_budget cores
+        self.assertEqual(sim.split_cpus(range(8)), ([0, 1, 2, 3, 4, 5], [6, 7]))
+        self.assertEqual(sim.split_cpus([5, 2, 4, 3, 3]), ([2, 3, 4], [5]))
+        self.assertEqual(sim.split_cpus([2, 3, 4, 5], spare=2), ([2, 3], [4, 5]))
+        self.assertEqual(sim.split_cpus([2, 3, 4, 5], spare=9), ([2], [3, 4, 5]))   # gzserver keeps one
+        self.assertEqual(sim.split_cpus([2, 3]), ([2], [3]))
+        self.assertEqual(sim.split_cpus([7]), ([7], [7]))                   # nothing to split: shared
+
+    def test_pin_self(self):
+        ctx = sim.RunContext(run_dir=Path('/tmp/x'))
+        self.assertEqual(sim.pin_self('gz', ctx), 'taskset -cp "$(python3 /rover_sim/scripts/sim.py cpus gz)" $$')
+        spare = sim.RunContext(run_dir=Path('/tmp/x'), gz_spare_cpus=2)
+        self.assertIn('cpus rest --spare 2)', sim.pin_self('rest', spare))
+
+    def test_spare_from_env(self):
+        with mock.patch.dict(os.environ, {'ROVER_SIM_GZ_SPARE_CPUS': '2'}):
+            self.assertEqual(sim.gz_spare_from_env(), 2)
+        for bad in ('0', '-1', 'x'):
+            with mock.patch.dict(os.environ, {'ROVER_SIM_GZ_SPARE_CPUS': bad}):
+                with self.assertRaises(sim.SimError):
+                    sim.gz_spare_from_env()
+        env = dict(os.environ)
+        env.pop('ROVER_SIM_GZ_SPARE_CPUS', None)
+        with mock.patch.dict(os.environ, env, clear=True):
+            self.assertIsNone(sim.gz_spare_from_env())
+
+
+class Phase2Panes(unittest.TestCase):
+    ctx = sim.RunContext(run_dir=Path(sim.RUN_DIR_DEFAULT))
+
+    def test_gazebo_panes(self):
+        panes = sim.gazebo_panes(SWAP, self.ctx)
+        self.assertEqual([p.slug for p in panes], ['gzserver', 'spawn', 'sim-tf', 'bridge-JR81', 'bridge-JR82',
+                                                   'bridge-RR83', 'bridge-RR84'])
+        self.assertEqual({p.container for p in panes}, {'sim-gazebo'})
+        self.assertEqual([(w, len(ps)) for w, ps in sim.tmux_windows(panes)], [('gazebo', 3), ('bridges', 4)])
+        by = {p.slug: p for p in panes}
+        self.assertEqual(by['gzserver'].cmd, sim.pin_self('gz', self.ctx) + ' && ros2 launch rover_sim '
+                         'world.launch.py world:=empty gui:=false paused:=true')
+        self.assertEqual(by['sim-tf'].cmd, sim.pin_self('rest', self.ctx)
+                         + ' && python3 /rover_sim/scripts/sim_tf.py --spawn /rover_sim/run/spawn.yaml')
+        self.assertEqual(by['bridge-RR83'].cmd, sim.pin_self('rest', self.ctx)
+                         + ' && python3 /rover_sim/scripts/livox_sim_bridge.py --ns RR83')
+        # Only gzserver runs on gzserver's cores.
+        for p in panes:
+            self.assertTrue(p.cmd.startswith(sim.pin_self('gz' if p.slug == 'gzserver' else 'rest', self.ctx)))
+            self.assertTrue(p.gate)
+            inner = inner_of(p)
+            subprocess.run(['bash', '-n', '-c', inner], check=True)
+            self.assertIn('source /usr/share/gazebo/setup.bash && source /opt/livox_ws/install/setup.bash && '
+                          'source /home/swarm/code/rover_sim_ws/install/setup.bash', inner)
+            # $$ is the container's bash: it must reach it unexpanded (single-quoted on the host).
+            self.assertIn("'", sim.pane_command(p).split(' bash -c ', 1)[1][:1])
+            self.assertIn(' $$ && ', inner)
+
+    def test_gui(self):
+        s = sim.validate_session(session(gui=True))
+        panes = sim.gazebo_panes(s, self.ctx)
+        # gzserver keeps its cores to itself; gzclient runs on the rest's, in its own pane.
+        self.assertIn('world:=empty gui:=false paused:=true', panes[0].cmd)
+        gzc = [p for p in panes if p.slug == 'gzclient']
+        self.assertEqual(len(gzc), 1)
+        self.assertEqual(gzc[0].cmd, sim.pin_self('rest', self.ctx)
+                         + ' && ros2 launch rover_sim world.launch.py server:=false gui:=true')
+        self.assertEqual(gzc[0].window, 'gazebo')
+        self.assertNotIn('gzclient', [p.slug for p in sim.gazebo_panes(SWAP, self.ctx)])
+
+    def test_spawn_sequence(self):
+        cmd = sim.spawn_cmd(SWAP, self.ctx)
+        steps = cmd.split(' && ')
+        self.assertEqual(steps[0], sim.pin_self('rest', self.ctx))
+        wait = next(i for i, c in enumerate(steps) if '/spawn_entity' in c and c.startswith('until '))
+        spawns = [i for i, c in enumerate(steps) if c.startswith('ros2 launch rover_sim spawn_agent.launch.py')]
+        unpause = [i for i, c in enumerate(steps) if 'unpause_physics' in c]
+        self.assertEqual(len(spawns), 4)
+        self.assertEqual(len(unpause), 1)
+        self.assertLess(wait, spawns[0])
+        self.assertEqual(unpause[0], spawns[-1] + 1)                   # once, after the last spawn
+        self.assertEqual(steps[unpause[0]], 'ros2 service call /unpause_physics std_srvs/srv/Empty')
+        self.assertEqual(steps[-1], 'exec sleep infinity')
+        self.assertIn('ros2 service list --no-daemon', steps[wait])
+        subprocess.run(['bash', '-n', '-c', cmd], check=True)
+
+    def test_spawn_agent_args(self):
+        rr84 = SWAP.agents[3]
+        args = launch_args(sim.spawn_agent_cmd(rr84, 1500), 'ros2 launch rover_sim spawn_agent.launch.py')
+        self.assertEqual(list(args), ['namespace', 'class', 'x', 'y', 'yaw', 'lidar_mount_file', 'lidar_height',
+                                      'lidar_samples', 'urdf_file'])
+        self.assertEqual((args['namespace'], args['class'], args['x'], args['y']), ('RR84', 'rr', '2.83', '-2.83'))
+        self.assertAlmostEqual(float(args['yaw']), math.radians(135.0), places=8)     # radians
+        self.assertEqual(args['lidar_mount_file'], '/rover_sim/run/sensor_calib/RR84_lidar_mount.yaml')
+        self.assertEqual(float(args['lidar_height']), 0.40)
+        self.assertEqual(args['lidar_samples'], '1500')
+        self.assertEqual(args['urdf_file'], '/rover_sim/run/urdf/RR84.urdf')
+        jr = launch_args(sim.spawn_agent_cmd(SWAP.agents[0], 500), 'ros2 launch')
+        self.assertEqual(float(jr['lidar_height']), 0.36)
+
+    def test_spawn_uses_the_world_budget(self):
+        for world in ('empty', 'ACL_office_simple'):
+            s = dataclasses.replace(SWAP, world=world)
+            want = 'lidar_samples:=%d ' % sim.world_lidar_samples(world)
+            self.assertEqual(sim.spawn_cmd(s, self.ctx).count(want), len(s.agents), world)
+
+    def test_world_lidar_samples(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / 'worlds.yaml'
+            p.write_text('lidar_samples_4_agents:\n  empty: 4000\n  bad: 0\n')
+            self.assertEqual(sim.world_lidar_samples('empty', p), 4000)
+            self.assertEqual(sim.world_lidar_samples('other', p), sim.LIDAR_SAMPLES_DEFAULT)
+            with self.assertRaises(sim.SimError):
+                sim.world_lidar_samples('bad', p)
+            p.write_text('lidar_samples_4_agents: [\n')
+            with self.assertRaises(sim.SimError):
+                sim.world_lidar_samples('empty', p)
+        # The shipped file has a budget for every shipped world.
+        for w in sim.WORLDS_DIR.glob('*.world'):
+            doc = yaml.safe_load(sim.WORLD_BUDGETS.read_text())
+            self.assertIn(w.stem, doc['lidar_samples_4_agents'])
+
+    def test_spare_cpus_reach_every_pinned_pane(self):
+        ctx = sim.RunContext(run_dir=Path('/tmp/x'), gz_spare_cpus=2)
+        for p in sim.gazebo_panes(SWAP, ctx):
+            self.assertIn('--spare 2)" $$', p.cmd)
+
+    def test_drive_panes(self):
+        panes = sim.drive_panes(SWAP, self.ctx)
+        self.assertEqual([p.slug for p in panes], ['description-tf-' + a.name for a in SWAP.agents])
+        p = panes[2]
+        self.assertEqual((p.container, p.window, p.gate), ('sim-drive', 'description', True))
+        self.assertEqual(p.cmd, 'ros2 launch rover_description state_publisher.launch.py robot_name:=RR83 '
+                                'ns_tf_frame_ids:=true')
+        argv = shlex.split(sim.pane_command(p))
+        self.assertEqual(argv[:9], ['docker', 'exec', '-it', '-e', 'VEHTYPE=RR', '-e', 'VEHNUM=83', '-e',
+                                    'ROBOT_NAME=RR83'])
+        subprocess.run(['bash', '-n', '-c', argv[-1]], check=True)
+
+
+SAMPLE_MOUNT = b'# test mount\nxyz: [0.0, 0.0, 0.0]\nrpy: [0.0, 0.5, 0.0]   # pitch\n'
+SAMPLE_MOUNT_RR = b'# test mount rr\nxyz: [0.0, 0.0, 0.0]\nrpy: [0.0, 0.35, 0.0]\n'
+SAMPLE_NPY = b'\x93NUMPY\x01\x00' + bytes(range(40))
+
+
+class RunFiles(unittest.TestCase):
+    def test_reference_robots_from_pins(self):
+        pins = sim.read_pins()
+        self.assertEqual((sim.reference_robot('jr', pins), sim.reference_robot('rr', pins)), ('JR02', 'RR08'))
+        self.assertEqual((pins['DLIO_JR_ROBOT'], pins['DLIO_RR_ROBOT']), ('JR02', 'RR08'))
+        for bad in ({}, {'DLIO_JR_ROBOT': 'RR08'}, {'DLIO_JR_ROBOT': 'JR2'}):
+            with self.assertRaises(sim.SimError):
+                sim.reference_robot('jr', bad)
+
+    def test_class_table(self):
+        self.assertEqual([(k, c.prefix, c.lidar_height) for k, c in sim.ROBOT_CLASSES.items()],
+                         [('jr', 'JR', 0.36), ('rr', 'RR', 0.40)])
+        self.assertEqual(sim.CLASS_PREFIXES, OrderedDict([('jr', 'JR'), ('rr', 'RR')]))
+        # Same heights as the Gazebo models' own defaults.
+        classes = REPO / 'src' / 'rover_sim' / 'config' / 'classes.yaml'
+        if classes.is_file():
+            doc = yaml.safe_load(classes.read_text())
+            for k, c in sim.ROBOT_CLASSES.items():
+                self.assertEqual(doc[k]['lidar_height'], c.lidar_height, k)
+
+    def test_spawn_table(self):
+        s = sim.validate_session(session())
+        pins = {'DLIO_JR_ROBOT': 'JR02', 'DLIO_RR_ROBOT': 'RR08'}
+        t = sim.spawn_table(s, pins)
+        self.assertEqual(list(t), ['agents'])
+        self.assertEqual([list(a) for a in t['agents']],
+                         [['name', 'class', 'id', 'x', 'y', 'yaw', 'yaw_deg', 'lidar_height', 'reference_robot']] * 2)
+        rr = t['agents'][1]
+        self.assertEqual((rr['name'], rr['class'], rr['id'], rr['x'], rr['y'], rr['yaw_deg'], rr['lidar_height'],
+                          rr['reference_robot']), ('RR83', 'rr', 83, 2.0, 1.0, 90.0, 0.40, 'RR08'))
+        self.assertAlmostEqual(rr['yaw'], math.pi / 2)
+        text = sim.generated_yaml(s, 'Agents', t)
+        self.assertTrue(text.startswith('# Agents for session t'))
+        self.assertEqual(yaml.safe_load(text), t)
+
+    def test_mount_header(self):
+        a = sim.Agent('JR81', 'jr', 0, 0, 0)
+        pins = {'DRIVE_IMAGE': 'rover-sim/drive:9b0b4ba', 'DRIVE_SHA': '9b0b4ba5e56930b67fd2061a395e926147ca99b2'}
+        h = sim.mount_header(a, 'JR02', pins)
+        self.assertTrue(h.startswith(b'# rover_sim: JR81 '))
+        self.assertTrue(h.endswith(b'\n'))
+        self.assertEqual(h.count(b'\n'), 1)
+        self.assertIn(b'JR02_lidar_mount.yaml verbatim from rover-sim/drive:9b0b4ba (rover 9b0b4ba)', h)
+        full = h + SAMPLE_MOUNT
+        self.assertEqual(full[len(h):], SAMPLE_MOUNT)
+        self.assertEqual(yaml.safe_load(full.decode()), yaml.safe_load(SAMPLE_MOUNT.decode()))
+        sim.check_mount(full, 'test')
+
+    def test_check_mount(self):
+        sim.check_mount(SAMPLE_MOUNT, 'ok')
+        for bad in (b'xyz: [0, 0, 0]\n', b'xyz: [0, 0]\nrpy: [0, 0, 0]\n', b'xyz: [a, 0, 0]\nrpy: [0, 0, 0]\n',
+                    b'- 1\n', b': :\n', b'\xff\xfe'):
+            with self.assertRaises(sim.SimError, msg=bad):
+                sim.check_mount(bad, 'bad')
+
+    def test_write_agent_files(self):
+        s = SWAP
+        calls = []
+
+        def fake_dexec(name, args, **kw):
+            calls.append((name, args))
+            path = args[-1]
+            data = {'JR02_lidar_mount.yaml': SAMPLE_MOUNT, 'RR08_lidar_mount.yaml': SAMPLE_MOUNT_RR,
+                    'JR02_calib.npy': SAMPLE_NPY, 'RR08_calib.npy': SAMPLE_NPY + b'rr'}.get(os.path.basename(path))
+            return FakeProc(0, base64.b64encode(data).decode()) if data else FakeProc(1, '', 'no such file')
+
+        with tempfile.TemporaryDirectory() as d:
+            run = Path(d)
+            (run / 'sensor_calib').mkdir()
+            (run / 'sensor_calib' / 'JR99_calib.npy').write_text('stale')
+            (run / 'urdf').mkdir()
+            (run / 'urdf' / 'JR99.urdf').write_text('stale')
+            with mock.patch.object(sim, 'dexec', fake_dexec), mock.patch.object(sim, 'running', lambda n: True), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                sim.write_agent_files(s, sim.RunContext(run_dir=run))
+            # Read from the drive image's rover_description, once per reference robot and file.
+            self.assertEqual({c[0] for c in calls}, {'sim-drive'})
+            self.assertEqual(sorted(c[1][-1] for c in calls), sorted(
+                sim.RD_SHARE + '/sensor_calib/' + f for f in ('JR02_lidar_mount.yaml', 'JR02_calib.npy',
+                                                              'RR08_lidar_mount.yaml', 'RR08_calib.npy')))
+            self.assertEqual(sorted(p.name for p in (run / 'sensor_calib').iterdir()), sorted(
+                '%s_%s' % (a.name, f) for a in s.agents for f in ('lidar_mount.yaml', 'calib.npy')))
+            self.assertEqual(list((run / 'urdf').iterdir()), [])
+            m = (run / 'sensor_calib' / 'RR84_lidar_mount.yaml').read_bytes()
+            first, rest = m.split(b'\n', 1)
+            self.assertTrue(first.startswith(b'# rover_sim: RR84 (class rr) uses RR08'))
+            self.assertEqual(rest, SAMPLE_MOUNT_RR)
+            self.assertEqual((run / 'sensor_calib' / 'JR82_calib.npy').read_bytes(), SAMPLE_NPY)
+            self.assertEqual((run / 'sensor_calib' / 'RR83_calib.npy').read_bytes(), SAMPLE_NPY + b'rr')
+            spawn = yaml.safe_load((run / 'spawn.yaml').read_text())
+            self.assertEqual(spawn, sim.spawn_table(s, sim.read_pins()))
+            fa = yaml.safe_load((run / 'frame_align.yaml').read_text())
+            self.assertEqual(len(fa['pairs']), 12)
+            # Refuses to start without sim-drive, the calibration's source.
+            with mock.patch.object(sim, 'running', lambda n: False):
+                with self.assertRaisesRegex(sim.SimError, 'sim-drive'):
+                    sim.write_agent_files(s, sim.RunContext(run_dir=run))
+
+    def test_run_dir_writes_never_follow_links(self):
+        # The containers write the run dir as root: a link planted there must not make
+        # sim.py write or delete anything outside it.
+        with tempfile.TemporaryDirectory() as d:
+            run, outside = Path(d) / 'run', Path(d) / 'outside'
+            run.mkdir()
+            outside.mkdir()
+            (outside / 'precious').write_text('keep')
+            (run / '.spawn.yaml.tmp').symlink_to(outside / 'precious')       # the temp name
+            sim.write_file(run / 'spawn.yaml', b'a: 1\n')
+            self.assertEqual((outside / 'precious').read_text(), 'keep')
+            self.assertEqual((run / 'spawn.yaml').read_bytes(), b'a: 1\n')
+            (run / 'spawn.yaml').unlink()
+            (run / 'spawn.yaml').symlink_to(outside / 'precious')            # the name itself
+            sim.write_file(run / 'spawn.yaml', b'a: 2\n')
+            self.assertFalse((run / 'spawn.yaml').is_symlink())
+            self.assertEqual((outside / 'precious').read_text(), 'keep')
+            self.assertEqual(sorted(p.name for p in run.iterdir()), ['spawn.yaml'])
+            (run / 'urdf').symlink_to(outside, target_is_directory=True)       # a whole subdir
+            with self.assertRaises(sim.SimError):
+                sim.write_file(run / 'urdf' / 'JR81.urdf', b'x')
+            sim.empty_own_dir(run / 'urdf')
+            self.assertTrue((run / 'urdf').is_dir() and not (run / 'urdf').is_symlink())
+            self.assertEqual(sorted(p.name for p in outside.iterdir()), ['precious'])
+            (run / 'urdf' / 'old.urdf').write_text('x')
+            (run / 'urdf' / 'link').symlink_to(outside / 'precious')
+            (run / 'urdf' / 'sub').mkdir()
+            sim.empty_own_dir(run / 'urdf')
+            self.assertEqual(sorted(p.name for p in (run / 'urdf').iterdir()), ['sub'])
+            self.assertEqual((outside / 'precious').read_text(), 'keep')
+            (run / 'file').write_text('')
+            with self.assertRaises(sim.SimError):
+                sim.empty_own_dir(run / 'file')
+            sim.write_session_file(sim.validate_session(session()), run)
+            self.assertEqual(json.loads((run / 'session.json').read_text())['name'], 't')
+
+    def test_read_file_script(self):
+        with tempfile.TemporaryDirectory() as d:
+            f = Path(d) / 'a.npy'
+            f.write_bytes(SAMPLE_NPY)
+            (Path(d) / 'link.npy').symlink_to(f)
+
+            def run(p):
+                return subprocess.run(['bash', '-c', sim._READ_FILE_SH, 'read', str(p)], stdout=subprocess.PIPE,
+                                      universal_newlines=True)
+            ok = run(f)
+            self.assertEqual((ok.returncode, base64.b64decode(ok.stdout)), (0, SAMPLE_NPY))
+            self.assertNotEqual(run(Path(d) / 'link.npy').returncode, 0)     # never one of the run's own links
+            self.assertNotEqual(run(Path(d) / 'missing').returncode, 0)
+
+    def test_link_calib_script(self):
+        # The script link_calib runs in sim-drive, here against a temp "share".
+        with tempfile.TemporaryDirectory() as d:
+            share, src = Path(d) / 'share', Path(d) / 'run'
+            share.mkdir()
+            src.mkdir()
+            for n in ('JR81', 'RR83'):
+                (src / (n + '_lidar_mount.yaml')).write_bytes(SAMPLE_MOUNT)
+                (src / (n + '_calib.npy')).write_bytes(SAMPLE_NPY)
+            (share / 'JR02_lidar_mount.yaml').write_bytes(SAMPLE_MOUNT)       # a real robot's own file
+            (share / 'RR83_calib.npy').symlink_to(Path(d) / 'stale')          # an earlier run's link
+
+            def run(*names):
+                return subprocess.run(['bash', '-c', sim._LINK_CALIB_SH, 'link', str(share), str(src)] + list(names),
+                                      stderr=subprocess.PIPE, universal_newlines=True)
+            self.assertEqual(run('JR81', 'RR83').returncode, 0)
+            for n in ('JR81', 'RR83'):
+                for f in (n + '_lidar_mount.yaml', n + '_calib.npy'):
+                    self.assertTrue((share / f).is_symlink())
+                    self.assertEqual(os.readlink(str(share / f)), str(src / f))
+            self.assertEqual(run('JR81').returncode, 0)                       # idempotent
+            (src / 'JR02_lidar_mount.yaml').write_bytes(SAMPLE_MOUNT)
+            (src / 'JR02_calib.npy').write_bytes(SAMPLE_NPY)
+            p = run('JR02')
+            self.assertEqual(p.returncode, 3)
+            self.assertIn("image's own file", p.stderr)
+            self.assertFalse((share / 'JR02_lidar_mount.yaml').is_symlink())
+            self.assertEqual(run('RR99').returncode, 1)                        # nothing generated for it
+
+    def test_link_calib(self):
+        seen = []
+
+        def fake(rc):
+            def dexec(name, args, **kw):
+                seen.append((name, args))
+                return FakeProc(rc, '', 'boom')
+            return dexec
+        s = sim.validate_session(session())
+        with mock.patch.object(sim, 'dexec', fake(0)):
+            sim.link_calib(s, sim.RunContext(run_dir=Path('/tmp/x')))
+        name, args = seen[0]
+        self.assertEqual(name, 'sim-drive')
+        self.assertEqual(args[:3], ['bash', '-c', sim._LINK_CALIB_SH])
+        self.assertEqual(args[3:], ['link', sim.RD_SHARE + '/sensor_calib', '/rover_sim/run/sensor_calib',
+                                    'JR81', 'RR83'])
+        with mock.patch.object(sim, 'dexec', fake(3)):
+            with self.assertRaisesRegex(sim.SimError, 'rename that agent'):
+                sim.link_calib(s, sim.RunContext(run_dir=Path('/tmp/x')))
+
+    def test_world_problem(self):
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / 'empty.world').write_text('<sdf/>')
+            self.assertIsNone(sim.world_problem('empty', Path(d)))
+            self.assertIn('have: empty', sim.world_problem('office', Path(d)))
+        self.assertIn('have: none', sim.world_problem('x', Path('/nonexistent')))
+        if sim.WORLDS_DIR.is_dir():
+            for p in sorted(SESSIONS_DIR.glob('*.yaml')):
+                self.assertIsNone(sim.world_problem(sim.load_session(str(p)).world), p.name)
+
+
+SESSIONS_DIR = REPO / 'config' / 'sessions'
+
+
+class SimTimeStatus(unittest.TestCase):
+    def test_parse(self):
+        out = ('@@ /JR81/sim/rtf 0.998\n@@ /JR81/sim/time_offset 1760812345.25\n@@ /RR83/sim/rtf \n'
+               '@@ /RR83/sim/time_offset nan?\nzenoh noise\n')
+        self.assertEqual(sim.parse_sim_time(out), {'/JR81/sim/rtf': 0.998, '/JR81/sim/time_offset': 1760812345.25,
+                                                   '/RR83/sim/rtf': None, '/RR83/sim/time_offset': None})
+        self.assertEqual(sim.sim_time_topics(['JR81']), ['/JR81/sim/rtf', '/JR81/sim/time_offset'])
+
+    def test_lines(self):
+        vals = {'/JR81/sim/rtf': 0.998, '/JR81/sim/time_offset': 12.3456, '/JR82/sim/rtf': 0.9}
+        lines = sim.sim_time_lines(['JR81', 'JR82', 'RR83'], vals)
+        self.assertEqual(lines[0], 'JR81  rtf 0.998  time_offset 12.346 s')
+        self.assertEqual(lines[1], 'JR82  rtf 0.900  LOW  time_offset -')
+        self.assertIn('RR83  no sim/rtf or sim/time_offset', lines[2])
+
+    def test_query_script(self):
+        subprocess.run(['bash', '-n', '-c', sim._SIM_TIME_SH], check=True)
+        # One process for every topic, killed if it outlives its timeout (a stuck zenoh session
+        # holds the router up until its socket closes).
+        self.assertEqual(sim._SIM_TIME_SH, 'exec timeout -k 2 %d python3 -c "$SIM_STATUS_PY" %d "$@"'
+                         % (sim.ECHO_TIMEOUT_S + 4, sim.ECHO_TIMEOUT_S))
+        compile(sim._SIM_TIME_PY, '<sim_status>', 'exec')
+        self.assertNotIn('ros2 topic echo', sim._SIM_TIME_PY)
+
+    def test_values_query(self):
+        seen = []
+
+        def dexec(name, args, **kw):
+            seen.append((name, args, kw))
+            return FakeProc(0, '@@ /JR81/sim/rtf 1.0\n@@ /JR81/sim/time_offset \n')
+        with mock.patch.object(sim, 'dexec', dexec):
+            vals = sim.sim_time_values(['JR81'], sim.RunContext(run_dir=Path('/tmp/x')))
+        self.assertEqual(vals, {'/JR81/sim/rtf': 1.0, '/JR81/sim/time_offset': None})
+        name, args, kw = seen[0]
+        self.assertEqual(name, 'sim-gazebo')
+        self.assertEqual(args[-3:], ['status', '/JR81/sim/rtf', '/JR81/sim/time_offset'])
+        self.assertEqual(dict(kw['env']), {'SIM_STATUS_PY': sim._SIM_TIME_PY})
+        self.assertIn('cpus rest', args[2])                                    # off gzserver's cores
+        subprocess.run(['bash', '-n', '-c', args[2]], check=True)
+
+        def hung(name, args, **kw):
+            raise sim.SimError('timed out after 28s')
+        with mock.patch.object(sim, 'dexec', hung), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(sim.sim_time_values(['JR81'], sim.RunContext(run_dir=Path('/tmp/x'))), {})
+
+    def test_violations_and_rotation(self):
+        with tempfile.TemporaryDirectory() as d:
+            run = Path(d)
+            self.assertEqual(sim.rtf_violations(run), [])
+            (run / sim.RTF_LOG).write_text('\n2026-10-18T20:00:00 JR81 rtf 0.91 for 5.2 s\n\n')
+            self.assertEqual(sim.rtf_violations(run), ['2026-10-18T20:00:00 JR81 rtf 0.91 for 5.2 s'])
+            sim.rotate_rtf_log(run)                                            # what `up` does
+            self.assertEqual(sim.rtf_violations(run), [])
+            self.assertIn('JR81', (run / 'rtf_violations.prev.log').read_text())
+            sim.rotate_rtf_log(run)                                            # nothing to rotate
+            if os.getuid() != 0:
+                (run / sim.RTF_LOG).write_text('x\n')
+                os.chmod(str(run / sim.RTF_LOG), 0)
+                self.assertEqual(len(sim.rtf_violations(run)), 1)              # unreadable: not valid
+                os.chmod(str(run / sim.RTF_LOG), 0o600)
+
+    def test_status_exit_code(self):
+        class NoTmux:
+            stdout, returncode = '', 1
+
+        with tempfile.TemporaryDirectory() as d:
+            run = Path(d)
+            (run / 'session.json').write_text(json.dumps(sim.validate_session(session()).to_json()))
+            patches = [mock.patch.object(sim, 'running_sim_containers', lambda: []),
+                       mock.patch.object(sim, 'docker_inspect', lambda kind, name: None),
+                       mock.patch.object(sim, 'tmux', lambda *a, **k: NoTmux()),
+                       mock.patch.dict(os.environ, {'ROVER_SIM_RUN': str(run)})]
+            for p in patches:
+                p.start()
+            try:
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    self.assertEqual(sim.cmd_status(None), 0)
+                self.assertIn('sim time: n/a', out.getvalue())
+                (run / sim.RTF_LOG).write_text('JR81 rtf 0.80 below 0.95 for 6.0 s\n')
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    self.assertEqual(sim.cmd_status(None), 2)
+                self.assertIn('!! RUN INVALID: the real-time factor was below 0.95 for over 5 s', out.getvalue())
+                self.assertIn('!!   JR81 rtf 0.80', out.getvalue())
+            finally:
+                for p in patches:
+                    p.stop()
+
+    def test_status_with_broken_isolation_opens_no_ros_session(self):
+        class Panes:
+            returncode = 0
+            stdout = 'rsim-gazebo\tgazebo\t0\tgzserver\tdocker\n'
+
+        with tempfile.TemporaryDirectory() as d:
+            run = Path(d)
+            (run / 'session.json').write_text(json.dumps(sim.validate_session(session()).to_json()))
+            queried = []
+            patches = [mock.patch.object(sim, 'running_sim_containers', lambda: ['sim-gazebo']),
+                       mock.patch.object(sim, 'docker_inspect', lambda kind, name: None),
+                       mock.patch.object(sim, 'resolve_run_dir', lambda: run),
+                       mock.patch.object(sim, 'check_isolation', lambda: ['network rover-sim is not internal']),
+                       mock.patch.object(sim, 'tmux', lambda *a, **k: Panes()),
+                       mock.patch.object(sim, 'sim_time_values', lambda *a, **k: queried.append(a) or {}),
+                       mock.patch.object(sim, 'dexec', lambda *a, **k: queried.append(a))]
+            for p in patches:
+                p.start()
+            try:
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    self.assertEqual(sim.cmd_status(None), 3)
+                self.assertEqual(queried, [])
+                self.assertIn('isolation: BROKEN', out.getvalue())
+                self.assertIn('sim time: not queried (isolation BROKEN)', out.getvalue())
+            finally:
+                for p in patches:
+                    p.stop()
+
+    def test_banner(self):
+        with mock.patch.object(sys.stdout, 'isatty', lambda: True):
+            b = sim.red_banner(['bad'])
+        self.assertTrue(b.startswith('\033[1;31m'))
+        self.assertTrue(b.endswith('\033[0m'))
+        self.assertIn('!! bad', b)
 
 
 class Json5AndZenoh(unittest.TestCase):
@@ -772,18 +1463,49 @@ class LoadTestPlan(unittest.TestCase):
 
 
 class Cli(unittest.TestCase):
+    def dry_run(self, name):
+        return subprocess.run([sys.executable, str(REPO / 'scripts' / 'sim.py'), 'up', name, '--dry-run'],
+                              stdout=subprocess.PIPE, universal_newlines=True, check=True).stdout
+
     def test_dry_run(self):
-        out = subprocess.run([sys.executable, str(REPO / 'scripts' / 'sim.py'), 'up', 'smoke', '--dry-run'],
-                             stdout=subprocess.PIPE, universal_newlines=True, check=True).stdout
-        self.assertIn('stack zenoh -> tmux session rsim-zenoh', out)
+        out = self.dry_run('smoke')
+        for stack in ('zenoh', 'gazebo', 'drive', 'frame_align'):
+            self.assertIn('stack %s -> tmux session rsim-%s' % (stack, stack), out)
         self.assertIn('rmw_zenohd', out)
-        self.assertIn('not started yet (later phases): gazebo (Phase 2)', out)
+        self.assertIn('world.launch.py world:=empty gui:=false paused:=true', out)
+        self.assertIn('JR81  jr  id 81  pose (-2.00, 0.00, 0.0 deg)  calibrated from JR02, lidar at 0.36 m', out)
+        self.assertIn('RR83  rr  id 83  pose (2.00, 0.00, 180.0 deg)  calibrated from RR08, lidar at 0.40 m', out)
+        self.assertIn('before the panes: write_agent_files, link_calib', out)
+        self.assertIn('not started yet (later phases): dlio (Phase 3), mapping (Phase 4), mighty (Phase 5)', out)
+
+    def test_dry_run_four_agents(self):
+        out = self.dry_run('multi_agent_swap')
+        self.assertEqual(out.count('frame_align_publisher.py'), 12)
+        for ego in ('JR81', 'JR82', 'RR83', 'RR84'):
+            self.assertIn('  window align-%s\n' % ego, out)
+            self.assertIn('livox_sim_bridge.py --ns %s' % ego, out)
+        self.assertIn('-p ego_name:=RR84 -p other_name:=RR81', out)
+        self.assertIn('world:=ACL_office_simple', self.dry_run('office_explore'))
 
     def test_bad_session_exit_code(self):
         p = subprocess.run([sys.executable, str(REPO / 'scripts' / 'sim.py'), 'up', 'nope', '--dry-run'],
                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
         self.assertEqual(p.returncode, 1)
-        self.assertIn('available: smoke', p.stderr)
+        self.assertIn('available: multi_agent_swap, office_explore, smoke', p.stderr)
+
+    def test_cpus_command(self):
+        # What every sim-gazebo pane runs first (pin_self), here under a 4-core affinity.
+        if shutil.which('taskset') is None or len(os.sched_getaffinity(0)) < 4:
+            self.skipTest('needs taskset and 4 cores')
+        cores = sorted(os.sched_getaffinity(0))[:4]
+        lst = ','.join(map(str, cores))
+
+        def run(*a):
+            return subprocess.run(['taskset', '-c', lst, sys.executable, str(REPO / 'scripts' / 'sim.py'), 'cpus']
+                                  + list(a), stdout=subprocess.PIPE, universal_newlines=True, check=True).stdout.strip()
+        self.assertEqual(run('gz'), ','.join(map(str, cores[:3])))
+        self.assertEqual(run('rest'), str(cores[3]))
+        self.assertEqual(run('rest', '--spare', '2'), ','.join(map(str, cores[2:])))
 
 
 if __name__ == '__main__':

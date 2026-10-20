@@ -154,35 +154,46 @@ RUN mkdir -p /src && vcs import /src < /tmp/rover_sim.sim.repos
 FROM scratch AS stack-sim-src
 COPY --from=stack-sim-git /src /
 
+# ---------- stack-sim-manifests: their package.xml files, for rosdep ---------
+# Both rosdep installs (build deps below, exec deps in gazebo) read only these,
+# mtime-pinned (as in mighty-build), so a pin bump that leaves a repo's
+# dependencies alone rebuilds its packages without re-running the apt layers.
+# livox_ros_driver2's ROS 2 manifest is package_ROS2.xml (its build.sh copies
+# it into place); Livox-SDK2 is plain CMake.
+FROM stack-base AS stack-sim-manifests
+COPY --from=stack-sim-src / /src
+RUN mkdir -p /manifests/livox_ros_driver2 && cd /src \
+ && find . \( -path ./livox_ros_driver2 -o -path ./Livox-SDK2 \) -prune -o -name package.xml \
+        -exec cp --parents {} /manifests \; \
+ && cp livox_ros_driver2/package_ROS2.xml /manifests/livox_ros_driver2/package.xml \
+ && find /manifests -exec touch -d @0 {} +
+
 # ---------- stack-gazebo-build: gazebo_ros, Livox sim + msgs, decomp ---------
 FROM stack-base AS stack-gazebo-build
 ARG WS
-ARG JOBS
-# Same caps as deps-build (see JOBS above).
-ENV MAKEFLAGS=-j${JOBS}
-ENV CMAKE_BUILD_PARALLEL_LEVEL=${JOBS}
 WORKDIR ${WS}
-COPY --from=stack-sim-src / ${WS}/src
-
-# Livox-SDK2/livox_ros_driver2 aren't plain colcon packages (as in deps-build):
-# move them out before colcon sees them. The driver's ROS 2 manifest is
-# package_ROS2.xml, which its build.sh copies into place; do that now so
-# rosdep sees the driver's deps too.
-RUN mkdir -p /opt/livox_sdk /opt/livox_ws/src \
- && mv ${WS}/src/Livox-SDK2 /opt/livox_sdk/src \
- && mv ${WS}/src/livox_ros_driver2 /opt/livox_ws/src/livox_ros_driver2 \
- && cp /opt/livox_ws/src/livox_ros_driver2/package_ROS2.xml /opt/livox_ws/src/livox_ros_driver2/package.xml
 
 # --skip-keys catkin: DecompUtil's package.xml says buildtool_depend catkin but
 # it's a plain CMake project. Undeclared: Eigen (decomp_util) and boost_chrono
 # (ros2_livox links it by name).
+COPY --from=stack-sim-manifests /manifests /tmp/manifests
 RUN apt-get update && rosdep update \
- && rosdep install -y --ignore-src --from-paths src /opt/livox_ws/src --skip-keys "catkin" \
+ && rosdep install -y --ignore-src --from-paths /tmp/manifests --skip-keys "catkin" \
  && apt-get install -y --no-install-recommends libeigen3-dev libboost-chrono-dev \
- && rm -rf /var/lib/apt/lists/*
+ && rm -rf /var/lib/apt/lists/* /tmp/manifests
 
+# Same caps as deps-build (see JOBS above). Declared only now, below the
+# installs, and exported only by the RUN lines that compile: an ARG is in the
+# cache key of every RUN after it, so declaring it (or an ENV made from it)
+# above the rosdep layer made another --jobs re-run the installs too.
+ARG JOBS
+
+# Livox-SDK2/livox_ros_driver2 aren't plain colcon packages (as in deps-build).
+# They are copied and built on their own, ahead of the rest of the sources, so
+# a pin bump of another sim repo does not rebuild them.
 # Livox-SDK2: plain CMake project, cmake-installed to /usr/local (where the
 # driver's CMakeLists looks for it).
+COPY --from=stack-sim-src /Livox-SDK2 /opt/livox_sdk/src
 RUN cd /opt/livox_sdk/src && cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
  && make -C build -j"${JOBS}" && make -C build install \
  && ldconfig
@@ -190,33 +201,36 @@ RUN cd /opt/livox_sdk/src && cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
 # livox_ros_driver2: built via its own build.sh (picks the ROS 2 message
 # variant) in its own workspace. build.sh exits 0 even when colcon fails, so
 # check for the package's ament index entry, which is installed last.
-RUN source /opt/ros/humble/setup.bash \
+COPY --from=stack-sim-src /livox_ros_driver2 /opt/livox_ws/src/livox_ros_driver2
+RUN export MAKEFLAGS=-j${JOBS} CMAKE_BUILD_PARALLEL_LEVEL=${JOBS} \
+ && source /opt/ros/humble/setup.bash \
  && cd /opt/livox_ws/src/livox_ros_driver2 && ./build.sh humble \
  && test -f /opt/livox_ws/install/livox_ros_driver2/share/ament_index/resource_index/packages/livox_ros_driver2
 
+# The colcon workspace: everything else in rover_sim.sim.repos (the two above
+# are already built; colcon would take both for plain CMake packages).
 # decomp_util first: decomp_rviz_plugins find_package()s it without declaring
 # the dependency, so colcon can't order them in one invocation. livox_ws is
 # sourced first so install/setup.bash chains it.
-RUN source /opt/ros/humble/setup.bash && source /opt/livox_ws/install/setup.bash \
+COPY --from=stack-sim-src / ${WS}/src
+RUN rm -rf src/Livox-SDK2 src/livox_ros_driver2 \
+ && export MAKEFLAGS=-j${JOBS} CMAKE_BUILD_PARALLEL_LEVEL=${JOBS} \
+ && source /opt/ros/humble/setup.bash && source /opt/livox_ws/install/setup.bash \
  && colcon build --executor sequential --packages-select decomp_util --cmake-args -DCMAKE_BUILD_TYPE=Release \
  && source install/setup.bash \
  && colcon build --executor sequential --packages-skip decomp_util \
         --cmake-args -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF \
  && rm -rf build log
-# Manifests for the gazebo target's rosdep, mtime-pinned (as in mighty-build).
-RUN mkdir -p /manifests/livox_ros_driver2 && cd src \
- && find . -name package.xml -exec cp --parents {} /manifests \; \
- && cp /opt/livox_ws/src/livox_ros_driver2/package.xml /manifests/livox_ros_driver2/ \
- && find /manifests -exec touch -d @0 {} +
 
 # ---------- stack-rover-sim-build: this repo's rover_sim package -------------
 # Its own stage so an edit to src/rover_sim rebuilds only this and the gazebo
-# target's last COPY.
-FROM stack-base AS stack-rover-sim-build
+# target's last COPY. On top of stack-gazebo-build for Gazebo's headers and
+# gazebo_dev (the real_time_lock world plugin); only rover_sim is built here.
+FROM stack-gazebo-build AS stack-rover-sim-build
 ARG WS
 WORKDIR ${WS}
 COPY src/rover_sim ${WS}/src/rover_sim
-RUN source /opt/ros/humble/setup.bash \
+RUN source /opt/ros/humble/setup.bash && source ${WS}/install/setup.bash \
  && colcon build --packages-select rover_sim \
  && rm -rf build log \
  && mkdir -p /manifests/rover_sim && cp src/rover_sim/package.xml /manifests/rover_sim/ \
@@ -227,7 +241,7 @@ FROM stack-base AS gazebo
 ARG WS
 LABEL rover_sim.stack="gazebo"
 WORKDIR ${WS}
-COPY --from=stack-gazebo-build /manifests /tmp/manifests
+COPY --from=stack-sim-manifests /manifests /tmp/manifests
 COPY --from=stack-rover-sim-build /manifests /tmp/manifests
 # Exec deps from the manifests (Gazebo itself comes in via gazebo_dev), plus
 # RViz, xacro, numpy for the sim's Python nodes, boost_chrono for ros2_livox,
@@ -254,10 +268,25 @@ ENV QT_X11_NO_MITSHM=1
 # Read by the NVIDIA runtime only when compose gives this container a GPU;
 # graphics adds the GL/EGL driver libraries Gazebo and RViz render with.
 ENV NVIDIA_DRIVER_CAPABILITIES=graphics,compute,utility
-# Interactive shells (docker exec -it ... bash) see the workspace; the panes
-# send their own setup line. install/setup.bash alone also chains livox_ws.
-RUN printf 'source /opt/ros/humble/setup.bash\nsource /opt/livox_ws/install/setup.bash\nsource %s/install/setup.bash\n' "${WS}" >> /root/.bashrc
+# Interactive shells (docker exec -it ... bash) get the panes' setup: Gazebo's
+# own (model, resource and plugin paths; without it model://ground_plane does
+# not resolve) and the workspace. install/setup.bash alone also chains livox_ws.
+RUN printf 'source /opt/ros/humble/setup.bash\nsource /usr/share/gazebo/setup.bash\nsource /opt/livox_ws/install/setup.bash\nsource %s/install/setup.bash\n' "${WS}" >> /root/.bashrc
 COPY --from=stack-rover-sim-build ${WS}/install/rover_sim ${WS}/install/rover_sim
+# Fails the build if anything the sim's own nodes and launch files need at run
+# time is missing: livox_sim_bridge.py and sim_tf.py (numpy, yaml, tf2_ros,
+# Livox and std msgs), spawn_agent.launch.py (xacro, spawn_entity.py)
+# and world.launch.py (gazebo_ros's init/factory plugins, rover_sim's
+# real_time_lock, built only where Gazebo's headers are). All of it comes
+# from the base image, rosdep, the apt line above or this workspace.
+RUN source /opt/ros/humble/setup.bash && source ${WS}/install/setup.bash \
+ && python3 -c "import numpy, yaml, rclpy, tf2_ros, std_srvs.srv, std_msgs.msg, nav_msgs.msg, sensor_msgs_py.point_cloud2, gazebo_msgs.srv, livox_ros_driver2.msg" \
+ && command -v xacro >/dev/null && command -v gzserver >/dev/null \
+ && test -x "$(ros2 pkg prefix gazebo_ros)/lib/gazebo_ros/spawn_entity.py" \
+ && test -f "$(ros2 pkg prefix gazebo_ros)/lib/libgazebo_ros_factory.so" \
+ && test -f "$(ros2 pkg prefix ros2_livox_simulation)/lib/libros2_livox.so" \
+ && test -f "$(ros2 pkg prefix gazebo_plugins)/lib/libgazebo_ros_imu_sensor.so" \
+ && test -f "$(ros2 pkg prefix rover_sim)/lib/librover_sim_real_time_lock.so"
 # Command comes from compose: the container only idles (sleep infinity).
 
 # ---------- stack-elevation-src: elevation_mapping_cupy ----------------------

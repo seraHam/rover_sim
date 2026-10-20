@@ -1,0 +1,40 @@
+# Per-class chassis and drive parameters of the Gazebo models (urdf/jr.urdf.xacro,
+# urdf/rr.urdf.xacro) and the spawn defaults (launch/spawn_agent.launch.py). The one
+# place these numbers live; scripts on the host may read it too.
+#
+# The drive limits are the real JR and RR motor firmware's (2026-10), and Gazebo's diff
+# drive (gazebo_ros_diff_drive.cpp, the blakete fork in rover_sim.sim.repos) applies them
+# to /<ns>/cmd_vel as that firmware does: it clamps v to v_max and w to omega_max, slews v
+# from its own last value at linear_acceleration up and down (w is not slewed), and with
+# no cmd_vel for command_timeout s stops (v through the same slew, w at once) until the
+# next one. It maps the twist to wheel rim speeds with wheel_separation and the wheel
+# diameter and drives the wheel joints with up to max_wheel_torque.
+#
+# Not modelled: the firmware's per-wheel PI speed loop (the sim's wheels take a new rim
+# speed as fast as max_wheel_torque and friction allow, so a step in w is near instant),
+# and its ARM latch (the robot disarms on a command timeout and needs a fresh ARM; the
+# sim drives again on the next cmd_vel).
+
+jr:   # Pioneer 3-DX: two driven wheels and a rear caster
+  lidar_height: 0.36          # m, base_link (= lidar origin) above the floor; DLIO's seed z
+  wheel_radius: 0.0975        # the firmware's
+  wheel_separation: 0.327     # the firmware's, also the wheels' spacing in the model
+  linear_acceleration: 1.5    # m/s^2, the firmware's anti-tip slew (the same up and down)
+  v_max: 1.2                  # m/s
+  omega_max: 6.0              # rad/s
+  command_timeout: 0.5        # s
+  max_wheel_torque: 10.0      # N m per wheel; ~1 N m reaches 1.5 m/s^2, so the slew is never torque-bound
+  drive_update_rate: 250      # Hz, a divisor of the 1 kHz step: the slew moves v 6 mm/s per update
+
+rr:   # Pioneer 3-AT: four driven wheels, skid steer
+  lidar_height: 0.40
+  wheel_radius: 0.111         # the tyre (collision) radius; the firmware's 0.105 is a loaded tyre
+  wheel_separation: 0.578     # the sim's effective skid-steer track (the wheels sit 0.394 apart), so
+                              # it turns in place at the commanded rate; the firmware's 0.6 is the
+                              # real RR's, and with it the sim turned at 1.038x the command
+  linear_acceleration: 2.5
+  v_max: 1.0
+  omega_max: 1.5
+  command_timeout: 0.5
+  max_wheel_torque: 20.0      # N m per wheel; turning in place scrubs ~3 N m per wheel
+  drive_update_rate: 500      # Hz: 5 mm/s per update

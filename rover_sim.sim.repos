@@ -10,16 +10,27 @@ repositories:
   # --build-context stack-sim-src=<dir>.
 
   # Gazebo classic ROS 2 bridge (gazebo_ros, gazebo_plugins: diff drive, IMU,
-  # p3d) and the MID-360 ray plugin. Same pins as mighty.repos; Phase 2 moves
-  # both to the blakete fix/sim-stamps forks (sensor stamps in sim time).
+  # p3d) and the MID-360 ray plugin: mighty.repos' kotakondo pins (ed1f7b8,
+  # 044e83e) plus commits on blakete fix/sim-stamps:
+  # - both: the IMU and lidar messages carry the exact sim time of their
+  #   sample. Stock, they are stamped from the plugin node's clock, which
+  #   follows /clock (10 Hz by default): ~20 IMU samples in a row shared a
+  #   stamp, and the PointCloud2 got wall time. livox_sim_bridge.py maps these
+  #   sim stamps to wall time;
+  # - gazebo_ros_pkgs a7a1be2: the diff drive's acceleration ramp no longer
+  #   brakes hard on small command changes, and it takes the firmware's
+  #   command limits (clamp, forward-speed slew, command timeout;
+  #   src/rover_sim/config/classes.yaml).
+  # Offered upstream as kotakondo/gazebo_ros_pkgs#1 and
+  # kotakondo/livox_laser_simulation_ros2#1; move back to kotakondo once merged.
   gazebo_ros_pkgs:
     type: git
-    url: https://github.com/kotakondo/gazebo_ros_pkgs.git
-    version: ed1f7b886971d7bf898e6e0f59c622df929c0521
+    url: https://github.com/blakete/gazebo_ros_pkgs.git
+    version: a7a1be2d83e22a2dd3d3ace66ef3c81c5ecdbdfd
   livox_laser_simulation_ros2:
     type: git
-    url: https://github.com/kotakondo/livox_laser_simulation_ros2.git
-    version: 044e83e6fc5d527b082852550d7206dd4308d950
+    url: https://github.com/blakete/livox_laser_simulation_ros2.git
+    version: 7c5858712fa3d2dfb0faebe23680fa96945948f4
 
   # RViz display of mighty's safe-corridor polyhedra (decomp_ros_msgs +
   # decomp_rviz_plugins). Same pin as mighty.repos.

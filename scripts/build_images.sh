@@ -39,8 +39,11 @@
 #                       --reuse mighty=mighty-hw:main-3cf7320. Refused if the image's
 #                       revision labels name another commit than the pin.
 #   --keep-external     keep images without a rover_sim.inputs label (earlier --reuse)
-#   --jobs N            JOBS build arg: caps colcon/make parallelism in this repo's
-#                       docker/Dockerfile targets (the upstream Dockerfiles take none)
+#   --jobs N            JOBS build arg (default 4): caps make parallelism in this repo's
+#                       gazebo target (the upstream Dockerfiles take none). Always passed,
+#                       so a plain run reuses the compile layers of the last run with the
+#                       same N; any other N rebuilds them (only them: the apt layers above
+#                       do not depend on it)
 #   --parallel N        build up to N units at once; logs go to .cache/logs/<time>/
 #   --prepare-only      fetch and patch, print the build commands, build nothing
 #   --list              show each unit's tag and whether a build would run
@@ -382,7 +385,7 @@ build_cmd() {  # $1 unit (prepared) -> CMD
   if [[ -n $U_TARGET ]]; then CMD+=(--target "$U_TARGET"); fi
   CMD+=("${SSH_FLAG[@]}")
   for a in "${U_ARGS[@]}"; do CMD+=(--build-arg "$a"); done
-  if [[ $U_KIND == self && -n $JOBS ]]; then CMD+=(--build-arg "JOBS=$JOBS"); fi
+  if [[ $U_KIND == self ]]; then CMD+=(--build-arg "JOBS=$JOBS"); fi
   # Ours: a local checkout replaces the stage that clones the pin.
   if [[ $U_KIND == self && -n $U_SRC ]]; then CMD+=(--build-context "$U_LOCAL_CTX=$U_SRC"); fi
   unit_labels
@@ -440,7 +443,8 @@ reuse_check() {  # $1 unit, $2 image: refuse an image whose labels name another 
 }
 
 # ---------- main -----------------------------------------------------------------------
-FORCE=0 PREPARE_ONLY=0 LIST=0 JOBS='' PARALLEL=1 KEEP_EXTERNAL=0
+# JOBS is fixed, not derived from the host: it is in the compile layers' cache keys.
+FORCE=0 PREPARE_ONLY=0 LIST=0 JOBS=4 PARALLEL=1 KEEP_EXTERNAL=0
 declare -A WANT=() REUSE=() ACTION=() SRC=()
 while (($#)); do
   case $1 in

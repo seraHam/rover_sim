@@ -1,0 +1,133 @@
+<?xml version="1.0"?>
+<!-- Parts shared by jr.urdf.xacro and rr.urdf.xacro: inertia helpers, a driven wheel, and the
+     sensor head (base_link, the MID-360 + IMU on rover_description's mount, ground truth). -->
+<robot xmlns:xacro="http://ros.org/wiki/xacro">
+
+  <xacro:include filename="$(find rover_sim)/urdf/mid360.xacro"/>
+
+  <xacro:macro name="box_inertial" params="mass x y z *origin">
+    <inertial>
+      <mass value="${mass}"/>
+      <xacro:insert_block name="origin"/>
+      <inertia ixx="${mass / 12 * (y*y + z*z)}" ixy="0" ixz="0"
+               iyy="${mass / 12 * (x*x + z*z)}" iyz="0"
+               izz="${mass / 12 * (x*x + y*y)}"/>
+    </inertial>
+  </xacro:macro>
+
+  <!-- A driven wheel on a continuous joint about its y axis. The collision is a 10 mm slice of
+       the tyre at its mid-plane: ODE does not share the load evenly between a wide cylinder's
+       edge contacts (a JR with full 41 mm wheels turned in place at 0.90 of the command; with
+       this slice at 0.992).
+       width sets the inertia. mu is isotropic (the world's cone friction model); fdir1
+       (collision frame, the axle) only keeps friction body-fixed under the pyramid model. -->
+  <xacro:macro name="wheel" params="name parent xyz radius width mass mesh mesh_scale:='1 1 1'
+                                     hub_mesh:='' mu:=1.0">
+    <link name="${name}">
+      <inertial>
+        <mass value="${mass}"/>
+        <inertia ixx="${mass / 12 * (3*radius*radius + width*width)}" ixy="0" ixz="0"
+                 iyy="${mass / 2 * radius*radius}" iyz="0"
+                 izz="${mass / 12 * (3*radius*radius + width*width)}"/>
+      </inertial>
+      <visual>
+        <geometry><mesh filename="${mesh}" scale="${mesh_scale}"/></geometry>
+        <material name="wheel_black"><color rgba="0.117 0.117 0.117 1"/></material>
+      </visual>
+      <xacro:if value="${hub_mesh != ''}">
+        <visual>
+          <geometry><mesh filename="${hub_mesh}" scale="${mesh_scale}"/></geometry>
+          <material name="hub_yellow"><color rgba="1.0 0.811 0.151 1"/></material>
+        </visual>
+      </xacro:if>
+      <collision>
+        <origin xyz="0 0 0" rpy="${pi/2} 0 0"/>
+        <geometry><cylinder radius="${radius}" length="0.01"/></geometry>
+      </collision>
+    </link>
+    <joint name="${name}_joint" type="continuous">
+      <parent link="${parent}"/>
+      <child link="${name}"/>
+      <origin xyz="${xyz}" rpy="0 0 0"/>
+      <axis xyz="0 1 0"/>
+    </joint>
+    <gazebo reference="${name}">
+      <material>Gazebo/Black</material>
+      <mu1>${mu}</mu1>
+      <mu2>${mu}</mu2>
+      <fdir1>0 0 1</fdir1>
+      <kp>1e6</kp>
+      <kd>300</kd>    <!-- less and a JR rocks on its caster at rest (IMU chatter) -->
+      <maxVel>0.1</maxVel>
+      <maxContacts>4</maxContacts>
+    </gazebo>
+  </xacro:macro>
+
+  <!-- base_link at lidar_height above the turning centre, level, and the MID-360 on it with
+       rover_description's mount (the same <ns>_lidar_mount.yaml, read the same way: URDF
+       <origin>, fixed-axis rpy), so Gazebo's lidar pose is the base_link -> lidar TF the
+       robot's rsp publishes. Both joints are fixed, so Gazebo lumps base_link and lidar into
+       the chassis; p3d therefore reports the chassis (its root) pose. -->
+  <xacro:macro name="sensor_head" params="namespace parent lidar_height mount_file samples">
+    <xacro:property name="mount" value="${xacro.load_yaml(mount_file)}"/>
+
+    <link name="base_link">
+      <inertial>
+        <mass value="0.001"/>
+        <inertia ixx="1e-6" ixy="0" ixz="0" iyy="1e-6" iyz="0" izz="1e-6"/>
+      </inertial>
+    </link>
+    <joint name="${parent}_to_base_link" type="fixed">
+      <parent link="${parent}"/>
+      <child link="base_link"/>
+      <origin xyz="0 0 ${lidar_height}" rpy="0 0 0"/>
+    </joint>
+
+    <xacro:mid360 namespace="${namespace}" parent="base_link" samples="${samples}">
+      <origin xyz="${mount['xyz'][0]} ${mount['xyz'][1]} ${mount['xyz'][2]}"
+              rpy="${mount['rpy'][0]} ${mount['rpy'][1]} ${mount['rpy'][2]}"/>
+    </xacro:mid360>
+
+    <!-- Ground truth of the root link, stamped with sim time: pose in world, child_frame_id
+         'chassis' (the floor point under the turning centre, not base_link), and the twist in
+         WORLD axes (p3d does not rotate it into the body, unlike nav_msgs/Odometry's
+         convention). livox_sim_bridge's ground_truth/odom_wall is the conventional form. -->
+    <gazebo>
+      <plugin name="p3d" filename="libgazebo_ros_p3d.so">
+        <ros>
+          <namespace>/${namespace}</namespace>
+          <remapping>odom:=ground_truth/odom</remapping>
+        </ros>
+        <body_name>${parent}</body_name>
+        <frame_name>world</frame_name>
+        <update_rate>100</update_rate>
+        <gaussian_noise>0</gaussian_noise>
+      </plugin>
+    </gazebo>
+  </xacro:macro>
+
+  <!-- The mast that carries the lidar, from the top plate to the lidar's underside. -->
+  <xacro:macro name="mast" params="parent bottom top">
+    <link name="mast">
+      <xacro:box_inertial mass="0.3" x="0.04" y="0.04" z="${top - bottom}">
+        <origin xyz="0 0 0" rpy="0 0 0"/>
+      </xacro:box_inertial>
+      <visual>
+        <geometry><box size="0.04 0.04 ${top - bottom}"/></geometry>
+        <material name="mast_grey"><color rgba="0.5 0.5 0.5 1"/></material>
+      </visual>
+      <collision>
+        <geometry><box size="0.04 0.04 ${top - bottom}"/></geometry>
+      </collision>
+    </link>
+    <joint name="${parent}_to_mast" type="fixed">
+      <parent link="${parent}"/>
+      <child link="mast"/>
+      <origin xyz="0 0 ${(top + bottom) / 2}" rpy="0 0 0"/>
+    </joint>
+    <gazebo reference="mast">
+      <material>Gazebo/Grey</material>
+    </gazebo>
+  </xacro:macro>
+
+</robot>
