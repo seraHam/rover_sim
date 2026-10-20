@@ -127,11 +127,11 @@ nodes:
     container: sim-mapping
     params: {kind: files, files: [config/mapping/persistent_map.yaml, launch_params/persistent_map_node.yaml]}
 
-  # on JR02's Orin (JX02), sim-elevation in the sim
+  # on JR02's Orin, sim-elevation in the sim
   elevation_mapping_node:
     fqn: /JR02/elevation_mapping_node
     container: sim-elevation
-    note: runs on the Orin (JX02), whose launch params were not captured for this reference; graph only
+    note: runs on the Orin, whose launch params were not captured for this reference; graph only
 
   # dlio container (DLIO 73c2489, dlio_ws cfg_overlay/JR02 baked in, scripts 59f6ee2)
   dlio_odom_node:

@@ -110,7 +110,7 @@ No ros2 CLI was run on the robot for these. The survey's earlier ros2 CLI calls 
   - `node info` sets for the 4 hw-mighty nodes.
   - `topic info -v` endpoints and their reliability and durability, for every reference topic that has a running endpoint node.
   - Only the agent's own endpoints count, since other agents share `/trajs` and the other root topics.
-- **Not covered:** the elevation mapper. It runs on JR02's Orin (JX02), whose launch params were not captured for this reference. The node appears in the graph checks only.
+- **Not covered:** the elevation mapper. It runs on JR02's Orin, whose launch params were not captured for this reference. The node appears in the graph checks only.
 
 ## Checked against real nodes (2026-10-18)
 

@@ -2,7 +2,7 @@ repositories:
   # Sim-only dependencies of the stack images' `gazebo` target (docker/Dockerfile,
   # stack-sim-git). Nothing here runs on a robot. The robot stacks (mighty,
   # mapping_ws, dlio_ws, rover) are pinned in docker/stacks.env and built from
-  # their own Dockerfiles; rover_sim.repos is the legacy monolith's list.
+  # their own Dockerfiles.
   #
   # Bump a pin by editing url/version here. All are public over https, so the
   # build needs no SSH key. To build from local checkouts instead, vcs-import

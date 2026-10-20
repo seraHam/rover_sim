@@ -53,7 +53,7 @@ leaves one subscription at a time (goal_relay.py leave_gently), and further sign
 short. The window lives in a child process with no ROS (sim_viz.py --window): GDK _exit()s a process
 that loses its X connection, so a restarted display or a logout ends only the child, and the node
 still leaves gently. The window opens before the node joins: no display, no join. Never SIGKILL it
-while a session runs (a docker stop of sim-viz is a Ctrl-C: compose.stack.yaml).
+while a session runs (a docker stop of sim-viz is a Ctrl-C: compose.yaml).
 
 The pure parts (marker store, frames, views, layout, bounds) import without rclpy, numpy or cv2;
 tests/test_sim_viz.py covers them, and the drawing where cv2 is installed.

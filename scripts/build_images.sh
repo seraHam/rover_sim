@@ -33,8 +33,7 @@
 #                       rover_sim.sim.repos). Always builds, and takes over the stack's tag
 #                       labelled rover_sim.source=local:<dir>, which sim.py up/status warn
 #                       about; the next plain run restores the pin. Patches go to a staged
-#                       copy, never into the checkout. (A flag, not <UNIT>_SRC variables:
-#                       the legacy `make build` reads MIGHTY_SRC and ELEVATION_SRC.)
+#                       copy, never into the checkout.
 #   --reuse UNIT=IMAGE  retag an existing image instead of building, e.g.
 #                       --reuse mighty=mighty-hw:main-3cf7320. Refused if the image's
 #                       revision labels name another commit than the pin.
@@ -482,7 +481,7 @@ done
 
 load_pins
 for v in MIGHTY_SRC MAPPING_SRC DLIO_SRC DRIVE_SRC ELEVATION_SRC GAZEBO_SRC; do
-  if [[ -n ${!v:-} ]]; then log "note: $v is set but not used here (legacy make build reads it); local builds: --src UNIT=DIR"; fi
+  if [[ -n ${!v:-} ]]; then log "note: $v is set but not used; local builds: --src UNIT=DIR"; fi
 done
 for u in "${!REUSE[@]}"; do add_unit "$u"; done
 if (( ${#WANT[@]} == 0 )); then for u in "${UNITS_ALL[@]}"; do WANT[$u]=1; done; fi

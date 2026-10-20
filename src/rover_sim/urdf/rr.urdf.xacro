@@ -3,7 +3,7 @@
      Physics model for the JR02-parity stack (launch/spawn_agent.launch.py): Gazebo's diff drive
      (two wheel pairs) takes /<ns>/cmd_vel, the sensors publish raw, and the model publishes no
      TF at all. The root link 'chassis' sits on the floor under the centre of the four wheels,
-     the turning centre. Geometry from the legacy pioneer3at_body.urdf.xacro meshes; its dead
+     the turning centre. Geometry from the old pioneer3at_body.urdf.xacro (removed) meshes; its dead
      p3at_gazebo_ext macro and the dangling _d435 include are not carried over. -->
 <robot name="rr" xmlns:xacro="http://www.ros.org/wiki/xacro">
 
