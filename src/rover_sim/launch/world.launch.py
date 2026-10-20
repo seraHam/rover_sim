@@ -68,7 +68,8 @@ def generate_launch_description():
                               description='rover_sim world name (share/rover_sim/worlds) or absolute path'),
         DeclareLaunchArgument('gui', default_value='false', description='Also start gzclient'),
         DeclareLaunchArgument('paused', default_value='false',
-                              description='Start paused (spawn every agent, then /unpause_physics)'),
+                              description='Start paused (scripts/sim.py spawns every agent, then unpauses with '
+                                          'gz world -p 0 after its last wave)'),
         DeclareLaunchArgument('verbose', default_value='false'),
         DeclareLaunchArgument('server', default_value='true',
                               description='Start gzserver (false: only gzclient, for a running gzserver)'),

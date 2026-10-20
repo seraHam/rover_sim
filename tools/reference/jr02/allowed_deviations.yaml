@@ -54,7 +54,6 @@ all:
     - /{ns}/*imu*
     - /{ns}/*mid360*
     - /{ns}/odom_eval*
-    - /{ns}/goal_relay*
     - /{ns}/frame_align*            # ground-truth frame_align (nothing publishes it on JR02)
     - /{ns}/sim_tf*                 # world -> <ns>/map at the spawn pose
     - /gazebo*
@@ -90,9 +89,8 @@ mapping:
         z_ground: fallback 0.15, the floor band out of the 2D grid, which is the planner's here
         distance_grid_2d.agent_height: fallback 0.55 (JR) / 0.90 (RR), the top of the projected band
         distance_grid_2d.esdf_enabled: fallback true, the planner's ESDF (map_fusion makes it on the robot)
-      mighty_node:
-        plan_to_terminal_goal: fallback has no composite map to plan the terminal goal on
-        max_window_m: fallback has no composite map window
+    # mighty_node, goal_selector and mpc run the robot's command lines in both modes: the planner
+    # takes grid_relay.py's grids for map_fusion's, so no planner key differs in the fallback.
     absent:
       - /{ns}/map_fusion_node
       - /{ns}/elevation_mapping_node

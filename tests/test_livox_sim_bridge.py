@@ -78,6 +78,40 @@ def feed_stall(cm, stall_s, catch_up, at_s=5.0, until_s=30.0, max_lag_s=0.5):
     return rows
 
 
+def feed_delivery_stall(cm, stall_s, drain, at_s=5.0, until_s=None, seed=3, rtf_at=()):
+    """The sim at RTF 1 with every stream's delivery held for stall_s at at_s (a zenoh
+    graph stall), then each stream's backlog delivered FIFO at drain[stream] x its publish
+    rate until it has caught up (by default the trace runs until 5 s after that). Base
+    latency 1-3 ms (imu, odom) and 8-15 ms (lidar). Returns ([(stream, sim, wall, out, ev)]
+    in arrival order, [cm.rtf(t) for t in rtf_at (s after the start)])."""
+    rnd = random.Random(seed)
+    if until_s is None:
+        until_s = at_s + stall_s * (1 + 1 / (min(drain.values()) - 1)) + 5.0
+    base = {'imu': (1.0, 3.0), 'odom': (1.0, 3.0), 'lidar': (8.0, 15.0)}
+    held_until = WALL0 + int((at_s + stall_s) * NS)
+    events = []
+    for name, hz in STREAMS:
+        service = int(NS / (hz * drain[name]))
+        last = 0
+        for k in range(1, int(until_s * hz) + 1):
+            sim = k * NS // hz
+            arr = WALL0 + sim + int(rnd.uniform(*base[name]) * MS)
+            if arr >= WALL0 + int(at_s * NS):
+                arr = max(arr, held_until)          # nothing gets through during the stall
+            last = max(arr, last + (service if last >= held_until else 1000))
+            events.append((last, name, sim))
+    events.sort()
+    out, rtf, queries = [], [], [WALL0 + int(t * NS) for t in rtf_at]
+    for wall, name, sim in events:
+        while queries and queries[0] <= wall:
+            rtf.append(cm.rtf(queries.pop(0)))
+        if name == 'imu':
+            cm.observe_rtf(sim, wall)
+        stamp, ev = cm.map(name, sim, wall)
+        out.append((name, sim, wall, stamp, ev))
+    return out, rtf
+
+
 def strictly_increasing(rows, stream):
     s = [r[3] for r in rows if r[0] == stream]
     return all(b > a for a, b in zip(s, s[1:]))
@@ -142,35 +176,73 @@ class ClockMapperTest(unittest.TestCase):
         rows = feed(cm, STREAMS, 5.0)
         # Paused 3 s: sim resumes where it stopped, wall moved on.
         rows += feed(cm, STREAMS, 5.0, sim0=5 * NS, wall0=WALL0 + 8 * NS)
-        self.assertEqual(cm.events['jump'], 1)
+        self.assertEqual(dict(cm.events), {'init': 1, 'jump': 1})
         self.assertAlmostEqual((cm.offset_ns - (WALL0 + 3 * NS)) / MS, 1.0, delta=0.2)
         for s, _ in STREAMS:
             self.assertTrue(strictly_increasing(rows, s), s)
         self.assertEqual(sum(cm.nudges.values()), 0)
+        # Confirmed after confirm_s of steady d; until then stamps carry on from before
+        # the pause (3 s stale), as one jump afterwards.
+        jumped = next(r[2] for r in rows if r[4] == 'jump')
+        self.assertAlmostEqual((jumped - (WALL0 + 8 * NS)) / NS, 2.5, delta=0.05)
+        lag = [(r[2] - r[3]) / NS for r in rows if WALL0 + 8 * NS < r[2] < jumped and r[0] == 'imu']
+        self.assertAlmostEqual(min(lag), 3.0, delta=0.01)
+        self.assertEqual(cm.held, 0)
 
     def test_world_reset_keeps_stamps_increasing(self):
         cm = bridge.ClockMapper()
         rows = feed(cm, STREAMS, 5.0, sim0=100 * NS)
         rows += feed(cm, STREAMS, 5.0, sim0=0, wall0=WALL0 + 5 * NS)
-        self.assertEqual(cm.events['jump'], 1)
+        # The IMU's sim stamps going back is a reset, never late delivery: no confirmation.
+        self.assertEqual(dict(cm.events), {'init': 1, 'reset': 1})
         for s, _ in STREAMS:
             self.assertTrue(strictly_increasing(rows, s), s)
-        # Only the confirm period (0.2 s) is nudged.
-        self.assertLess(cm.nudges['imu'], 50)
+        self.assertEqual(sum(cm.nudges.values()), 0)
+        after = [r for r in rows if r[2] > WALL0 + 5 * NS + 10 * MS]
+        self.assertLess(max(abs(r[3] - r[2]) for r in after) / MS, 5.0)
 
     def test_stall_not_caught_up_reanchors(self):
-        # real_time_lock accepts a lag over 0.5 s for good: the offset follows within the
-        # confirm period, not after ~0.7 s / slew of stamps that stale.
+        # real_time_lock accepts a lag over 0.5 s for good: the IMU's d stays up, steady,
+        # and the offset follows after confirm_s (2.5 s of stamps 0.7 s stale: consistent
+        # for DLIO), not after ~0.7 s / slew of them.
         cm = bridge.ClockMapper()
         rows = feed_stall(cm, 0.7, catch_up=1.5)
         self.assertEqual(dict(cm.events), {'init': 1, 'jump': 1})
         resumed = next(a for a, _, _ in rows if a > WALL0 + int(5.6 * NS))
-        stale = [(a - o) / NS for a, o, _ in rows if a > resumed + int(0.25 * NS)]
+        jumped = next(a for a, _, ev in rows if ev == 'jump')
+        self.assertAlmostEqual((jumped - resumed) / NS, 2.5, delta=0.05)
+        held = [(a - o) / NS for a, o, _ in rows if resumed <= a < jumped]
+        self.assertAlmostEqual(min(held), 0.7, delta=0.01)
+        stale = [(a - o) / NS for a, o, _ in rows if a > jumped]
         self.assertLess(max(stale), 0.01)
         self.assertGreaterEqual(min(stale), 0.0)
         out = [o for _, o, _ in rows]
         self.assertTrue(all(b > a for a, b in zip(out, out[1:])))
         self.assertEqual(sum(cm.nudges.values()), 0)
+
+    def test_rtf_reads_slow_sim_and_catch_up(self):
+        # Sustained RTF 0.9 reads 0.9 over the window. A 1.2 s gzserver stall (the lock accepts
+        # it) is lost real time and reads as such while it is in the window, then 1.0.
+        cm = bridge.ClockMapper()
+        rows = feed(cm, (('imu', 200),), 20.0, rtf=0.9, latency_ms=(1.0, 3.0))
+        self.assertAlmostEqual(cm.rtf(rows[-1][2]), 0.9, delta=0.005)
+        got = []
+        cm2 = bridge.ClockMapper()
+        wall, sim = 0.0, 0.0
+        for k in range(1, 20001):          # 20 s at 1 kHz steps: a 1.2 s stall at 5 s, accepted
+            if k == 5000:
+                wall += 1.2
+            wall += 0.001
+            sim += 0.001
+            if k % 5 == 0:
+                w = WALL0 + int((wall + 0.002) * NS)
+                cm2.observe_rtf(int(round(sim * 1000)) * MS, w)
+                if k % 500 == 0:
+                    got.append((k / 1000.0, cm2.rtf(w)))
+        lost = dict(got)
+        self.assertAlmostEqual(lost[4.5], 1.0, delta=0.01)
+        self.assertAlmostEqual(lost[8.0], 1 - 1.2 / 5.0, delta=0.06)   # the lost 1.2 s, as it is
+        self.assertAlmostEqual(lost[12.0], 1.0, delta=0.01)
 
     def test_stall_caught_up_is_not_a_jump(self):
         # A lag the lock makes up (here 0.48 s, at 1.5x or a CPU-bound 1.2x) is not
@@ -180,6 +252,7 @@ class ClockMapperTest(unittest.TestCase):
             cm = bridge.ClockMapper()
             rows = feed_stall(cm, 0.48, catch_up=catch_up)
             self.assertEqual(dict(cm.events), {'init': 1}, catch_up)
+            self.assertEqual(cm.held, 1, catch_up)
             err = [(a - o) / NS for a, o, _ in rows]
             self.assertGreater(min(err), -0.01, catch_up)                # never in the future
             self.assertLess(max(err[-1000:]), 0.01, catch_up)           # caught up afterwards
@@ -198,6 +271,145 @@ class ClockMapperTest(unittest.TestCase):
         self.assertIsNone(ev)
         self.assertEqual(dict(cm.events), {'init': 1})
 
+    def test_delivery_stall_holds_the_offset(self):
+        # A zenoh graph stall of 1.0 or 2.7 s, its backlog delivered as a burst (IMU, odom
+        # 20x their rate) or drained slowly (5 % over the publish rate, the clouds 2x or
+        # 1.05x): every message keeps its sim-consistent stamp, late, and nothing is nudged.
+        # (The mapper before this confirmed the slow drain as a +0.5-2 s jump after 0.2 s.)
+        for stall in (1.0, 2.7):
+            for drain in ({'imu': 20, 'odom': 20, 'lidar': 2}, {'imu': 1.05, 'odom': 1.05, 'lidar': 1.05}):
+                cm = bridge.ClockMapper()
+                rows, _ = feed_delivery_stall(cm, stall, drain)
+                what = (stall, drain['imu'])
+                self.assertEqual(dict(cm.events), {'init': 1}, what)
+                self.assertEqual(cm.held, 1, what)
+                self.assertAlmostEqual(cm.last_held[0], stall, delta=0.01)
+                self.assertEqual(sum(cm.nudges.values()), 0, what)
+                for s, _ in STREAMS:
+                    self.assertTrue(strictly_increasing(rows, s), (what, s))
+                # published - sim is the offset of before the stall, within its slew
+                off = [(r[3] - r[1]) / MS for r in rows if r[2] > WALL0 + 3 * NS]
+                self.assertLess(max(off) - min(off), 2.0, what)
+                late = max((r[2] - r[3]) / NS for r in rows if r[0] == 'imu')
+                self.assertAlmostEqual(late, stall, delta=0.01)
+
+    def test_held_stall_then_rtf_under_1(self):
+        # A 3 s delivery stall, then a sim running at RTF 0.975-0.99 (under load, not a violation):
+        # once the backlog is in, the offset follows the sim's pace again. Holding it for the whole
+        # drain_s let the stamps fall 0.45 s behind and ended in a drift re-anchor.
+        for rtf in (0.99, 0.98, 0.975):
+            cm, sim, t, dt, backlog, worst = bridge.ClockMapper(), 0.0, 0.0, 0.005, [], 0.0
+            while t < 60.0:
+                sim_ns = int(sim * NS)
+                if 10.0 <= t < 13.0:
+                    backlog.append(sim_ns)
+                else:
+                    for b in backlog:
+                        cm.observe('imu', b, int(t * NS))
+                    backlog = []
+                    cm.observe('imu', sim_ns, int(t * NS))
+                    worst = max(worst, t - (sim_ns + cm.offset_ns) / NS)
+                sim += dt * (1.0 if t < 10.0 else rtf)
+                t += dt
+            self.assertEqual(cm.held, 1, rtf)
+            self.assertNotIn('drift', cm.events, rtf)
+            self.assertLess(worst, 0.15, rtf)
+            self.assertIsNone(cm._drain_until, rtf)
+
+    def test_delivery_stall_rtf(self):
+        # No IMU for over stall_s reads 0.0 (no data: a stalled sim or transport); once the
+        # backlog is in, the least delayed samples read 1.0, not the burst's sim per wall
+        # (the first and last samples gave 1.5 there), and no violation is reported.
+        cm = bridge.ClockMapper()
+        at = [k / 2.0 for k in range(2, 30)]
+        rows, rtf = feed_delivery_stall(cm, 2.7, {'imu': 20, 'odom': 20, 'lidar': 2}, until_s=15.0, rtf_at=at)
+        got = dict(zip(at, rtf))
+        self.assertEqual(got[6.5], 0.0)
+        self.assertEqual(got[7.5], 0.0)
+        for t in (8.0, 9.0, 10.0, 12.0, 14.5):
+            self.assertAlmostEqual(got[t], 1.0, delta=0.01, msg=t)
+        m = bridge.RtfMonitor()
+        self.assertNotIn('violation', [m.update(r, t) for t, r in zip(at, rtf)])
+
+    def test_live_stall_shape_is_held(self):
+        # As recorded live under parity_check's CLI churn: every stream 0.43-0.49 s late for
+        # 0.25 s, then 2.9 s of nothing, then a 0.2 s burst that drops most of the backlog
+        # (1-2 s of IMU missing). Silence is no evidence of steady d: the burst's first
+        # sample, 3.1 s into the episode, must not confirm the 0.43 s. (Before: +2.85 s
+        # jump, then drift, then +0.42 s; every parked DLIO diverged.)
+        cm = bridge.ClockMapper()
+        rows = feed(cm, STREAMS, 10.0, latency_ms=(1.0, 3.0))
+        off = cm.offset_ns
+        arrivals = []
+        for name, hz in STREAMS:
+            last = 0
+            for k in range(1, 15 * hz + 1):
+                sim = 10 * NS + k * NS // hz
+                t = sim / NS
+                if t < 10.2:
+                    wall = sim + 2 * MS
+                elif t < 10.45:
+                    wall = sim + 450 * MS                       # late
+                elif t < 12.6:
+                    continue                                    # lost
+                elif t < 13.35:
+                    wall = int(13.35 * NS) + int((t - 12.6) * 0.2 / 0.75 * NS)   # the burst
+                else:
+                    wall = sim + 2 * MS
+                last = max(wall, last + 1000)                   # FIFO per stream
+                arrivals.append((WALL0 + last, name, sim))
+        arrivals.sort()
+        queries, rtf = [WALL0 + int(t * NS) for t in (13.6, 14.0, 15.0, 16.0, 17.0, 18.0, 18.6, 19.5, 24.5)], []
+        for wall, name, sim in arrivals:
+            while queries and queries[0] <= wall:
+                rtf.append(cm.rtf(queries.pop(0)))
+            if name == 'imu':
+                cm.observe_rtf(sim, wall)
+            out, ev = cm.map(name, sim, wall)
+            rows.append((name, sim, wall, out, ev))
+        # Live, the window's old ends read up to 1.7 for a few seconds after such a burst. Now
+        # it is 1.0, or unknown while less than a second of on-time data spans the window.
+        for r in rtf:
+            self.assertTrue(r is None or abs(r - 1.0) < 0.01, rtf)
+        self.assertAlmostEqual(rtf[-1], 1.0, delta=0.01)
+        self.assertEqual(dict(cm.events), {'init': 1})
+        self.assertEqual(cm.held, 1)
+        self.assertEqual(sum(cm.nudges.values()), 0)
+        self.assertLess(abs(cm.offset_ns - off), 1 * MS)
+        for st, _ in STREAMS:
+            self.assertTrue(strictly_increasing(rows, st), st)
+
+    def test_no_step_after_a_silence(self):
+        # A target below the offset after 3 s without messages: the slew allows 0.05 x 3 s
+        # = 150 ms, which in one sample would be a stamp step (nudges behind it).
+        cm = bridge.ClockMapper()
+        cm.map('imu', 0, WALL0 + 100 * MS)                       # 100 ms late at init
+        for k in range(1, 20):
+            cm.map('imu', k * 5 * MS, WALL0 + 100 * MS + k * 5 * MS)
+        before = cm.offset_ns
+        cm.map('imu', 3100 * MS, WALL0 + 3100 * MS + 1 * MS)     # 3 s silence, then on time
+        self.assertLessEqual(before - cm.offset_ns, int(0.05 * 10 * MS) + 1)
+
+    def test_late_clouds_alone_never_move_the_offset(self):
+        # The large clouds lag longest after a stall: 3 s of them 1 s late, the IMU on time.
+        cm = bridge.ClockMapper()
+        feed(cm, (('imu', 200), ('odom', 100)), 10.0)
+        before = cm.offset_ns
+        for k in range(31):
+            sim = 6 * NS + k * NS // 10
+            out, ev = cm.map('lidar', sim, WALL0 + sim + 1000 * MS)
+            self.assertIsNone(ev)
+            self.assertEqual(out, sim + cm.offset_ns)
+        self.assertLess(abs(cm.offset_ns - before), 1 * MS)
+        self.assertEqual(dict(cm.events), {'init': 1})
+        self.assertEqual(cm.take_max_lag()['lidar'], (WALL0 + 1000 * MS - before) / NS)
+        self.assertEqual(cm.take_max_lag(), {})
+
+    def test_bad_params(self):
+        for kw in ({'ref_s': 0.0}, {'ref_s': 3.0}, {'rtf_bucket_s': 0}, {'jump_s': 0}):
+            with self.assertRaises(ValueError):
+                bridge.ClockMapper(**kw)
+
     def test_sim_jumping_ahead_reinitialises(self):
         cm = bridge.ClockMapper()
         feed(cm, (('imu', 200),), 3.0)
@@ -214,6 +426,23 @@ class ClockMapperTest(unittest.TestCase):
         lag = [(r[2] - r[3]) / NS for r in rows]
         self.assertLess(max(lag), 1.5)
         self.assertAlmostEqual(cm.rtf(rows[-1][2]), 0.9, delta=0.005)
+
+    def test_rtf092_hovering_lag_keeps_slewing(self):
+        # Sustained RTF 0.92 (an overloaded host): the lag creeps up to jump_s and hovers there
+        # with jitter. Those episodes did not start with a sudden rise, so no drain hold may
+        # stop the slew: the offset follows at its full rate between the 'drift' re-anchors.
+        cm = bridge.ClockMapper()
+        rows = feed(cm, STREAMS, 60.0, rtf=0.92, latency_ms=(1.0, 30.0))
+        lag = [(r[2] - r[3]) / NS for r in rows]
+        self.assertLess(max(lag), 1.0)
+        self.assertGreaterEqual(cm.events['drift'], 1)
+        self.assertEqual(cm.events['jump'], 0)
+        self.assertIsNone(cm._drain_until)
+        for st, _ in STREAMS:
+            self.assertTrue(strictly_increasing(rows, st), st)
+        imu = [r for r in rows if r[0] == 'imu' and r[4] is None]
+        self.assertFalse(any(r[4] == 'held' for r in rows))
+        self.assertGreater(len(imu), 0)
 
     def test_nudge(self):
         cm = bridge.ClockMapper()

@@ -37,10 +37,22 @@
 #     idle host                   1429   1.0000  0.992      23 ms     700-1300
 #     CPUs 12-15 busy (**)        1429   0.9997  0.976      89 ms     700-1300
 #
+#   2026-10-19, Phase 5: 4 DLIO + GPU mapping, the 4 agents driving 41-67 m (gz stats RTF over
+#   the ~3 min drive, the bridges' worst 5 s sim/rtf, gzserver % of a core parked)
+#   ACL_office_simple as Phase 4 had it (bare walls)
+#     idle host                   1429   1.0002  0.990      gzserver  81 %
+#     CPUs 12-15 busy (***)       1429   1.0001  0.993                98 %
+#     idle host                   2858   0.829   0.806                96 %   not real time
+#   ACL_office_simple with its sim-only pilasters, shelves and corridor ceiling (the world file)
+#     idle host                   1429   1.0001  0.974                90 %
+#     CPUs 12-15 busy (***)       1429   1.0002  0.979               108 %
+#     48 pilasters, full ceiling  1429   0.960   0.913               106 %   12-15 busy: RTF violations
+#
 # (*) 4 numpy matmul loops on 12-15, the SMT siblings of sim-gazebo's 2-5, which the other
 # stacks share: the later phases' load. (**) 4 single-threaded 1200x1200 numpy matmul loops
 # there. That load costs less than (*) did: without DLIO it left the office at 1539 rays at
-# 0.985, not 0.912, so Phase 5 has to re-check the margin under its real load.
+# 0.985, not 0.912, so Phase 5 has to re-check the margin under its real load. (***) 4 busy
+# python loops on 12-15, in sim-mighty before its planner panes ran.
 #
 # DLIO (dlio_ws cfg_overlay JR02/RR08, unchanged) needs both structure and density:
 #   - empty: never. On a flat floor with only the other robots in view, x, y and yaw are
@@ -51,6 +63,16 @@
 #     rays on it tracked at every tested spot: ATE RMSE 1.6-6.7 cm, max 8-15 cm (the
 #     feasibility probe's drives); 4 agents on 4 m squares along the hall, 48 m each through
 #     odom_eval.py --drive: RMSE 2.0-4.6 cm, max 6.8-17.9 cm (the max in in-place turns).
+#     Exploration-like drives (Phase 5: straight legs along the hall and the corridors, in-place
+#     turns at walls, 0.5 m/s) found where that is not enough: an RR slid 7-100 m along the bare
+#     1.4 m west corridor, a JR up to 13 m along the hall, and an RR's z sat 9-16 cm off with only
+#     the floor to hold it. 2858 rays do not fit in real time (above), so the world got sim-only
+#     structure instead. With it, 4 agents, 40-67 m each on two route sets: RMSE 2.0-5.3 cm, max
+#     7-24 cm (five runs, one with 12-15 busy), except an RR on a one-way route up the west corridor
+#     and across the open hall: 9.7-12.3 cm, nearly all z (xy 3-8 cm), as its pitch drifts by
+#     0.3-1 degree and z follows (routes that come back cancel it). A ceiling over the hall
+#     made a JR slide along it (likely DLIO's adaptive mode: with a median range under 5 m it
+#     matches within 0.25 m instead of 1 m), so the ceiling covers only the corridors and rooms.
 #   - arena at 2858 rays, JR and RR, 4 agents driving ~48 m each (3D ATE, odom_eval.py):
 #     odom_eval.yaml's drive (odom_eval.py --drive, drive_pattern.py's 0.5 m/s^2 ramps):
 #     RMSE 1.4-2.6 cm, max 4.3-6.3 cm (three runs); the feasibility probe's drives, which

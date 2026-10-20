@@ -13,6 +13,12 @@ world: ACL_office_simple
 gui: false
 mapping: gpu
 rviz: false
+# goal_selector's own exploration (hw_goal_selector.yaml: exploration on, on the persistent
+# map), as on the robot. It commits frontiers as soon as it has maps; the agents move once armed
+# (auto_arm) and driven 1.2 m off their spots (goal_relay.py's first drive; every start has the
+# room for it, tests/test_goal_relay.py).
+demo: explore
+auto_arm: true
 agents:
   - {name: JR81, class: jr, pose: [-4.5, 4.0, -45.0]}
   - {name: JR82, class: jr, pose: [16.5, 4.0, -135.0]}

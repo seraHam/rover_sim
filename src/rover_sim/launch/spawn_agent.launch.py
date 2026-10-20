@@ -85,7 +85,7 @@ def spawn(context):
 
     def check(event, _context):
         # ros2 launch exits 0 whatever its processes do; an exception here makes it exit 1,
-        # so sim.py's spawn pane stops before unpausing a world that is missing an agent.
+        # so sim.py's spawn pane fails and `up` stops before the world is ever unpaused.
         if event.returncode != 0:
             raise RuntimeError('%s: spawn_entity failed (exit %d)' % (ns, event.returncode))
 

@@ -16,6 +16,7 @@ import random
 import re
 import shlex
 import shutil
+import signal
 import socket
 import stat
 import subprocess
@@ -275,11 +276,13 @@ class Panes(unittest.TestCase):
 class Stacks(unittest.TestCase):
     def test_registry(self):
         self.assertEqual(list(sim.STACKS), ['zenoh', 'gazebo', 'drive', 'frame_align', 'dlio', 'mapping',
-                                            'elevation', 'mighty', 'rviz'])
-        self.assertEqual([s.name for s in sim.STACKS.values() if s.implemented],
-                         ['zenoh', 'gazebo', 'drive', 'frame_align', 'dlio', 'mapping', 'elevation'])
+                                            'elevation', 'mighty', 'rviz', 'goals'])
+        self.assertTrue(all(s.implemented for s in sim.STACKS.values()))
+        self.assertFalse(hasattr(sim.STACKS['goals'], 'late'))     # every stack starts paused
         self.assertEqual((sim.STACKS['mapping'].containers, sim.STACKS['elevation'].containers),
                          (('sim-mapping',), ('sim-elevation',)))
+        self.assertEqual([sim.STACKS[n].containers for n in ('mighty', 'rviz', 'goals')],
+                         [('sim-mighty',), ('sim-gazebo',), ('sim-mighty',)])
         self.assertEqual(sim.STACKS['dlio'].containers, ('sim-dlio-jr', 'sim-dlio-rr'))
         for s in sim.STACKS.values():
             for c in s.containers:
@@ -293,19 +296,27 @@ class Stacks(unittest.TestCase):
 
     def test_select_default(self):
         s = sim.validate_session(session())
+        # With the planner, goals: goal_relay.py's first drive (and RViz goals, if any).
         self.assertEqual([x.name for x in sim.select_stacks(s)], ['zenoh', 'gazebo', 'drive', 'frame_align', 'dlio',
-                                                                  'mapping'])
-        self.assertEqual(sim.pending_stacks(s), ['mighty (Phase 5)'])
+                                                                  'mapping', 'mighty', 'goals'])
+        self.assertEqual(sim.pending_stacks(s), [])
         gpu = sim.validate_session(session(mapping='gpu', rviz=True))
-        # The elevation mapper needs the GPU: only mapping: gpu runs it.
+        # The elevation mapper needs the GPU: only mapping: gpu runs it. With RViz, its goals.
         self.assertEqual([x.name for x in sim.select_stacks(gpu)], ['zenoh', 'gazebo', 'drive', 'frame_align', 'dlio',
-                                                                    'mapping', 'elevation'])
-        self.assertEqual(sim.pending_stacks(gpu), ['mighty (Phase 5)', 'rviz (Phase 5)'])
+                                                                    'mapping', 'elevation', 'mighty', 'rviz', 'goals'])
+        self.assertEqual(sim.pending_stacks(gpu), [])
         self.assertEqual(sim.session_profiles(gpu), ['gpu'])
         self.assertEqual(sim.session_profiles(s), [])
         # One agent: nothing to align.
         one = sim.validate_session(session(agents=[{'name': 'JR81', 'class': 'jr', 'pose': [0, 0, 0]}]))
-        self.assertEqual([x.name for x in sim.select_stacks(one)], ['zenoh', 'gazebo', 'drive', 'dlio', 'mapping'])
+        self.assertEqual([x.name for x in sim.select_stacks(one)], ['zenoh', 'gazebo', 'drive', 'dlio', 'mapping',
+                                                                    'mighty', 'goals'])
+        # No planner: neither mighty nor goals; a swap demo: goals without RViz.
+        none = [x.name for x in sim.select_stacks(sim.validate_session(session(planner=False)))]
+        self.assertEqual(('mighty' in none, 'goals' in none), (False, False))
+        swap = session(demo='swap')
+        swap['agents'][0]['goals'] = [[1.0, 0.0]]
+        self.assertEqual([x.name for x in sim.select_stacks(sim.validate_session(swap))][-2:], ['mighty', 'goals'])
 
     def test_select_requested(self):
         s = sim.validate_session(session())
@@ -313,8 +324,11 @@ class Stacks(unittest.TestCase):
         self.assertEqual([x.name for x in sim.select_stacks(s, ['drive', 'gazebo'])], ['gazebo', 'drive'])
         self.assertEqual([x.name for x in sim.select_stacks(s, ['dlio', 'zenoh'])], ['zenoh', 'dlio'])
         self.assertEqual([x.name for x in sim.select_stacks(s, ['mapping', 'zenoh'])], ['zenoh', 'mapping'])
-        with self.assertRaisesRegex(sim.SimError, 'Phase 5'):
-            sim.select_stacks(s, ['mighty'])
+        self.assertEqual([x.name for x in sim.select_stacks(s, ['mighty', 'zenoh'])], ['zenoh', 'mighty'])
+        with self.assertRaisesRegex(sim.SimError, r'goals stack does not apply .*rviz: False, planner: False'):
+            sim.select_stacks(sim.validate_session(session(planner=False)), ['goals'])
+        with self.assertRaisesRegex(sim.SimError, r'mighty stack does not apply .*planner: False'):
+            sim.select_stacks(sim.validate_session(session(planner=False)), ['mighty'])
         with self.assertRaisesRegex(sim.SimError, r'elevation stack does not apply .*mapping: fallback'):
             sim.select_stacks(s, ['elevation'])
         with self.assertRaisesRegex(sim.SimError, 'unknown stack'):
@@ -328,21 +342,21 @@ class Stacks(unittest.TestCase):
         self.assertEqual(sim.generate_steps([st['zenoh'], st['gazebo'], st['drive'], st['frame_align'], st['dlio'],
                                              st['mapping'], st['elevation']]),
                          [sim.write_agent_files, sim.link_calib, sim.write_teleop_file, sim.write_dlio_launch,
-                          sim.write_mapping_files, sim.check_elevation_launch])
-        self.assertEqual(sim.generate_steps([st['elevation']]), [sim.check_elevation_launch])
+                          sim.write_mapping_files, sim.check_elevation_launch, sim.check_kernel_cache])
+        self.assertEqual(sim.generate_steps([st['elevation']]), [sim.check_elevation_launch, sim.check_kernel_cache])
         self.assertEqual(sim.generate_steps([st['drive']]), [sim.write_agent_files, sim.link_calib,
                                                              sim.write_teleop_file])
         self.assertEqual(sim.generate_steps([st['dlio']]), [sim.write_dlio_launch])
         self.assertEqual(sim.generate_steps([st['gazebo']]), [sim.write_agent_files])
         self.assertEqual(sim.generate_steps([st['zenoh']]), [])
 
-    def test_placeholders_raise(self):
+    def test_every_stack_builds_panes(self):
         s = sim.validate_session(session(mapping='gpu', rviz=True))
         ctx = sim.RunContext(run_dir=Path('/tmp/x'))
         for st in sim.STACKS.values():
-            if not st.implemented:
-                with self.assertRaisesRegex(sim.SimError, 'Phase %d' % st.phase):
-                    st.panes(s, ctx)
+            self.assertTrue(st.panes(s, ctx), st.name)
+        self.assertEqual(str(sim._not_yet('mighty')), 'the mighty stack lands in Phase 5 (mighty_node, '
+                                                      'convert_odom_to_state, mpc, goal_selector per agent)')
 
 
 def inner_of(p):
@@ -386,8 +400,19 @@ class ShippedSessions(unittest.TestCase):
             self.assertAlmostEqual(math.remainder(a.yaw_deg - facing, 360.0), 0.0, delta=0.5)
             opposite = [o for o in s.agents if math.hypot(o.x + a.x, o.y + a.y) < 1e-6]
             self.assertEqual(len(opposite), 1, a.name)
-            self.assertEqual(a.goals, ((opposite[0].x, opposite[0].y),), a.name)
             self.assertNotEqual(opposite[0].cls, a.cls)                         # crossings are cross-class
+            # Across the centre, 20 deg past the opposite start on the same circle: no agent is
+            # parked on it (mighty refuses a goal on an occupied cell), and no box is near.
+            ((gx, gy),) = a.goals
+            self.assertAlmostEqual(math.hypot(gx, gy), 4.0, delta=0.01)
+            past = math.degrees(math.atan2(gy, gx) - math.atan2(opposite[0].y, opposite[0].x))
+            self.assertAlmostEqual(math.remainder(past, 360.0), 20.0, delta=0.2, msg=a.name)
+            self.assertGreater(min(math.hypot(gx - o.x, gy - o.y) for o in s.agents), 1.3, a.name)
+        world = REPO / 'src' / 'rover_sim' / 'worlds' / 'arena.world'
+        if world.is_file():
+            boxes = world_boxes(world)
+            for a in s.agents:
+                self.assertGreater(min(box_distance(a.goals[0][0], a.goals[0][1], b) for b in boxes), 2.0, a.name)
 
     def test_office_explore(self):
         s = sim.load_session('office_explore')
@@ -423,6 +448,10 @@ def world_boxes(path):
         c, s = math.cos(a[2]), math.sin(a[2])
         return a[0] + c * b[0] - s * b[1], a[1] + s * b[0] + c * b[1], a[2] + b[2]
 
+    def z_of(el):
+        p = el.find('pose')
+        return float(p.text.split()[2]) if p is not None and p.text else 0.0
+
     out = []
     for m in ET.parse(str(path)).getroot().find('world').findall('model'):
         for link in m.findall('link'):
@@ -430,7 +459,9 @@ def world_boxes(path):
             for col in link.findall('collision'):
                 size = col.find('geometry/box/size')
                 if size is not None:
-                    sx, sy, _ = (float(t) for t in size.text.split())
+                    sx, sy, sz = (float(t) for t in size.text.split())
+                    if z_of(m) + z_of(link) + z_of(col) - sz / 2 >= 1.0:
+                        continue                  # over the robots (the office's sim-only ceiling)
                     out.append(compose(lp, pose_of(col)) + (sx, sy))
     return out
 
@@ -914,13 +945,13 @@ class SimTimeStatus(unittest.TestCase):
 
     def test_specs(self):
         self.assertEqual(sim.status_specs(['JR81'], ['gazebo']), ['f64:/JR81/sim/rtf', 'f64:/JR81/sim/time_offset'])
-        self.assertEqual(sim.status_specs(['JR81', 'RR83'], {'dlio', 'drive', 'mighty'}), [
+        self.assertEqual(sim.status_specs(['JR81', 'RR83'], {'dlio', 'drive', 'frame_align'}), [
             'odom:/JR81/dlio/odom_node/odom', 'count:/JR81/dlio/odom_node/pointcloud/deskewed', 'str:/JR81/mode',
             'odom:/RR83/dlio/odom_node/odom', 'count:/RR83/dlio/odom_node/pointcloud/deskewed', 'str:/RR83/mode'])
         self.assertEqual(sim.status_specs(['JR81'], ['zenoh']), [])
-        for spec in sim.status_specs(['JR81'], ['gazebo', 'dlio', 'drive']):
+        for spec in sim.status_specs(['JR81'], ['gazebo', 'dlio', 'drive', 'mighty']):
             kind, topic = spec.split(':', 1)
-            self.assertIn(kind, ('f64', 'str', 'odom', 'count'))
+            self.assertIn(kind, ('f64', 'str', 'odom', 'count', 'twist', 'bool'))
             self.assertTrue(topic.startswith('/JR81/'))
 
     def test_lines(self):
@@ -952,10 +983,12 @@ class SimTimeStatus(unittest.TestCase):
                          % sim.ECHO_TIMEOUT_S)
         compile(sim._STATUS_PY, '<sim_status>', 'exec')
         self.assertNotIn('ros2 topic echo', sim._STATUS_PY)
-        self.assertIn('LEAVE_GAP_S, LEAVE_PAUSE_S = 0.1, 0.5\n', sim._STATUS_PY)
+        self.assertIn('LEAVE_GAP_S, LEAVE_PAUSE_S = %r, %r\n' % (sim.STATUS_LEAVE_GAP_S, sim.STATUS_LEAVE_PAUSE_S),
+                      sim._STATUS_PY)
         # The timeout covers rclpy's start, the deadline and the paced leave of every subscription.
         self.assertEqual(sim.status_budget(0), sim.ECHO_TIMEOUT_S + 5)
-        self.assertEqual(sim.status_budget(32), sim.ECHO_TIMEOUT_S + 4 + 4)
+        self.assertEqual(sim.status_budget(32), math.ceil(sim.ECHO_TIMEOUT_S + 4 + 32 * sim.STATUS_LEAVE_GAP_S
+                                                          + sim.STATUS_LEAVE_PAUSE_S))
         out = subprocess.run(['bash', '-c', sim._STATUS_SH.replace('exec timeout -k 2', 'echo'), 'status', '15', 'a:/x',
                               'b:/y z'], stdout=subprocess.PIPE, universal_newlines=True, env={'SIM_STATUS_PY': 'P'}).stdout
         self.assertEqual(out, '15 python3 -c P 8 3 a:/x b:/y z\n')
@@ -1208,7 +1241,8 @@ class ComposeFile(unittest.TestCase):
         for name, svc in services.items():
             self.assertEqual(svc['container_name'], name)
             self.assertEqual(svc['networks'], ['rover-sim'], name)
-            self.assertEqual(svc['command'], ['sleep', 'infinity'], name)
+            if name != 'sim-viz':                       # its own: VizCommand.test_docker_stop_is_a_ctrl_c
+                self.assertEqual(svc['command'], ['sleep', 'infinity'], name)
             self.assertIs(svc['init'], True, name)
             self.assertEqual(svc['env_file'], '../config/sim.env', name)
             self.assertEqual(svc['pull_policy'], 'never', name)
@@ -1222,21 +1256,34 @@ class ComposeFile(unittest.TestCase):
                          '../config:/rover_sim/config:ro'):
                 self.assertIn(want, vols, name)
             # No default run dir: a shared /tmp path is unsafe (sim.py check_run_dir).
-            run = [v for v in vols if isinstance(v, str) and v.endswith(':/rover_sim/run')]
+            run = [v for v in vols if isinstance(v, str) and re.search(r':/rover_sim/run(:ro)?$', v)]
             self.assertEqual(len(run), 1, name)
+            self.assertEqual(run[0].endswith(':ro'), name in ('sim-viz', 'sim-mighty'), name)   # they only read it
             self.assertTrue(run[0].startswith('${ROVER_SIM_RUN:?'), name)
             self.assertEqual(svc['cpuset'], '${%s:-}' % sim.cpuset_var(name), name)
             for v in vols:
                 self.assertFalse(sim.docker_socket_mount(sim._volume_source(v)), v)
         self.assertIn('/tmp/.X11-unix:/tmp/.X11-unix:rw', services['sim-gazebo']['volumes'])
+        self.assertIn('/tmp/.X11-unix:/tmp/.X11-unix:ro', services['sim-viz']['volumes'])     # connect needs no write
         self.assertEqual(services['sim-elevation']['profiles'], ['gpu'])
+        self.assertEqual({n: s['profiles'] for n, s in services.items() if 'profiles' in s},
+                         {'sim-elevation': ['gpu'], 'sim-viz': ['viz']})
         dev = services['sim-elevation']['deploy']['resources']['reservations']['devices'][0]
         self.assertEqual((dev['driver'], dev['capabilities']), ('nvidia', ['gpu']))
+
+    def test_elevation_kernel_cache(self):
+        # cupy's compiled kernels outlive a recreated sim-elevation, as on the robot's disk; no
+        # other service gets a named volume.
+        named = {name: [v for v in svc['volumes'] if isinstance(v, str) and not v.startswith(('.', '/', '$'))]
+                 for name, svc in self.doc['services'].items()}
+        self.assertEqual(named.pop('sim-elevation'), ['cupy-kernel-cache:/root/.cupy'])
+        self.assertEqual(set(map(tuple, named.values())), {()})
+        self.assertEqual(self.doc['volumes'], {'cupy-kernel-cache': {'name': 'rover-sim-cupy-kernel-cache'}})
 
     def test_images_from_pin_file(self):
         want = {'sim-gazebo': 'GAZEBO_IMAGE', 'sim-drive': 'DRIVE_IMAGE', 'sim-dlio-jr': 'DLIO_JR_IMAGE',
                 'sim-dlio-rr': 'DLIO_RR_IMAGE', 'sim-mapping': 'MAPPING_IMAGE',
-                'sim-elevation': 'ELEVATION_IMAGE', 'sim-mighty': 'MIGHTY_IMAGE'}
+                'sim-elevation': 'ELEVATION_IMAGE', 'sim-mighty': 'MIGHTY_IMAGE', 'sim-viz': 'GAZEBO_IMAGE'}
         for name, var in want.items():
             self.assertTrue(self.doc['services'][name]['image'].startswith('${%s:?' % var), name)
         stacks_env = REPO / 'docker' / 'stacks.env'
@@ -1288,7 +1335,8 @@ class ComposeFile(unittest.TestCase):
     def test_cpu_budget(self):
         b = sim.cpu_budget(20, sim.CONTAINERS)
         self.assertEqual(b['sim-gazebo'], '2-5')                    # gzserver's cores, nobody else's
-        self.assertEqual({v for k, v in b.items() if k != 'sim-gazebo'}, {'6-19'})
+        self.assertEqual({v for k, v in b.items() if k not in ('sim-gazebo', 'sim-viz')}, {'6-19'})
+        self.assertEqual(b['sim-viz'], '16-19')                         # off 2-5 and their siblings 12-15
         self.assertEqual(sorted(b), sorted(sim.CONTAINERS))
         self.assertEqual(sim.cpu_budget(8, sim.CONTAINERS), {})       # too small to split: unpinned
         self.assertEqual(sim.cpuset_var('sim-dlio-jr'), 'ROVER_SIM_CPUSET_DLIO_JR')
@@ -1638,14 +1686,19 @@ class Cli(unittest.TestCase):
         self.assertIn('JR81  jr  id 81  pose (-2.00, 0.00, 0.0 deg)  calibrated from JR02, lidar at 0.36 m', out)
         self.assertIn('RR83  rr  id 83  pose (2.00, 0.00, 180.0 deg)  calibrated from RR08, lidar at 0.40 m', out)
         self.assertIn('before the panes: write_agent_files, link_calib, write_teleop_file, write_dlio_launch, '
-                      'write_mapping_files', out)
-        self.assertIn('not started yet (later phases): mighty (Phase 5)\n', out)
+                      'write_mapping_files, check_goal_relay', out)
+        self.assertNotIn('not started yet (later phases)', out)
         self.assertIn('mapping: fallback (NOT PARITY', out)
         self.assertNotIn('stack elevation', out)                       # no GPU in the fallback
         self.assertIn('stack dlio -> tmux session rsim-dlio', out)
-        self.assertIn('not arming: auto_arm is off, so every safety_node stays DISARMED (scripts/sim.py arm)', out)
+        # A planner session arms before the unpause, at once; odom_eval (no planner) after it, on DLIO.
+        self.assertIn('after the last wave, before the unpause: arm JR81, RR83: /<ns>/auto_mode at once', out)
         self.assertIn('after the panes: arm JR81, JR82, RR83, RR84: /<ns>/auto_mode once its DLIO registers scans',
                       self.dry_run('odom_eval'))
+        no_arm = subprocess.run([sys.executable, str(REPO / 'scripts' / 'sim.py'), 'up', 'smoke', '--no-arm',
+                                 '--dry-run'], stdout=subprocess.PIPE, universal_newlines=True, check=True).stdout
+        self.assertIn('not arming: auto_arm needs the dlio and drive stacks, and mighty in a planner session (or '
+                      '--no-arm was given)', no_arm)
 
     def test_dry_run_four_agents(self):
         out = self.dry_run('multi_agent_swap')
@@ -1685,7 +1738,7 @@ FAKE_ROS = {
     'rclpy/__init__.py': r'''
 import json, os, time
 WORLD = json.loads(os.environ['FAKE_WORLD'])
-def init(args=None):
+def init(args=None, signal_handler_options=None):
     pass
 def try_shutdown():
     pass
@@ -1722,6 +1775,8 @@ class Sub:
         m.pose.pose = Msg()
         m.pose.pose.position = Msg()
         m.pose.pose.position.z = spec.get('z', 0.0)
+        m.linear, m.angular = Msg(), Msg()
+        m.linear.x, m.angular.z = spec.get('v', 0.0), spec.get('w', 0.0)
         self.cb(m)
 class Future:
     def __init__(self, r):
@@ -1753,16 +1808,25 @@ class Node:
         self.subs.remove(sub)
         print('LEFT %s' % sub.topic, file=sys.stderr)
     def create_client(self, srv_type, name):
-        return Client(name)
+        self.clients = getattr(self, 'clients', []) + [Client(name)]
+        return self.clients[-1]
+    def destroy_client(self, client):
+        self.clients.remove(client)
+        print('LEFT client %s' % client.name, file=sys.stderr)
     def destroy_node(self):
         print('CALLS %s' % ' '.join(rclpy.WORLD.get('calls', [])), file=sys.stderr)
         print('DESTROYED with %d subscription(s) left, %s' % (len(self.subs), sorted(self.kw.items())), file=sys.stderr)
+        if getattr(self, 'clients', None):
+            print('DESTROYED with %d client(s) left' % len(self.clients), file=sys.stderr)
 ''',
+    'rclpy/signals.py': 'class SignalHandlerOptions:\n    NO = 0\n',
     'rclpy/qos.py': 'class ReliabilityPolicy:\n    BEST_EFFORT = 2\nclass QoSProfile:\n    def __init__(self, **kw):\n'
                     '        pass\n',
     'nav_msgs/__init__.py': '', 'nav_msgs/msg.py': 'class Odometry:\n    pass\nclass OccupancyGrid:\n    pass\n',
     'sensor_msgs/__init__.py': '', 'sensor_msgs/msg.py': 'class PointCloud2:\n    pass\n',
-    'std_msgs/__init__.py': '', 'std_msgs/msg.py': 'class Float64:\n    pass\nclass String:\n    pass\n',
+    'std_msgs/__init__.py': '', 'std_msgs/msg.py': 'class Float64:\n    pass\nclass String:\n    pass\n'
+                                                   'class Bool:\n    pass\n',
+    'geometry_msgs/__init__.py': '', 'geometry_msgs/msg.py': 'class Twist:\n    pass\n',
     'std_srvs/__init__.py': '', 'std_srvs/srv.py': 'class Trigger:\n    class Request:\n        pass\n',
 }
 
@@ -1786,14 +1850,22 @@ def run_with_fake_ros(script, args, world, calls=None, err=None):
     return p.stdout
 
 
+def dlio_session(ns, n=1):
+    """A /<ns>/dlio/session id as dlio_with_session.launch.py makes one (start ns, host, pid)."""
+    return '17600000%02d000000000-sim-dlio-%s-%d' % (n, ns[:2].lower(), 40 + n)
+
+
 def safety_world(*agents, **over):
     """A world with each agent's safety_node (mode + both Trigger services) and its DLIO:
-    agents are (ns, mode, odom stamp 'now' | 0 | None, scans?), DLIO's odom at the seed height."""
+    agents are (ns, mode, odom stamp 'now' | 0 | None, scans?), DLIO's odom at the seed height
+    and its session (dlio_session(ns)) announced at 1 Hz."""
     w = {'pubs': {}, 'services': {}}
     for ns, mode, stamp, scans in agents:
         w['pubs']['/%s/mode' % ns] = {'hz': 20, 'value': mode}
         if stamp is not None:
             w['pubs']['/%s/dlio/odom_node/odom' % ns] = {'hz': 100, 'stamp': stamp, 'z': sim.lidar_height_of(ns)}
+            w['pubs']['/%s/dlio/session' % ns] = {'hz': 1, 'value': json.dumps(
+                {'id': dlio_session(ns), 'start': 1760000000.0, 'ns': ns}, sort_keys=True)}
         if scans:
             w['pubs']['/%s/dlio/odom_node/pointcloud/deskewed' % ns] = {'hz': 10}
         for srv, sets in (('auto_mode', 'AUTO'), ('disarm', 'DISARMED')):
@@ -1963,18 +2035,18 @@ class Phase3Panes(unittest.TestCase):
         self.assertEqual(by['dlio-RR83'].waits, sim.seed_wait(SWAP.agents[2]))
         # After the router's gate and before the node marker: `up` waits for DLIO to start.
         inner = inner_of(by['dlio-RR83'])
-        self.assertLess(inner.index('wait_zenoh_ready.py'), inner.index('pgrep -f'))
+        self.assertLess(inner.index('wait_zenoh_ready.py'), inner.index('wait_for_seed.py'))
         self.assertTrue(inner.endswith(sim.seed_wait(SWAP.agents[2]) + ' && ' + sim.node_marker() + ' && '
                                        + by['dlio-RR83'].cmd))
-        # DLIO starts only once its own seed publisher runs: the pattern finds that process's
-        # command line, never a pane's bash -c (which contains it) or another agent's seed.
-        pat = re.search(r'pgrep -f "([^"]+)"', by['dlio-RR83'].waits).group(1)
-        seed_proc = '/usr/bin/python3 /opt/ros/humble/bin/ros2 ' + by['seed-RR83'].cmd[len('ros2 '):]
-        self.assertTrue(re.search(pat, seed_proc))
-        for p in panes:
-            self.assertFalse(re.search(pat, 'bash -c ' + sim.pane_inner(p)), p.slug)
-        self.assertFalse(re.search(pat, seed_proc.replace('/RR83/', '/RR84/')))
-        self.assertIn('&& sleep %d' % sim.SEED_LEAD_S, by['dlio-RR83'].waits)
+        # DLIO starts only once a seed message has reached its container (not just once the seed
+        # pane's publisher runs): this repo's wait_for_seed.py, mounted, on the agent's own topic.
+        self.assertEqual(by['dlio-RR83'].waits, 'python3 /rover_sim/scripts/wait_for_seed.py RR83 --timeout %d'
+                         % sim.SEED_WAIT_S)
+        self.assertTrue((REPO / 'scripts' / sim.WAIT_FOR_SEED).is_file())
+        self.assertGreaterEqual(sim.SEED_WAIT_S, 120)        # the paused bring-up takes minutes
+        self.assertIn(' /RR83/world ', by['seed-RR83'].cmd)
+        self.assertNotIn('pgrep', inner)
+        self.assertFalse(hasattr(sim, 'SEED_LEAD_S'))
         self.assertEqual(by['seed-JR82'].cmd, 'ros2 topic pub -r 2 /JR82/world geometry_msgs/msg/PoseStamped '
                                               '"{header: {frame_id: world}, pose: {position: {z: 0.36}, '
                                               'orientation: {w: 1}}}"')
@@ -2076,18 +2148,21 @@ class Phase3Panes(unittest.TestCase):
             self.assertFalse(sim.docker_socket_mount(sim._volume_source(m)))
 
     def test_session_auto_arm(self):
-        # Off by default: without mpc (Phase 5) nothing publishes cmd_vel_auto, and safety_node in
-        # AUTO logs every 20 ms. Only the odom_eval session, which drives through it, arms.
+        # Off by default. The planner sessions arm (mpc publishes cmd_vel_auto from its start), and
+        # so does odom_eval, whose drives publish it themselves.
         self.assertFalse(sim.validate_session(session()).auto_arm)
         self.assertTrue(sim.validate_session(session(auto_arm=True)).auto_arm)
         self.assertIn("auto_arm: 'no' is not true/false", errors_of(session(auto_arm='no')))
         self.assertIs(sim.validate_session(session()).to_json()['auto_arm'], False)
-        self.assertEqual([n for n in ('smoke', 'multi_agent_swap', 'office_explore', 'odom_eval')
-                          if sim.load_session(n).auto_arm], ['odom_eval'])
+        shipped = ['smoke', 'multi_agent_swap', 'office_explore', 'odom_eval']
+        self.assertEqual([n for n in shipped if sim.load_session(n).auto_arm], shipped)
         st = sim.STACKS
         s = sim.validate_session(session(auto_arm=True))
-        everything = [st[n] for n in ('zenoh', 'gazebo', 'drive', 'dlio')]
+        everything = [st[n] for n in ('zenoh', 'gazebo', 'drive', 'dlio', 'mighty')]
         self.assertTrue(sim.will_arm(s, everything))
+        # A planner session without its planner: nothing would send cmd_vel_auto, so no arming.
+        self.assertFalse(sim.will_arm(s, everything[:-1]))
+        self.assertTrue(sim.will_arm(dataclasses.replace(s, planner=False), everything[:-1]))
         self.assertFalse(sim.will_arm(s, everything, no_arm=True))
         self.assertFalse(sim.will_arm(sim.validate_session(session(auto_arm=False)), everything))
         self.assertFalse(sim.will_arm(s, [st['zenoh'], st['gazebo'], st['drive']]))       # no DLIO, no arming
@@ -2106,7 +2181,7 @@ class Arming(unittest.TestCase):
         res, calls, out = self.run_arm(world, names=('JR81', 'RR83', 'JR82'))
         self.assertEqual(calls, ['/JR81/auto_mode'])                 # never before DLIO is past its calibration
         self.assertEqual(res['JR81'], sim.ArmResult('JR81', 'ok', 'AUTO', 'rover switched to AUTO mode by '
-                                                                          'auto_mode service'))
+                                                                          'auto_mode service', dlio_session('JR81')))
         self.assertEqual((res['RR83'].status, res['RR83'].mode), ('timeout', 'DISARMED'))
         self.assertIn('unstamped: no IMU', res['RR83'].message)
         self.assertIn('no scans yet', res['JR82'].message)
@@ -2121,6 +2196,170 @@ class Arming(unittest.TestCase):
         self.assertEqual(calls, ['/JR81/auto_mode'])
         self.assertEqual((res['RR83'].status, res['RR83'].mode), ('timeout', 'DISARMED'))
         self.assertIn('DLIO odom z 0.00, expected 0.40: the seed pose came too late', res['RR83'].message)
+
+    def test_z_check_binds_on_the_first_arm_of_a_dlio_session(self):
+        zc = sim.arm_z_check
+        # Within ARM_Z_TOL_M: nothing, whatever the session.
+        self.assertEqual(zc('JR81', 0.40, 0.36, 0.1, None, None), (None, None))
+        # Late-seed signature (odom anchored at 0), first arm: blamed on the seed.
+        why, warn = zc('RR83', 0.002, 0.4, 0.1, 'S1', None)
+        self.assertIsNone(warn)
+        self.assertEqual(why, 'DLIO odom z 0.00, expected 0.40: the seed pose came too late; restart its dlio pane '
+                              '(scripts/sim.py attach dlio: Ctrl-C, Up, Enter)')
+        self.assertIn('the seed pose came too late', zc('RR83', -0.05, 0.4, 0.1, 'S2', 'S1')[0])   # after a restart
+        # Off by more than the tolerance but not at 0: no seed blame, the offset and both ways out.
+        why, warn = zc('JR81', 0.51, 0.36, 0.1, 'S1', None)
+        self.assertIsNone(warn)
+        self.assertEqual(why, "DLIO odom z 0.51, expected 0.36 (offset +0.15; first arm in this DLIO session): restart "
+                              "its dlio pane (resets that agent's maps) or scripts/sim.py arm --no-z-check JR81")
+        self.assertNotIn('too late', why)
+        self.assertIn('(offset +0.15; DLIO restarted since its last arm)', zc('JR81', 0.51, 0.36, 0.1, 'S2', 'S1')[0])
+        self.assertIn('(offset -0.21; no /JR81/dlio/session seen)', zc('JR81', 0.15, 0.36, 0.1, None, 'S1')[0])
+        self.assertIn('no /JR81/dlio/session seen', zc('JR81', 0.51, 0.36, 0.1, None, None)[0])
+        # Armed before in this very session: z drifts over a run, so a warning only.
+        self.assertEqual(zc('JR81', 0.51, 0.36, 0.1, 'S1', 'S1'),
+                         (None, 'odometry z drifted +0.15 m since its DLIO session started; not blocking'))
+        # ... but z at 0 is the late seed, which no earlier arm excuses (a paused arm records the
+        # session without any z check).
+        self.assertIn('the seed pose came too late', zc('JR81', 0.0, 0.36, 0.1, 'S1', 'S1')[0])
+        # --no-z-check: neither.
+        self.assertEqual(zc('RR83', 0.0, 0.4, 0.1, None, None, check=False), (None, None))
+
+    def test_dlio_session_id(self):
+        sid = dlio_session('JR81')
+        self.assertEqual(sim.dlio_session_id(json.dumps({'id': sid, 'start': 1.0, 'ns': 'JR81'})), sid)
+        for bad in ('', 'not json', '[1]', '{"start": 1}', '{"id": 7}', '{"id": ""}', '{"id": "a b"}',
+                    '{"id": " a"}', None):
+            self.assertIsNone(sim.dlio_session_id(bad), bad)
+
+    def test_parse_arm_sessions(self):
+        res = sim.parse_arm('@@ JR81 session S-1\n@@ JR81 session S-2\n@@ JR81 ok mode=AUTO switched\n'
+                            '@@ RR83 timeout mode=DISARMED DLIO odom z 0.51, expected 0.40 (offset +0.11; x)\n'
+                            '@@ RR84 session S-9\n')
+        self.assertEqual(list(res), ['JR81', 'RR83'])                # a session line alone is no result
+        self.assertEqual((res['JR81'].session, res['JR81'].message), ('S-2', 'switched'))
+        self.assertEqual(res['RR83'].session, '')
+
+    def test_armed_sessions_record(self):
+        R = sim.ArmResult
+        res = OrderedDict([('JR81', R('JR81', 'ok', 'AUTO', 'switched', 'S-new')),
+                           ('JR82', R('JR82', 'ok', 'AUTO', sim.ALREADY_AUTO, 'S-82')),    # not checked here
+                           ('RR83', R('RR83', 'timeout', 'DISARMED', 'z', 'S-83')),
+                           ('RR84', R('RR84', 'ok', 'AUTO', 'switched', ''))])             # no session seen
+        self.assertEqual(sim.armed_sessions_after({'JR81': 'S-old', 'RR84': 'S-84'}, res),
+                         {'JR81': 'S-new', 'RR84': 'S-84'})
+        with tempfile.TemporaryDirectory() as d:
+            run = Path(d)
+            self.assertEqual(sim.load_armed_sessions(run), {})
+            sim.save_armed_sessions(run, {'JR81': 'S-1'})
+            self.assertEqual(sim.load_armed_sessions(run), {'JR81': 'S-1'})
+            self.assertEqual(sorted(p.name for p in run.iterdir()), ['armed_sessions.json'])   # no temp left
+            for text in ('{broken', '["JR81"]'):
+                (run / 'armed_sessions.json').write_text(text)
+                with contextlib.redirect_stderr(io.StringIO()) as err:
+                    self.assertEqual(sim.load_armed_sessions(run), {})      # no record: every arm a first arm
+                self.assertIn('first-arm z check', err.getvalue())
+            (run / 'armed_sessions.json').write_text('{"JR81": "S-1", "RR83": 5}')
+            self.assertEqual(sim.load_armed_sessions(run), {'JR81': 'S-1'})
+
+    def drift_world(self, z=0.51, session=True):
+        world = safety_world(('JR81', 'DISARMED', 'now', True))
+        world['pubs']['/JR81/dlio/odom_node/odom']['z'] = z
+        if not session:
+            del world['pubs']['/JR81/dlio/session']
+        return world
+
+    def run_query(self, world, armed=None, z_check=True, service='auto_mode', gate='dlio', timeout=1.5):
+        calls = []
+        args = sim.arm_args(service, gate, timeout, ['JR81'], armed, z_check)[4:]
+        out = run_with_fake_ros(sim._ARM_PY, args, world, calls)
+        return sim.parse_arm(out)['JR81'], calls, out
+
+    def test_rearm_in_the_same_session_only_warns(self):
+        r, calls, out = self.run_query(self.drift_world(), {'JR81': dlio_session('JR81')})
+        self.assertEqual((r.status, r.mode, r.session, calls), ('ok', 'AUTO', dlio_session('JR81'), ['/JR81/auto_mode']))
+        self.assertEqual(out.count('[arm] JR81: WARNING: odometry z drifted +0.15 m since its DLIO session started; '
+                                   'not blocking'), 1)
+        # A new session (DLIO restarted), the first arm, or no session to compare: blocked.
+        for armed, why in (({'JR81': dlio_session('JR81', 2)}, 'DLIO restarted since its last arm'),
+                           (None, 'first arm in this DLIO session')):
+            r, calls, out = self.run_query(self.drift_world(), armed)
+            self.assertEqual((r.status, calls), ('timeout', []))
+            self.assertIn('DLIO odom z 0.51, expected 0.36 (offset +0.15; %s)' % why, r.message)
+            self.assertNotIn('WARNING', out)
+        r, calls, _ = self.run_query(self.drift_world(session=False), {'JR81': dlio_session('JR81')})
+        self.assertEqual((r.status, calls), ('timeout', []))
+        self.assertIn('no /JR81/dlio/session seen', r.message)
+
+    def test_no_z_check_and_disarm(self):
+        r, calls, out = self.run_query(self.drift_world(z=0.0), z_check=False)
+        self.assertEqual((r.status, r.session, calls), ('ok', dlio_session('JR81'), ['/JR81/auto_mode']))
+        self.assertNotIn('WARNING', out)
+        world = self.drift_world(z=0.0)
+        world['pubs']['/JR81/mode']['value'] = 'AUTO'
+        r, calls, _ = self.run_query(world, service='disarm', gate='none')
+        self.assertEqual((r.status, r.mode, calls), ('ok', 'DISARMED', ['/JR81/disarm']))   # never a z check
+
+    def test_waits_briefly_for_the_session_id(self):
+        # z fine but no session: armed once SESSION_WAIT_S is over (nothing to record), not before.
+        t = time.time()
+        r, calls, _ = self.run_query(self.drift_world(z=0.36, session=False), timeout=8)
+        self.assertEqual((r.status, r.session, calls), ('ok', '', ['/JR81/auto_mode']))
+        self.assertGreater(time.time() - t, 3.0)
+        self.assertIn('SESSION_WAIT_S, SESSION_WAIT_UP_S = 5.0, 2.0, 15.0, 3.0, 15.0', sim._ARM_PY)
+        r, calls, _ = self.run_query(self.drift_world(z=0.36, session=False), timeout=1.5)
+        self.assertEqual((r.status, calls), ('timeout', []))
+        self.assertIn('no /JR81/dlio/session yet', r.message)
+
+    def test_session_gate_records_without_the_dlio_checks(self):
+        # up's paused arm: DLIO has no IMU yet (no odom, no scans), so nothing about them is
+        # checked, but the session is waited for and reported, for the record.
+        world = self.drift_world(z=0.0)
+        del world['pubs']['/JR81/dlio/odom_node/odom']
+        r, calls, out = self.run_query(world, gate='session')
+        self.assertEqual((r.status, r.mode, r.session, calls), ('ok', 'AUTO', dlio_session('JR81'), ['/JR81/auto_mode']))
+        self.assertNotIn('WARNING', out)
+        r, calls, _ = self.run_query(self.drift_world(session=False), gate='session', timeout=1.5)
+        self.assertEqual((r.status, calls), ('timeout', []))
+        self.assertIn('no /JR81/dlio/session yet', r.message)
+
+    def test_arm_agents_records_the_session(self):
+        seen = []
+
+        def lines(name, args, timeout, env, on_line):
+            seen.append(args)
+            for l in ('[arm] JR81: WARNING: odometry z drifted +0.15 m since its DLIO session started; not blocking',
+                      '@@ JR81 session S-7', '@@ JR81 ok mode=AUTO switched',
+                      '@@ RR83 session S-8', '@@ RR83 timeout mode=DISARMED z'):
+                on_line(l)
+            return 0
+
+        with tempfile.TemporaryDirectory() as d:
+            run, log = Path(d), Path(d) / 'arm.log'
+            (run / 'armed_sessions.json').write_text('{"RR84": "S-4"}')
+            err = io.StringIO()
+            with mock.patch.object(sim, 'dexec_lines', lines), contextlib.redirect_stdout(io.StringIO()), \
+                    contextlib.redirect_stderr(err):
+                res = sim.arm_agents(['JR81', 'RR83'], 'auto_mode', 'dlio', 30, log, run_dir=run)
+                self.assertEqual(seen[-1][-2:], ['JR81=0.36', 'RR83=0.4'])
+                self.assertEqual(json.loads((run / 'armed_sessions.json').read_text()), {'JR81': 'S-7', 'RR84': 'S-4'})
+                self.assertEqual(res['JR81'].session, 'S-7')
+                self.assertIn('WARNING: JR81: odometry z drifted +0.15 m', err.getvalue())
+                sim.arm_agents(['JR81', 'RR83'], 'auto_mode', 'dlio', 30, log, run_dir=run, z_check=False)
+                self.assertEqual(seen[-1][9:], ['0', 'JR81=0.36=S-7', 'RR83=0.4'])
+                # disarm and --now neither pass nor change the record.
+                sim.arm_agents(['JR81'], 'disarm', 'none', 30, log, run_dir=run)
+                sim.arm_agents(['JR81'], 'auto_mode', 'none', 30, log, run_dir=run)
+                self.assertEqual([a[-1] for a in seen[-2:]], ['JR81=0.36', 'JR81=0.36'])
+                # up's paused arm (gate session) records too.
+                (run / 'armed_sessions.json').write_text('{}')
+                sim.arm_agents(['JR81'], 'auto_mode', 'session', 30, log, run_dir=run)
+                self.assertEqual(json.loads((run / 'armed_sessions.json').read_text()), {'JR81': 'S-7'})
+                (run / 'armed_sessions.json').write_text('{"JR81": "S-7", "RR84": "S-4"}')
+            self.assertEqual(json.loads((run / 'armed_sessions.json').read_text()), {'JR81': 'S-7', 'RR84': 'S-4'})
+            text = log.read_text()
+        self.assertEqual(text.count('NO z check (--no-z-check)'), 1)
+        self.assertIn('@@ JR81 session S-7', text)
 
     def test_idempotent_and_disarm(self):
         res, calls, _ = self.run_arm(safety_world(('JR81', 'AUTO', 'now', True)))
@@ -2164,16 +2403,23 @@ class Arming(unittest.TestCase):
     def test_arm_args(self):
         args = sim.arm_args('auto_mode', 'dlio', 60, ['JR81', 'RR83'])
         self.assertEqual(args[:2], ['bash', '-c'])
-        self.assertEqual(args[3:], ['arm', 'auto_mode', 'dlio', '60', '1', '0.1', 'JR81=0.36', 'RR83=0.4'])
+        self.assertEqual(args[3:], ['arm', 'auto_mode', 'dlio', '60', '1', '0.1', '1', 'JR81=0.36', 'RR83=0.4'])
+        # A recorded DLIO session goes with its agent; --no-z-check is the 0.
+        self.assertEqual(sim.arm_args('auto_mode', 'dlio', 60, ['JR81', 'RR83'], {'RR83': 'S-1', 'JR99': 'x'},
+                                      z_check=False)[9:], ['0', 'JR81=0.36', 'RR83=0.4=S-1'])
         self.assertIn("'@@ %s ok mode=AUTO " + sim.ALREADY_AUTO + "'", sim._ARM_PY)   # report_interrupted reads it
-        self.assertTrue(args[2].endswith('exec timeout -k 2 66 python3 -c "$SIM_ARM_PY" "$@"'))
+        # rclpy's start, the 60 s, then the paced leave of 5 entities per agent.
+        self.assertEqual(sim.arm_budget(60, 2), math.ceil(66 + 10 * sim.STATUS_LEAVE_GAP_S + sim.STATUS_LEAVE_PAUSE_S))
+        self.assertEqual(sim.arm_budget(180, 4),
+                         math.ceil(186 + 20 * sim.STATUS_LEAVE_GAP_S + sim.STATUS_LEAVE_PAUSE_S))
+        self.assertTrue(args[2].endswith('exec timeout -k 2 %d python3 -c "$SIM_ARM_PY" "$@"' % sim.arm_budget(60, 2)))
         subprocess.run(['bash', '-n', '-c', args[2]], check=True)
         compile(sim._ARM_PY, '<sim_arm>', 'exec')
         # Ctrl-C finds it by the marker in its command line (python3 -c <script>).
         self.assertTrue(sim._ARM_PY.startswith('# ' + sim.ARM_MARKER))
         P = sim.Proc
         procs = [P(1, 0, 1, 1, '/sbin/docker-init -- sleep infinity'), P(7, 1, 7, 2, 'sleep infinity'),
-                 P(40, 0, 40, 9, 'timeout -k 2 66 python3 -c ' + sim._ARM_PY.replace('\n', ' ') + ' auto_mode'),
+                 P(40, 0, 40, 9, 'timeout -k 2 68 python3 -c ' + sim._ARM_PY.replace('\n', ' ') + ' auto_mode'),
                  P(41, 40, 40, 9, 'python3 -c ' + sim._ARM_PY.replace('\n', ' ') + ' auto_mode dlio 60 1 JR81'),
                  P(50, 0, 50, 9, 'python3 /home/swarm/code/rover_ws/install/lib/acl_ctrl_safety/safety_node')]
         self.assertEqual([p.pid for p in sim.stop_targets(procs, match=sim.ARM_MARKER)[0]], [40, 41])
@@ -2196,6 +2442,7 @@ class Arming(unittest.TestCase):
             text = log.read_text()
         self.assertEqual(seen[0][0], 'sim-drive')
         self.assertEqual(seen[0][1], sim.arm_args('auto_mode', 'dlio', 30, ['JR81', 'RR83']))
+        self.assertEqual(seen[0][2], sim.arm_budget(30, 2) + 14)          # after the container's own timeout
         self.assertEqual(seen[0][3], {'SIM_ARM_PY': sim._ARM_PY, 'RUST_LOG': 'zenoh=error'})
         self.assertEqual(list(res), ['JR81', 'RR83'])                 # the requested agents, in order
         self.assertEqual(res['JR81'].status, 'ok')
@@ -2210,7 +2457,7 @@ class Arming(unittest.TestCase):
         stopped, queries = [], []
 
         def lines(name, args, timeout, env, on_line):
-            service, agents = args[4], [a.split('=')[0] for a in args[9:]]
+            service, agents = args[4], [a.split('=')[0] for a in args[10:]]
             queries.append((service, agents))
             if service == 'auto_mode':
                 on_line('@@ RR83 ok mode=AUTO ' + sim.ALREADY_AUTO)
@@ -2230,7 +2477,11 @@ class Arming(unittest.TestCase):
 
     def test_interrupt_fails_closed(self):
         e, queries, stopped = self.interrupt(['JR81', 'JR82', 'RR83'])
-        self.assertEqual(stopped, [('sim-drive', {'match': sim.ARM_MARKER, 'grace_int': 2, 'grace_term': 2})])
+        # Its Ctrl-C ends the query's wait; it gets the time its paced leave takes (3 agents x 5 entities).
+        self.assertEqual(stopped, [('sim-drive', {'match': sim.ARM_MARKER, 'grace_term': 2,
+                                                  'grace_int': 15 * sim.STATUS_LEAVE_GAP_S + sim.STATUS_LEAVE_PAUSE_S + 2})])
+        self.assertIn('SignalHandlerOptions.NO', sim._ARM_PY)
+        self.assertIn('and not stop:', sim._ARM_PY)
         # JR82 too: the query may have armed it after the client's last line. RR83 was in AUTO before.
         self.assertEqual(queries, [('auto_mode', ['JR81', 'JR82', 'RR83']), ('disarm', ['JR81', 'JR82'])])
         self.assertEqual((e.service, list(e.seen), list(e.undo)), ('auto_mode', ['RR83', 'JR81'], ['JR81', 'JR82']))
@@ -2286,9 +2537,11 @@ class Arming(unittest.TestCase):
 
     def cli(self, argv, isolation=(), results=None, project=('sim-drive', 'sim-gazebo'), raises=None):
         calls = []
+        self.kw = []
 
         def arm_agents(*a, **k):
             calls.append(a)
+            self.kw.append(k)
             if raises is not None:
                 raise raises
             return results
@@ -2344,6 +2597,24 @@ class Arming(unittest.TestCase):
             rc, calls, text = self.cli([verb], isolation=['sim-drive reaches 10.0.0.1/7447 is open'])
             self.assertEqual((rc, calls), (3, []))                 # no ROS session at all
             self.assertIn('isolation: BROKEN', text)
+
+    def test_cli_z_check(self):
+        ok = OrderedDict([('JR81', sim.ArmResult('JR81', 'ok', 'AUTO', 'x'))])
+        rc, calls, text = self.cli(['arm', 'JR81', '--no-z-check'], results=ok)
+        self.assertEqual((rc, calls), (0, [(['JR81'], 'auto_mode', 'dlio', 60.0, None)]))
+        self.assertIs(self.kw[0]['z_check'], False)
+        self.assertIsInstance(self.kw[0]['run_dir'], Path)              # where armed_sessions.json is kept
+        self.assertIn('--no-z-check: arming without the DLIO odom height check', text)
+        rc, calls, text = self.cli(['arm', 'JR81'], results=ok)
+        self.assertIs(self.kw[0]['z_check'], True)
+        self.assertNotIn('--no-z-check', text)
+        # disarm has no such flag, and its query checks no z (gate none).
+        dis = OrderedDict([('JR81', sim.ArmResult('JR81', 'ok', 'DISARMED', 'x'))])
+        rc, calls, _ = self.cli(['disarm', 'JR81'], results=dis)
+        self.assertEqual((rc, calls[0][1:3], self.kw[0]['z_check']), (0, ('disarm', 'none'), True))
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                sim.build_parser().parse_args(['disarm', '--no-z-check'])
 
     def test_up_arms_after_the_panes(self):
         with tempfile.TemporaryDirectory() as d:
@@ -2444,7 +2715,7 @@ class Phase3Cli(unittest.TestCase):
             self.assertIn('sim-dlio-%s bash -c' % a.cls, out)
         self.assertEqual(out.count('ros2 launch rover_control teleop.launch.yaml'), 4)
         self.assertEqual(out.count('dlio_sim.launch.py namespace:='), 4)
-        self.assertIn('not arming: auto_arm is off', out)
+        self.assertIn('before the unpause: arm JR81, JR82, RR83, RR84', out)
         self.assertIn('-> /home/swarm/code/dlio_ws/scripts (ro)', out)
         self.assertIn('after the panes: arm JR81, JR82, RR83, RR84', self.dry_run('odom_eval'))
         self.assertIn('not arming: auto_arm needs', self.dry_run('odom_eval', '--no-arm'))
@@ -2576,8 +2847,9 @@ class Phase4Mapping(unittest.TestCase):
             subprocess.run(['bash', '-n', '-c', inner], check=True)
         # Only global_mapper waits for DLIO's odometry, as on the robot.
         self.assertEqual([p.slug for p in panes if p.waits], ['global-mapper-' + a.name for a in SWAP.agents])
-        self.assertEqual(by['global-mapper-RR84'].waits, 'python3 /home/swarm/code/mapping_ws/install/share/'
-                                                         'rover_bringup/scripts/wait_for_tf.py RR84/odom RR84/base_link')
+        self.assertEqual(robot_gate(by['global-mapper-RR84'].waits), 'python3 /home/swarm/code/mapping_ws/install/'
+                         'share/rover_bringup/scripts/wait_for_tf.py RR84/odom RR84/base_link')
+        self.assertEqual(by['global-mapper-RR84'].waits, sim.verdict_gate(sim.tf_gate(SWAP.agents[3])))
 
     def test_tf_gate_is_the_robots(self):
         script = checkout_file('tmux/mapping_host_tmux.sh')
@@ -3037,9 +3309,10 @@ class PausedBringUp(unittest.TestCase):
     def test_waves(self):
         """Gazebo spawns on a quiet graph; DLIO's inputs come before DLIO's readers; elevation last."""
         st = sim.STACKS
-        self.assertEqual([[s.name for s, _ in w] for w in sim.start_waves([(s, []) for s in st.values()])],
+        every = [(s, []) for s in st.values()]
+        self.assertEqual([[s.name for s, _ in w] for w in sim.start_waves(every)],
                          [['zenoh', 'gazebo'], ['drive', 'frame_align', 'dlio'], ['mapping'], ['elevation'], ['mighty'],
-                          ['rviz']])
+                          ['rviz', 'goals']])
         plan = [(st[n], []) for n in ('elevation', 'zenoh', 'mapping', 'dlio')]
         self.assertEqual([[s.name for s, _ in w] for w in sim.start_waves(plan)],
                          [['zenoh'], ['dlio'], ['mapping'], ['elevation']])
@@ -3082,7 +3355,7 @@ class PausedBringUp(unittest.TestCase):
             self.assertIn('mapping: load not readable', (Path(d) / sim.BRINGUP_LOG).read_text())
             # A pane that ended before its node started is returned at once, without the idle wait.
             ret, out, err = run((12.0, ['mapping/map-fusion-JR81'], []), (4.0, (3.0, 80.0)))
-            self.assertEqual(ret, ['mapping/map-fusion-JR81'])
+            self.assertEqual(ret, [('mapping/map-fusion-JR81', 'ended before its node started')])
             self.assertEqual(seen, [('nodes', ['mapping'])])
 
     def test_bring_up_order(self):
@@ -3093,14 +3366,16 @@ class PausedBringUp(unittest.TestCase):
                  'wait_spawned': lambda log_dir: order.append('spawned') or 8.0,
                  'settle_wave': lambda wave, n, log_dir: order.append('settle ' + '+'.join(s.name for s, _ in wave))
                  or [],
-                 'unpause_physics': lambda ctx, log: order.append('unpause') or 1}
+                 'unpause_physics': lambda ctx, log: order.append('unpause') or 1,
+                 'check_graph': lambda session, stacks: order.append('graph') or []}
         with tempfile.TemporaryDirectory() as d, mock.patch.multiple(sim, **fakes), \
                 contextlib.redirect_stdout(io.StringIO()) as out:
             sim.bring_up(OFFICE, plan, self.ctx, Path(d))
             log = (Path(d) / sim.BRINGUP_LOG).read_text()
         self.assertEqual(order, ['start zenoh', 'start gazebo', 'spawned', 'settle zenoh+gazebo',
                                  'start drive', 'start frame_align', 'start dlio', 'settle drive+frame_align+dlio',
-                                 'start mapping', 'settle mapping', 'start elevation', 'settle elevation', 'unpause'])
+                                 'start mapping', 'settle mapping', 'start elevation', 'settle elevation', 'graph',
+                                 'unpause'])
         self.assertIn('physics unpaused at', out.getvalue())
         self.assertIn('wave 3: starting elevation', log)
         # Without gazebo in this `up`, there is no world to spawn into or unpause.
@@ -3108,22 +3383,85 @@ class PausedBringUp(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d, mock.patch.multiple(sim, **fakes), \
                 contextlib.redirect_stdout(io.StringIO()):
             sim.bring_up(OFFICE, [(st['zenoh'], []), (st['mapping'], [])], self.ctx, Path(d))
-        self.assertEqual(order, ['start zenoh', 'settle zenoh', 'start mapping', 'settle mapping'])
+        self.assertEqual(order, ['start zenoh', 'settle zenoh', 'start mapping', 'settle mapping', 'graph'])
         # A pane that ended before its node started stops `up` after its wave: no later wave, no
         # unpause (the world stays paused, and nothing arms).
         del order[:]
         failing = dict(fakes, settle_wave=lambda wave, n, log_dir: order.append(
-            'settle ' + '+'.join(s.name for s, _ in wave)) or (['dlio/dlio-RR83'] if wave[-1][0].name == 'dlio' else []))
+            'settle ' + '+'.join(s.name for s, _ in wave)) or ([('dlio/dlio-RR83', 'ended before its node started')]
+                                                              if wave[-1][0].name == 'dlio' else []))
         with tempfile.TemporaryDirectory() as d, mock.patch.multiple(sim, **failing), \
                 contextlib.redirect_stdout(io.StringIO()):
-            with self.assertRaisesRegex(sim.SimError, r'ended before starting their node: dlio/dlio-RR83 .*attach dlio\)'
-                                                      r'.*the world stays paused, and mapping, elevation did not start; '
-                                                      r'every safety_node stays DISARMED'):
+            with self.assertRaisesRegex(sim.SimError, r'failed in wave 1: dlio/dlio-RR83 ended before its node started '
+                                                      r'.*attach dlio\).*the world stays paused, and mapping, '
+                                                      r'elevation did not start; every safety_node stays DISARMED'):
                 sim.bring_up(OFFICE, plan, self.ctx, Path(d))
-            self.assertIn('stopping: pane(s) ended before starting their node: dlio/dlio-RR83',
+            self.assertIn('stopping: dlio/dlio-RR83 ended before its node started',
                           (Path(d) / sim.BRINGUP_LOG).read_text())
         self.assertEqual(order, ['start zenoh', 'start gazebo', 'spawned', 'settle zenoh+gazebo', 'start drive',
                                  'start frame_align', 'start dlio', 'settle drive+frame_align+dlio'])
+        # The planner's waves come last, then RViz with the goals, all before the unpause.
+        del order[:]
+        full = plan + [(st[n], []) for n in ('mighty', 'rviz', 'goals')]
+        with tempfile.TemporaryDirectory() as d, mock.patch.multiple(sim, **fakes), \
+                contextlib.redirect_stdout(io.StringIO()):
+            sim.bring_up(OFFICE, full, self.ctx, Path(d))
+        self.assertEqual(order[-7:], ['start mighty', 'settle mighty', 'start rviz', 'start goals', 'settle rviz+goals',
+                                      'graph', 'unpause'])
+        # An edge missing from the graph (a declaration lost while starting) stops `up` before the
+        # arm and the unpause.
+        del order[:]
+        armed = []
+        lost = dict(fakes, check_graph=lambda session, stacks: order.append('graph') or [
+            '/RR83/map_fusion_node is not subscribed to /RR83/elev/occ_2d_topic'])
+        with tempfile.TemporaryDirectory() as d, mock.patch.multiple(sim, **lost), \
+                contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(sim.SimError, r'(?s)graph check: 1 edge.*RR83/map_fusion_node is not subscribed '
+                                                      r'to /RR83/elev/occ_2d_topic.*the world stays paused'):
+                sim.bring_up(OFFICE, full, self.ctx, Path(d), before_unpause=lambda: armed.append(1) or 0)
+        self.assertEqual((order[-1], armed), ('graph', []))
+
+    def test_graph_edges(self):
+        names = [s.name for s in sim.select_stacks(OFFICE, None)]
+        edges = sim.graph_edges(OFFICE, names)
+        self.assertIn(('/RR83/elev/occ_2d_topic', '/RR83/map_fusion_node'), edges)
+        self.assertIn(('/JR81/cmd_vel_auto', '/JR81/safety_node'), edges)
+        self.assertEqual(len(edges), len(sim.GRAPH_EDGES) * len(OFFICE.agents))
+        # The fallback has no map_fusion and no elevation; without the planner, no planner edge.
+        fb = sim.graph_edges(SMOKE, [s.name for s in sim.select_stacks(SMOKE, None)])
+        self.assertFalse([e for e in fb if 'map_fusion_node' in e[1] or 'elevation' in e[1]])
+        self.assertIn(('/JR81/live/occ_2d_topic', '/JR81/persistent_map_node'), fb)
+        part = sim.graph_edges(OFFICE, ['zenoh', 'gazebo', 'drive', 'dlio'])
+        self.assertEqual(sorted({t.split('/', 2)[2] for t, _ in part}), ['livox/lidar'])
+        self.assertEqual(sim.graph_edges(OFFICE, ['zenoh']), [])
+        # Every edge's ends run in the stacks it names (the subscriber's node is one of theirs).
+        for topic, node, need, mode in sim.GRAPH_EDGES:
+            self.assertTrue(set(need) <= set(sim.STACKS), topic)
+            self.assertIn(mode, (None,) + sim.MAPPING_MODES, topic)
+
+    def test_check_graph_reads_the_query(self):
+        calls = []
+
+        class P:
+            returncode = 0
+            stdout = ('@@ /JR81/livox/lidar /JR81/dlio_odom_node ok\n'
+                      '@@ /RR83/livox/lidar /RR83/dlio_odom_node nosub\n')
+        with mock.patch.object(sim, 'dexec', lambda name, args, **kw: calls.append((name, args, kw)) or P()):
+            out = sim.check_graph(SMOKE, ['zenoh', 'gazebo', 'drive', 'dlio'])
+        self.assertEqual(out, ['/RR83/dlio_odom_node is not subscribed to /RR83/livox/lidar'])
+        name, args, kw = calls[0]
+        self.assertEqual(name, sim.QUERY_CONTAINER)
+        self.assertEqual(args[-2:], ['/JR81/livox/lidar|/JR81/dlio_odom_node', '/RR83/livox/lidar|/RR83/dlio_odom_node'])
+        self.assertIn('SIM_GRAPH_PY', dict(kw['env']))
+        # The query itself declares no publisher or subscription, so it has nothing to leave paced.
+        self.assertNotIn('create_subscription', sim._GRAPH_PY)
+        self.assertNotIn('create_publisher', sim._GRAPH_PY)
+        self.assertIn('enable_rosout=False', sim._GRAPH_PY)
+        P.stdout, P.returncode = '', 124
+        with mock.patch.object(sim, 'dexec', lambda name, args, **kw: P()):
+            self.assertEqual(sim.check_graph(SMOKE, ['gazebo', 'dlio']),
+                             ['/JR81/dlio_odom_node on /JR81/livox/lidar: not checked (query exit 124)',
+                              '/RR83/dlio_odom_node on /RR83/livox/lidar: not checked (query exit 124)'])
 
     def test_persistent_map_in_memory(self):
         # save_dir:=none in both modes: no run resumes another's map, nothing is written to
@@ -3167,6 +3505,22 @@ class PausedBringUp(unittest.TestCase):
             self.assertEqual(rc, 0)
             self.assertTrue(out.endswith('elevation_mapping_dlio.launch.py'), out)
 
+    def test_check_kernel_cache(self):
+        # Only a warning: the run works, its first seconds of physics carry the compile burst.
+        for rc, out, warned in ((0, '127\n', False), (0, '0\n', True), (1, '', True)):
+            with mock.patch.object(sim, 'dexec', lambda name, args, **kw: FakeProc(rc, out)), \
+                    contextlib.redirect_stdout(io.StringIO()) as o, contextlib.redirect_stderr(io.StringIO()) as e:
+                sim.check_kernel_cache(OFFICE, self.ctx)
+            self.assertEqual('cupy has no compiled kernels' in e.getvalue(), warned, (rc, out))
+            self.assertEqual('cupy kernel cache: 127 compiled kernels' in o.getvalue(), not warned)
+        with tempfile.TemporaryDirectory() as d:
+            env = dict(os.environ, CUPY_CACHE_DIR=d)
+            count = lambda: subprocess.run(['bash', '-c', sim._KERNEL_CACHE_SH], stdout=subprocess.PIPE, env=env,
+                                           universal_newlines=True).stdout.strip()
+            self.assertEqual(count(), '0')
+            (Path(d) / 'a.cubin').write_text('')
+            self.assertEqual(count(), '1')
+
     def test_fallback_up_needs_no_gpu(self):
         # mapping: fallback on a host without nvidia-smi: no gpu profile, no sim-elevation, and
         # gpu_available() is never asked.
@@ -3193,8 +3547,10 @@ class PausedBringUp(unittest.TestCase):
                 'compose_env': lambda run_dir: {}, 'wait_running': lambda s: None, 'ensure_run_dir': lambda r: None,
                 'check_isolation': lambda: [], 'write_session_file': lambda s, r: None,
                 'rotate_rtf_log': lambda r: None, 'clear_ros_logs': lambda n: None, 'make_log_dir': lambda: logs,
-                'generate_steps': lambda stacks: [], 'bring_up': lambda session, plan, ctx, log_dir: asked.setdefault(
-                    'stacks', [s.name for s, _ in plan]),
+                'generate_steps': lambda stacks: [],
+                'bring_up': lambda session, plan, ctx, log_dir, before_unpause=None: asked.setdefault(
+                    'stacks', [s.name for s, _ in plan]) and (before_unpause() if before_unpause else 0),
+                'arm_after_up': lambda session, log_dir, gate='dlio', run_dir=None: 0,
             }
             with mock.patch.multiple(sim, **patches), mock.patch.dict(os.environ, {'ROVER_SIM_RUN': str(run)}), \
                     mock.patch.object(sim.shutil, 'which', lambda tool: '/usr/bin/' + tool), \
@@ -3230,17 +3586,18 @@ class PausedBringUp(unittest.TestCase):
                 'write_session_file': lambda s, r: None, 'rotate_rtf_log': lambda r: None,
                 'clear_ros_logs': lambda n: None, 'make_log_dir': lambda: logs,
                 'generate_steps': lambda stacks: [lambda s, c: order.append('generate')],
-                'bring_up': lambda session, plan, ctx, log_dir: order.append(
-                    'bring_up ' + ','.join(s.name for s, _ in plan)),
-                'arm_after_up': lambda session, log_dir: order.append('arm') or 0,
+                'bring_up': lambda session, plan, ctx, log_dir, before_unpause=None: order.append(
+                    'bring_up ' + ','.join(s.name for s, _ in plan)) or (before_unpause() if before_unpause else 0),
+                'arm_after_up': lambda session, log_dir, gate='dlio', run_dir=None: order.append('arm ' + gate) or 0,
             }
             with mock.patch.multiple(sim, **patches), mock.patch.dict(os.environ, {'ROVER_SIM_RUN': str(run)}), \
                     mock.patch.object(sim.shutil, 'which', lambda tool: '/usr/bin/' + tool), \
                     contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as err:
                 rc = sim.main(['up', 'odom_eval'])
         self.assertEqual(rc, 0, err.getvalue())
+        # No planner: armed after the unpause, once DLIO tracks.
         self.assertEqual(order, ['compose up', 'generate', 'bring_up zenoh,gazebo,drive,frame_align,dlio,mapping',
-                                 'arm'])
+                                 'arm dlio'])
         self.assertIn('mapping: fallback (NOT PARITY', err.getvalue())     # warned, not just printed
 
 
@@ -3368,6 +3725,1032 @@ class Phase4Status(unittest.TestCase):
                 sim.cmd_status(sim.build_parser().parse_args(['status', '--maps']))
         self.assertIn('mapping: not running (session mapping: fallback)', out.getvalue())
         self.assertNotIn('NOT PARITY', out.getvalue())
+
+
+# ---------------------------------------------------------------------------- Phase 5
+
+def pinned_mighty_file(rel):
+    """A file of the pinned mighty checkout (build_images.sh's), or None."""
+    f = REPO / '.cache' / 'src' / ('mighty@' + sim.read_pins().get('MIGHTY_SHA', '')) / rel
+    return f if f.is_file() else None
+
+
+def goal_relay_module():
+    path = REPO / 'scripts' / 'goal_relay.py'
+    if not path.is_file():
+        return None
+    spec = importlib.util.spec_from_file_location('goal_relay', str(path))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)                                       # its pure part imports without rclpy
+    return mod
+
+
+def swap_session(**over):
+    d = session(demo='swap', **over)
+    d['agents'][0]['goals'] = [[2.0, 1.0]]
+    d['agents'][1]['goals'] = [[0.0, 0.0]]
+    return d
+
+
+def robot_gate(waits):
+    """The robot's own gate inside sim.verdict_gate (the pane goes on after its logged verdict)."""
+    m = re.match(r'\{ g=/tmp/rsim-gate\.\$\$; (.*) 2>&1 \| tee \$g; ', waits)
+    return m.group(1) if m else waits
+
+
+def pane_line(p):
+    """What the pane runs after the router's gate: its own gates (the robot's, unwrapped), then its command."""
+    return (robot_gate(p.waits) + ' && ' if p.waits else '') + p.cmd
+
+
+# Real pane output (Phase 4 log): the gate's warning in colour, the typed command line before it.
+GATE_TIMEOUT = ("\x1b[33m[WARN] [1792407422.257998099] [wait_for_tf]: TIMEOUT after 60.0s; still missing "
+                "[('JR81/map', 'JR81/odom')]; proceeding anyway (degraded)\x1b[0m\r\n")
+GATE_OK = '[INFO] [1792407422.2] [wait_for_tf]: all transforms available; proceeding\r\n'
+TYPED = "docker exec -it sim-mighty bash -c '... ros2 run mighty wait_for_tf.py $ROBOT_NAME/map $ROBOT_NAME/odom ...'\n"
+MARKER = '[rover_sim] node starting at 2026-10-19T12:00:01+0000\r\n'
+
+
+class Phase5Sessions(unittest.TestCase):
+    def test_demo_and_planner(self):
+        s = sim.validate_session(session())
+        self.assertEqual((s.planner, s.demo), (True, 'none'))
+        self.assertEqual(sim.validate_session(swap_session()).demo, 'swap')
+        for bad, why in ((session(demo='tour'), "demo: 'tour' is not one of none, swap, explore"),
+                         (session(planner='yes'), "planner: 'yes' is not true/false"),
+                         (swap_session(planner=False), 'demo: swap needs the planner'),
+                         (session(demo='swap'), 'demo: swap needs goals'),
+                         (dict(swap_session(), demo='explore'), 'demo: explore takes no goals .*: JR81, RR83')):
+            self.assertRegex(errors_of(bad), why)
+        # An agent without goals in a swap stays put; one with goals is enough.
+        d = swap_session()
+        del d['agents'][1]['goals']
+        self.assertEqual(sim.validate_session(d).agents[1].goals, ())
+        j = sim.validate_session(swap_session(planner=True)).to_json()
+        self.assertEqual((j['planner'], j['demo'], j['num_agents']), (True, 'swap', 83))
+        self.assertNotIn('agents_override', j)
+
+    def test_session_json_round_trip(self):
+        for s in (SWAP, SMOKE, OFFICE, sim.load_session('odom_eval')):
+            data = json.loads(json.dumps(dict(s.to_json(), started='2026-10-19T12:00:00+0000')))
+            back = sim.session_from_json(data)
+            self.assertEqual(back, s)
+        over = sim.apply_agents_env(SWAP, 'JR81:jr,RR82:rr')
+        self.assertEqual(sim.session_from_json(json.loads(json.dumps(over.to_json()))), over)
+        with self.assertRaisesRegex(sim.SessionError, 'not a session file'):
+            sim.session_from_json({'name': 'x'})
+        with tempfile.TemporaryDirectory() as d:
+            with self.assertRaisesRegex(sim.SimError, 'no running session'):
+                sim.load_running_session(Path(d))
+            sim.write_session_file(SMOKE, Path(d))
+            self.assertEqual(sim.load_running_session(Path(d)), SMOKE)
+
+    def test_shipped_sessions(self):
+        smoke = SMOKE
+        self.assertEqual((smoke.demo, smoke.auto_arm, smoke.planner), ('swap', True, True))
+        jr, rr = smoke.agents
+        # Each to 1 m beside the other's start (not onto it: it is parked there), mirrored, so the
+        # two paths cross halfway.
+        self.assertEqual((jr.goals, rr.goals), (((rr.x, rr.y + 1.0),), ((jr.x, jr.y + 1.0),)))
+        self.assertEqual((SWAP.demo, SWAP.auto_arm), ('swap', True))
+        self.assertEqual((OFFICE.demo, OFFICE.auto_arm, OFFICE.rviz), ('explore', True, False))
+        oe = sim.load_session('odom_eval')
+        self.assertEqual((oe.planner, oe.demo, oe.auto_arm), (False, 'none', True))
+        # odom_eval.py --drive publishes cmd_vel_auto itself: no mpc there.
+        self.assertNotIn('mighty', [s.name for s in sim.select_stacks(oe)])
+        self.assertEqual([s.name for s in sim.select_stacks(OFFICE)][-2:], ['mighty', 'goals'])   # its first drive
+        self.assertEqual([s.name for s in sim.select_stacks(SWAP)][-2:], ['mighty', 'goals'])
+        # session.json carries what goal_relay.py reads.
+        relay = goal_relay_module()
+        if relay is not None:
+            with tempfile.TemporaryDirectory() as d:
+                sim.write_session_file(SWAP, Path(d))
+                demo, goals = relay.load_session(str(Path(d) / sim.SESSION_FILE))
+            self.assertEqual(demo, 'swap')
+            self.assertEqual(goals, {a.name: [tuple(g) for g in a.goals] for a in SWAP.agents})
+
+
+class AgentsEnv(unittest.TestCase):
+    def test_parse(self):
+        self.assertEqual(sim.parse_agents_env(' JR81:jr, RR82:rr ,'), [('JR81', 'jr', None), ('RR82', 'rr', None)])
+        self.assertEqual(sim.parse_agents_env('JR85:jr:1:-2.5:90'), [('JR85', 'jr', (1.0, -2.5, 90.0))])
+        for bad, why in (('JR81', 'is not NAME:class'), ('JR81:jr:1:2', 'is not NAME:class'),
+                         ('JR81:jr:a:2:3', 'must be numbers'), ('JR81:jr:nan:2:3', 'must be numbers'),
+                         (' , ', 'names no agent')):
+            with self.assertRaisesRegex(sim.SessionError, why, msg=bad):
+                sim.parse_agents_env(bad)
+
+    def test_fewer_take_the_sessions_places(self):
+        s = sim.apply_agents_env(SWAP, 'JR81:jr,RR82:rr')
+        self.assertEqual([(a.name, a.cls) for a in s.agents], [('JR81', 'jr'), ('RR82', 'rr')])
+        for a, slot in zip(s.agents, SWAP.agents):
+            self.assertEqual((a.x, a.y, a.yaw_deg, a.goals), (slot.x, slot.y, slot.yaw_deg, slot.goals))
+        self.assertEqual((s.num_agents, s.agents_env, s.source), (82, 'JR81:jr,RR82:rr', SWAP.source))
+        self.assertEqual(s.to_json()['agents_override'], 'JR81:jr,RR82:rr')
+        # A pose of its own wins, and has no goals.
+        s = sim.apply_agents_env(SWAP, 'JR81:jr,RR82:rr:1.0:1.0:0')
+        self.assertEqual((s.agents[1].x, s.agents[1].y, s.agents[1].goals), (1.0, 1.0, ()))
+        # validate_session's rules still hold.
+        for bad, why in (('JR81:jr,RR81:rr', 'id 81 already used by JR81'), ('JR81:rr', 'needs the name prefix RR'),
+                         ('JX81:jr', 'not a robot class')):
+            with self.assertRaisesRegex(sim.SessionError, why):
+                sim.apply_agents_env(SWAP, bad)
+
+    def test_more_go_on_the_circle(self):
+        names = ['JR81', 'RR82', 'JR83', 'RR84', 'JR85', 'RR86']
+        s = sim.apply_agents_env(SWAP, ','.join('%s:%s' % (n, n[:2].lower()) for n in names))
+        self.assertEqual([a.name for a in s.agents], names)
+        self.assertEqual((s.agents[0].x, s.agents[0].y), (2.83, 2.83))          # where multi_agent_swap's first is
+        boxes = world_boxes(REPO / 'src' / 'rover_sim' / 'worlds' / 'arena.world')
+        for a in s.agents:
+            self.assertAlmostEqual(math.hypot(a.x, a.y), 4.0, delta=0.01)
+            facing = math.degrees(math.atan2(-a.y, -a.x))
+            self.assertAlmostEqual(math.remainder(a.yaw_deg - facing, 360.0), 0.0, delta=0.1)
+            self.assertEqual(a.goals, (tuple(sim.circle_goal('arena', (a.x, a.y), 6)),))   # past the far side
+            self.assertGreater(min(box_distance(a.x, a.y, b) for b in boxes), 2.0, a.name)
+        for k in range(1, sim.CIRCLE_MAX_AGENTS + 1):                         # 2.1 m apart or more
+            pts = sim.circle_layout('arena', k)
+            self.assertTrue(all(math.hypot(p[0] - q[0], p[1] - q[1]) > 2.0 for p in pts for q in pts if p is not q))
+        self.assertIsNone(sim.circle_layout('arena', sim.CIRCLE_MAX_AGENTS + 1))
+        # No swap goal on (or next to) another agent's start, for any count: mighty refuses a terminal
+        # goal on an occupied cell. Four is multi_agent_swap's layout, goals included.
+        for k in range(1, sim.CIRCLE_MAX_AGENTS + 1):
+            pts = sim.circle_layout('arena', k)
+            for p in pts:
+                g = sim.circle_goal('arena', p, k)
+                self.assertAlmostEqual(math.hypot(*g), 4.0, delta=0.01)
+                self.assertGreaterEqual(min(math.hypot(g[0] - q[0], g[1] - q[1]) for q in pts),
+                                        sim.SWAP_GOAL_CLEAR_M - 0.03, (k, p, g))   # poses and goals are cm-rounded
+        four = sim.apply_agents_env(SWAP, 'JR81:jr,JR82:jr,RR83:rr,RR84:rr,JR85:jr')
+        self.assertEqual(len(four.agents), 5)
+        self.assertEqual([list(a.goals[0]) for a in SWAP.agents],
+                         [sim.circle_goal('arena', (a.x, a.y), 4) for a in SWAP.agents])
+        self.assertIsNone(sim.circle_layout('ACL_office_simple', 5))
+        # Explore: no goals on the circle.
+        explore = sim.validate_session(dict(session(world='arena', demo='explore')))
+        self.assertTrue(all(not a.goals for a in sim.apply_agents_env(explore, 'JR81:jr,JR82:jr,JR83:jr').agents))
+
+    def test_office_needs_poses_for_more(self):
+        five = 'JR81:jr,JR82:jr,RR83:rr,RR84:rr,RR85:rr'
+        with self.assertRaisesRegex(sim.SessionError, 'RR85 has no pose: session office_explore places 4 agent'
+                                                      r'\(s\), and world ACL_office_simple has no default layout .* '
+                                                      'give it one as RR85:rr:x:y:yaw_deg'):
+            sim.apply_agents_env(OFFICE, five)
+        s = sim.apply_agents_env(OFFICE, five + ':5.0:-2.0:90')
+        self.assertEqual([(a.x, a.y) for a in s.agents[:4]], [(a.x, a.y) for a in OFFICE.agents])
+        self.assertEqual((s.agents[4].x, s.agents[4].y, s.num_agents), (5.0, -2.0, 85))
+
+    def test_up_and_dry_run(self):
+        with mock.patch.dict(os.environ, {'ROVER_SIM_AGENTS': 'JR81:jr,RR82:rr'}):
+            self.assertEqual([a.name for a in sim.load_up_session('multi_agent_swap').agents], ['JR81', 'RR82'])
+        env = dict(os.environ)
+        env.pop('ROVER_SIM_AGENTS', None)
+        self.assertEqual(len(sim.load_up_session('multi_agent_swap').agents), 4)
+        out = subprocess.run([sys.executable, str(REPO / 'scripts' / 'sim.py'), 'up', 'multi_agent_swap', '--dry-run'],
+                             stdout=subprocess.PIPE, universal_newlines=True, check=True,
+                             env=dict(env, ROVER_SIM_AGENTS='JR81:jr,RR82:rr')).stdout
+        self.assertIn('agents from ROVER_SIM_AGENTS=JR81:jr,RR82:rr', out)
+        self.assertIn('num_agents 82', out)
+        self.assertEqual(out.count('frame_align_publisher.py'), 2)
+        self.assertEqual(out.count('only_nodes:=mighty_node num_agents:=82'), 2)
+        self.assertIn('  RR82  rr  id 82  pose (-2.83, 2.83, -45.0 deg)', out)
+        self.assertNotIn('ROBOT_NAME=JR82', out)
+        self.assertIn('/frame_align/JR81/JR82 (RR82)', out)                   # ego's prefix, the other's id
+
+
+class MightyPanes(unittest.TestCase):
+    ctx = sim.RunContext(run_dir=Path(sim.RUN_DIR_DEFAULT))
+
+    def test_pane_lines_are_mighty_hw_sh(self):
+        script = pinned_mighty_file('docker/mighty_hw.sh')
+        if script is None:
+            self.skipTest('no pinned mighty checkout')
+        text = script.read_text()
+        tf_gate = re.search(r"local tf_gate='([^']*)'", text).group(1)
+        base = re.search(r"local launch_base='([^']*)'", text).group(1)
+        titles = shlex.split(re.search(r'titles=\((.*)\)', text).group(1))
+        lines = [c.replace('${tf_gate}', tf_gate).replace('${launch_base}', base)
+                 for c in re.findall(r'"\$\(dx "(.*)"\)"', text)]
+        self.assertEqual(len(lines), 4)
+        panes = sim.mighty_panes(SWAP, self.ctx)
+        for a in SWAP.agents:
+            mine = [p for p in panes if p.window == a.name]
+            self.assertEqual([p.title for p in mine], ['%s %s' % (a.name, t) for t in titles])
+            # The robot's lines exactly, plus num_agents:= (the highest id).
+            self.assertEqual([pane_line(p) for p in mine], [l + ' num_agents:=84' for l in lines])
+        self.assertEqual(tf_gate, sim.MIGHTY_TF_GATE + ' && ')
+        self.assertEqual(base, sim.MIGHTY_LAUNCH)
+        # Its pane gate is the router's port, which every sim pane waits for too.
+        self.assertIn('echo >/dev/tcp/127.0.0.1/${ZENOH_ROUTER_PORT}', text)
+
+    def test_pane_lines_are_jr02s(self):
+        """tools/reference/jr02 (tracked): JR02's own process list, names substituted."""
+        top = (REPO / 'tools' / 'reference' / 'jr02' / 'processes' / 'docker_top_hw-mighty.txt').read_text()
+        robot = dict((re.search(r'only_nodes:=(\S+)', l).group(1), l[l.index('ros2 launch'):].strip())
+                     for l in top.splitlines() if 'onboard_mighty.launch.py' in l)
+        self.assertEqual(sorted(robot), sorted(m.node for m in sim.MIGHTY_PANES))
+        for p in sim.mighty_panes(SWAP, self.ctx):
+            a = next(x for x in SWAP.agents if x.name == p.window)
+            node = re.search(r'only_nodes:=(\S+)', p.cmd).group(1)
+            self.assertEqual(p.cmd.replace('$ROBOT_NAME', a.name),
+                             robot[node].replace('JR02', a.name) + ' num_agents:=%d' % SWAP.num_agents)
+
+    def test_panes(self):
+        panes = sim.mighty_panes(SWAP, self.ctx)
+        self.assertEqual([(w, [p.slug for p in ps]) for w, ps in sim.tmux_windows(panes)],
+                         [(a.name, ['mighty-node-' + a.name, 'odom-to-state-' + a.name, 'mpc-' + a.name,
+                                    'goal-selector-' + a.name]) for a in SWAP.agents])
+        by = {p.slug: p for p in panes}
+        for a in SWAP.agents:
+            for p in (by['mighty-node-' + a.name], by['mpc-' + a.name]):
+                self.assertEqual((p.waits, p.strict_tf_gate), (sim.verdict_gate(sim.MIGHTY_TF_GATE), True))
+            for p in (by['odom-to-state-' + a.name], by['goal-selector-' + a.name]):
+                self.assertEqual((p.waits, p.strict_tf_gate, p.ready), ('', False, ''))
+            self.assertEqual(by['mpc-' + a.name].ready, sim.MPC_READY)
+            self.assertEqual(by['mighty-node-' + a.name].ready, '')
+        for p in panes:
+            a = next(x for x in SWAP.agents if x.name == p.window)
+            self.assertEqual((p.container, p.env, p.gate), ('sim-mighty', sim.robot_env(a), True))
+            self.assertIn(('ROBOT_NAME', a.name), p.env)
+            self.assertNotIn('use_ground_robot', p.cmd)                # it switches the base config
+            self.assertTrue(p.cmd.endswith(' num_agents:=84'))
+            inner = inner_of(p)
+            self.assertTrue(inner.endswith(sim.node_marker() + ' && ' + p.cmd))
+            self.assertIn('until (exec 3<>/dev/tcp/sim-drive/7447', inner)
+            subprocess.run(['bash', '-n', '-c', inner], check=True)
+        # $ROBOT_NAME is the container's: the pane's env names the agent.
+        p = by['mpc-RR83']
+        env = dict(os.environ, **dict(p.env))
+        out = subprocess.run(['bash', '-c', 'f() { printf "%s\\n" "$@"; }; f ' + p.cmd[len('ros2 launch '):]],
+                             stdout=subprocess.PIPE, universal_newlines=True, env=env).stdout
+        self.assertIn('namespace:=RR83', out.split('\n'))
+        gate = subprocess.run(['bash', '-c', 'echo ' + robot_gate(p.waits)], stdout=subprocess.PIPE, universal_newlines=True,
+                              env=dict(os.environ, **dict(p.env))).stdout
+        self.assertEqual(gate, 'ros2 run mighty wait_for_tf.py RR83/map RR83/odom\n')
+        # Fewer agents: the session's highest id.
+        self.assertTrue(all(p.cmd.endswith(' num_agents:=83') for p in sim.mighty_panes(SMOKE, self.ctx)))
+
+    def test_verdict_gate(self):
+        # The robot's wait_for_tf.py gate, but its verdict decides, not its exit: a session that
+        # fails to close after "proceeding" (rclpy.shutdown raised, 2026-10-20) must not stop the pane.
+        lines = {'ok': '[INFO] [1.0] [wait_for_tf]: all transforms available; proceeding',
+                 'degraded': ("\x1b[33m[WARN] [1.0] [wait_for_tf]: TIMEOUT after 60.0s; still missing x; "
+                              "proceeding anyway (degraded)\x1b[0m"),
+                 'none': '[INFO] [1.0] [wait_for_tf]: waiting for transforms'}
+        for verdict, code, starts in (('ok', 0, True), ('ok', 1, True), ('degraded', 1, True), ('none', 1, False),
+                                      ('none', 0, True)):
+            cmd = 'bash -c %s' % shlex.quote('echo %s; exit %d' % (shlex.quote(lines[verdict]), code))
+            r = subprocess.run(['bash', '-c', sim.verdict_gate(cmd) + ' && echo NODE'], stdout=subprocess.PIPE,
+                               universal_newlines=True)
+            self.assertEqual(('NODE' in r.stdout, r.returncode == 0), (starts, starts), (verdict, code, r.stdout))
+            self.assertIn(lines[verdict], r.stdout)                      # the pane still shows the gate's output
+            self.assertEqual('after its verdict' in r.stdout, code != 0 and starts, (verdict, code))
+        self.assertTrue(sim.WAIT_FOR_TF_RE.search(lines['ok']) and sim.WAIT_FOR_TF_RE.search(lines['degraded']))
+
+    def test_parity_contract(self):
+        nodes = yaml.safe_load((JR_REF / 'manifest.yaml').read_text())['nodes']
+        for name in ('mighty_node', 'goal_selector', 'mpc', 'convert_odom_to_state'):
+            self.assertEqual(nodes[name]['container'], 'sim-mighty')
+        allowed = yaml.safe_load((JR_REF / 'allowed_deviations.yaml').read_text())
+        self.assertIn('num_agents', allowed['all']['params']['mighty_node'])
+        self.assertEqual(sim.mighty_cmd('mpc', 84), sim.MIGHTY_LAUNCH + ' only_nodes:=mpc num_agents:=84')
+
+    def test_launch_file_takes_these_arguments(self):
+        launch = pinned_mighty_file('launch/onboard_mighty.launch.py')
+        if launch is None:
+            self.skipTest('no pinned mighty checkout')
+        declared = set(re.findall(r"DeclareLaunchArgument\('(\w+)'", launch.read_text()))
+        used = set(re.findall(r' (\w+):=', sim.mighty_cmd('mpc', 84)))
+        self.assertEqual(used - declared, set())               # ros2 launch would silently ignore one
+        self.assertIn('only_nodes', declared)
+        keys = re.search(r'keyed = \{(.*?)\}', launch.read_text(), re.S).group(1)
+        for m in sim.MIGHTY_PANES:
+            self.assertIn("'%s'" % m.node, keys)
+        # mpc's ready line is the one mpc_node logs after its NLP build.
+        self.assertTrue(re.search(sim.MPC_READY, '[mpc_node-1] [INFO] [1.2] [JR81.mpc]: MPC controller started.'))
+
+
+class TfGatesAndReady(unittest.TestCase):
+    def test_node_started_and_gate_result(self):
+        self.assertFalse(sim.node_started(TYPED))
+        self.assertTrue(sim.node_started(TYPED + MARKER))
+        self.assertFalse(sim.node_started(TYPED + MARKER, sim.MPC_READY))
+        ready = '[mpc_node-1] [INFO] [1] [JR81.mpc]: MPC controller started.\n'
+        self.assertTrue(sim.node_started(TYPED + MARKER + ready, sim.MPC_READY))
+        # A restarted pane: the ready line must follow its last marker.
+        self.assertFalse(sim.node_started(MARKER + ready + 'Ctrl-C\n' + MARKER, sim.MPC_READY))
+        self.assertIsNone(sim.tf_gate_result(TYPED + MARKER))
+        self.assertEqual(sim.tf_gate_result(TYPED + GATE_TIMEOUT + MARKER), 'degraded')
+        self.assertEqual(sim.tf_gate_result(GATE_TIMEOUT + MARKER + GATE_OK + MARKER), 'ok')
+        self.assertEqual(sim.tf_gate_result(GATE_OK + GATE_TIMEOUT), 'degraded')
+        # mapping_ws's copy logs the same lines.
+        copy = REPO / '.cache' / 'src' / ('mapping_ws@' + sim.read_pins().get('MAPPING_SHA', '')) / 'scripts' / \
+            'wait_for_tf.py'
+        mine = pinned_mighty_file('scripts/wait_for_tf.py')
+        for f in (copy, mine):
+            if f is not None and f.is_file():
+                src = f.read_text()
+                self.assertIn("'all transforms available; proceeding'", src)
+                self.assertIn("proceeding anyway (degraded)'", src)
+
+    def test_wait_nodes_started_waits_for_ready(self):
+        st = sim.STACKS
+        mpc = sim.Pane('m', 'mpc-JR81', 'sim-mighty', 'true', ready=sim.MPC_READY)
+        plan = [(st['mighty'], [mpc])]
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / 'mighty').mkdir()
+            log = Path(d) / 'mighty' / 'mpc-JR81.log'
+            log.write_text(TYPED + MARKER)
+            with mock.patch.object(sim, 'pane_commands', lambda: {('rsim-mighty', 'mpc-JR81'): 'docker'}), \
+                    mock.patch.object(sim, 'SPAWN_PANE_GRACE_S', 0), mock.patch.object(sim.time, 'sleep', lambda s: None):
+                self.assertEqual(sim.wait_nodes_started(plan, Path(d), timeout=0)[1:], ([], ['mighty/mpc-JR81']))
+                log.write_text(TYPED + MARKER + 'MPC controller started.\n')
+                self.assertEqual(sim.wait_nodes_started(plan, Path(d), timeout=0)[1:], ([], []))
+
+    def test_settle_wave_stops_on_a_strict_gate(self):
+        st = sim.STACKS
+        strict = sim.Pane('p', 'mighty-node-JR81', 'sim-mighty', 'true', waits='gate', strict_tf_gate=True)
+        loose = sim.Pane('g', 'global-mapper-JR81', 'sim-mapping', 'true', waits='gate')
+        with tempfile.TemporaryDirectory() as d:
+            for stack, slug in (('mighty', 'mighty-node-JR81'), ('mapping', 'global-mapper-JR81')):
+                (Path(d) / stack).mkdir()
+                (Path(d) / stack / (slug + '.log')).write_text(TYPED + GATE_TIMEOUT + MARKER)
+            fakes = {'wait_nodes_started': lambda wave, log_dir: (61.0, [], []),
+                     'wait_idle': lambda *a, **k: (4.0, (3.0, 80.0)), 'running_sim_containers': lambda: ['sim-drive'],
+                     'router_cpu_seconds': lambda: 1.0}
+            with mock.patch.multiple(sim, **fakes), contextlib.redirect_stdout(io.StringIO()):
+                # The global_mapper gate always times out while paused: logged, not a failure.
+                self.assertEqual(sim.settle_wave([(st['mapping'], [loose])], 4, Path(d)), [])
+                ret = sim.settle_wave([(st['mighty'], [strict])], 4, Path(d))
+            self.assertEqual(ret, [('mighty/mighty-node-JR81',
+                                    'its TF gate timed out (wait_for_tf.py exits 0 and starts the node anyway)')])
+            log = (Path(d) / sim.BRINGUP_LOG).read_text()
+            self.assertIn('mapping/global-mapper-JR81: its wait_for_tf.py gate timed out and the node started '
+                          'degraded\n', log)
+            self.assertIn('mighty/mighty-node-JR81: its wait_for_tf.py gate timed out and the node started degraded '
+                          '(strict: stopping)', log)
+            (Path(d) / 'mighty' / 'mighty-node-JR81.log').write_text(TYPED + GATE_OK + MARKER)
+            self.assertEqual(sim.degraded_tf_gates([(st['mighty'], [strict])], Path(d)), [])
+
+    def test_start_stack_marks_strict_panes(self):
+        calls = []
+
+        class Done:
+            stdout = '%1\n%2\n'
+            returncode = 0
+        with tempfile.TemporaryDirectory() as d, \
+                mock.patch.object(sim, 'tmux', lambda *a, **k: (calls.append(a), Done())[1]):
+            sim.start_stack(sim.STACKS['mighty'], [sim.Pane('a', 'a', 'sim-mighty', 'true', strict_tf_gate=True),
+                                                   sim.Pane('b', 'b', 'sim-mighty', 'true')], Path(d))
+        self.assertIn(('set-option', '-p', '-t', '%1', '@rsim_tf_gate', 'strict'), calls)
+        self.assertFalse([c for c in calls if '%2' in c and '@rsim_tf_gate' in c])
+
+
+class RvizConfig(unittest.TestCase):
+    ctx = sim.RunContext(run_dir=Path(sim.RUN_DIR_DEFAULT))
+
+    def groups(self, s):
+        doc = yaml.safe_load(sim.rviz_config(s))
+        return doc, OrderedDict((g['Name'], g['Displays']) for g in doc['Visualization Manager']['Displays']
+                                if g['Class'] == 'rviz_common/Group')
+
+    def test_config(self):
+        for s in (SWAP, SMOKE, OFFICE):
+            text = sim.rviz_config(s)
+            self.assertNotRegex(text, r'@[A-Z_]+@')
+            self.assertTrue(text.startswith('# rover_sim RViz config for session %s (%s)' % (s.name, s.source)))
+            doc, groups = self.groups(s)
+            vm = doc['Visualization Manager']
+            self.assertEqual(vm['Global Options']['Fixed Frame'], 'world')
+            self.assertEqual(vm['Global Options']['Frame Rate'], 10)
+            goal = [t for t in vm['Tools'] if t['Class'] == 'rviz_default_plugins/SetGoal']
+            self.assertEqual([t['Topic']['Value'] for t in goal], ['/sim/goal'])
+            self.assertEqual(list(groups), [a.name for a in s.agents])
+            colors = set()
+            for a in s.agents:
+                displays = groups[a.name]
+                topics = [d['Topic']['Value'] for d in displays if 'Topic' in d]
+                self.assertTrue(all(t.startswith('/%s/' % a.name) for t in topics), topics)
+                on = sorted(d['Topic']['Value'][len(a.name) + 2:] for d in displays if d['Enabled'] and 'Topic' in d)
+                want = ['dlio/odom_node/pointcloud/deskewed', 'occ_2d_topic', 'persistent_map/grid', 'term_goal',
+                        'traj_committed_colored'] + (['exploration/frontiers'] if s.demo == 'explore' else [])
+                self.assertEqual(on, sorted(want), (s.name, a.name))
+                axes = [d for d in displays if d['Class'] == 'rviz_default_plugins/Axes']
+                self.assertEqual([d['Reference Frame'] for d in axes], ['%s/base_link' % a.name])
+                for d in displays:
+                    self.assertEqual(d['Enabled'], d['Value'], d['Name'])
+                    if 'Topic' in d:
+                        # the latched persistent map transient local, everything else volatile
+                        self.assertEqual(d['Topic']['Durability Policy'],
+                                         'Transient Local' if d['Topic']['Value'].endswith('persistent_map/grid')
+                                         else 'Volatile', d['Name'])
+                colors.add(next(d['Color'] for d in displays if d['Class'] == 'rviz_default_plugins/PointCloud2'))
+                self.assertEqual(any('/elev/' in t for t in topics), s.mapping == 'gpu')
+            self.assertEqual(len(colors), len(s.agents))
+        # mighty's own names for what it publishes (mighty_node.cpp, goal_selector_node.cpp).
+        src = pinned_mighty_file('src/mighty/mighty_node.cpp')
+        gs = pinned_mighty_file('src/goal_selector/goal_selector_node.cpp')
+        if src is not None and gs is not None:
+            published = set(re.findall(r'"([\w/]+)"', src.read_text() + gs.read_text()))
+            for name in ('traj_committed_colored', 'hgp_path_marker', 'point_G_term', 'term_goal',
+                         'exploration/frontiers', 'exploration/current_goal'):
+                self.assertIn(name, published)
+
+    def test_view(self):
+        self.assertEqual(sim.rviz_view(SWAP), (0.0, 0.0, 22.0))                # the arena's 16 m walls
+        fx, fy, dist = sim.rviz_view(OFFICE)
+        self.assertAlmostEqual(fx, sum(a.x for a in OFFICE.agents) / 4)
+        self.assertGreater(dist, 1.25 * (max(a.x for a in OFFICE.agents) - min(a.x for a in OFFICE.agents)))
+
+    def test_templates(self):
+        self.assertEqual(sorted(p.name for p in sim.RVIZ_TEMPLATES.iterdir()), sorted(sim.RVIZ_PARTS))
+        with self.assertRaisesRegex(sim.SimError, r'x.part: no value for @NS@'):
+            sim.fill_template('a @NS@ b', {}, 'x.part')
+        with tempfile.TemporaryDirectory() as d:
+            for n in sim.RVIZ_PARTS:
+                shutil.copy(str(sim.RVIZ_TEMPLATES / n), str(Path(d) / n))
+            (Path(d) / 'footer.rviz.part').write_text((sim.RVIZ_TEMPLATES / 'footer.rviz.part').read_text()
+                                                      + 'Extra: @OOPS@\n')
+            with self.assertRaisesRegex(sim.SimError, 'footer.rviz.part: no value for @OOPS@'):
+                sim.rviz_config(SWAP, Path(d))
+            (Path(d) / 'agent.rviz.part').unlink()
+            with self.assertRaisesRegex(sim.SimError, 'RViz template .*agent.rviz.part'):
+                sim.rviz_config(SWAP, Path(d))
+
+    def test_write_and_pane(self):
+        with tempfile.TemporaryDirectory() as d:
+            out = Path(d) / 'rviz'
+            out.mkdir()
+            (out / 'stale.rviz').write_text('x')
+            with contextlib.redirect_stdout(io.StringIO()):
+                sim.write_rviz_config(SWAP, sim.RunContext(run_dir=Path(d)))
+            self.assertEqual([p.name for p in out.iterdir()], ['session.rviz'])
+            self.assertEqual((out / 'session.rviz').read_text(), sim.rviz_config(SWAP))
+        s = sim.validate_session(session(rviz=True))
+        (p,) = sim.rviz_panes(s, self.ctx)
+        self.assertEqual((p.container, p.slug, p.window), ('sim-gazebo', 'rviz', 'rviz'))
+        self.assertEqual(p.cmd, sim.pin_self('rest', self.ctx) + ' && rviz2 -d /rover_sim/run/rviz/session.rviz')
+        self.assertIn(sim.RESTARTABLE['rviz'], p.cmd)
+        subprocess.run(['bash', '-n', '-c', inner_of(p)], check=True)
+        st = sim.STACKS['rviz']
+        self.assertEqual((st.generate, st.wave, st.needs_display(s)), ((sim.write_rviz_config,), 5, True))
+
+
+class GoalsStack(unittest.TestCase):
+    ctx = sim.RunContext(run_dir=Path(sim.RUN_DIR_DEFAULT))
+
+    def test_pane(self):
+        (p,) = sim.goals_panes(SWAP, self.ctx)
+        self.assertEqual((p.container, p.slug, p.window, p.env), ('sim-mighty', 'goal-relay', 'goals', ()))
+        self.assertEqual(p.cmd, 'python3 /rover_sim/scripts/goal_relay.py --spawn /rover_sim/run/spawn.yaml '
+                                '--session /rover_sim/run/session.json --mode swap')
+        self.assertIn(sim.RESTARTABLE['goals'], p.cmd)
+        subprocess.run(['bash', '-n', '-c', inner_of(p)], check=True)
+        self.assertEqual([sim.goal_mode(s) for s in (SWAP, OFFICE, sim.validate_session(session()))],
+                         ['swap', 'explore', 'rviz'])
+        relay = goal_relay_module()
+        if relay is None:
+            self.skipTest('no scripts/goal_relay.py')
+        args = relay.build_parser().parse_args(shlex.split(p.cmd)[2:])
+        self.assertEqual((args.mode, args.spawn, args.session), ('swap', '/rover_sim/run/spawn.yaml',
+                                                                 '/rover_sim/run/session.json'))
+        self.assertEqual(relay.SESSION_DEMO_MODE, dict(sim.GOAL_MODES))
+        self.assertEqual(relay.GOAL_TOPIC, sim.GOAL_TOPIC)
+        self.assertEqual(relay.FIRST_DRIVE_M, sim.GOAL_RELAY_FIRST_DRIVE_M)
+        self.assertEqual((relay.LEAVE_GAP_S, relay.LEAVE_PAUSE_S), (sim.STATUS_LEAVE_GAP_S, sim.STATUS_LEAVE_PAUSE_S))
+
+    def test_check_goal_relay(self):
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(sim, 'REPO', Path(d)):
+            with self.assertRaisesRegex(sim.SimError, 'no scripts/goal_relay.py'):
+                sim.check_goal_relay(SWAP, self.ctx)
+            (Path(d) / 'scripts').mkdir()
+            (Path(d) / 'scripts' / 'goal_relay.py').write_text('')
+            sim.check_goal_relay(SWAP, self.ctx)
+
+    def test_up_starts_goals_paused(self):
+        """goal_relay.py joins in the last paused wave and waits for AUTO itself: `up` starts nothing
+        once physics runs, whether or not it arms."""
+        order = []
+
+        def up(argv, arm_rc):
+            del order[:]
+            with tempfile.TemporaryDirectory() as d:
+                run, logs = Path(d) / 'run', Path(d) / 'logs'
+                logs.mkdir()
+                patches = {
+                    'compose_images': lambda profiles, run_dir: OrderedDict((n, 'img') for n in sim.CONTAINERS),
+                    'check_images': lambda used: None, 'image_provenance': lambda used: [],
+                    'gpu_available': lambda: True,
+                    'mapping_mounts_problem': lambda pins, services: None, 'dlio_scripts_problem': lambda pins: None,
+                    'mapping_config_problem': lambda session, pins: None,
+                    'tmux_sessions': lambda: [], 'running_sim_containers': lambda: [], 'busy_containers': lambda n: [],
+                    'prepare_run_dir': lambda r: None, 'sh': lambda *a, **k: None, 'compose_env': lambda run_dir: {},
+                    'wait_running': lambda s: None, 'ensure_run_dir': lambda r: None, 'check_isolation': lambda: [],
+                    'write_session_file': lambda s, r: None, 'rotate_rtf_log': lambda r: None,
+                    'clear_ros_logs': lambda n: None, 'make_log_dir': lambda: logs, 'generate_steps': lambda stacks: [],
+                    'bring_up': lambda session, plan, ctx, log_dir, before_unpause=None: order.append(
+                        'bring_up ' + ','.join(s.name for s, _ in plan)) or (before_unpause() if before_unpause else 0),
+                    'arm_after_up': lambda session, log_dir, gate='dlio', run_dir=None: order.append('arm ' + gate) or arm_rc,
+                }
+                with mock.patch.multiple(sim, **patches), mock.patch.dict(os.environ, {'ROVER_SIM_RUN': str(run)}), \
+                        mock.patch.object(sim.shutil, 'which', lambda tool: '/usr/bin/' + tool), \
+                        contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    return sim.main(argv)
+        # A planner session arms inside bring_up, before the unpause, without the DLIO gate but
+        # recording each agent's DLIO session (gate session), so a later re-arm only warns on drift.
+        self.assertEqual(up(['up', 'multi_agent_swap'], 0), 0)
+        self.assertEqual(order, ['bring_up zenoh,gazebo,drive,frame_align,dlio,mapping,elevation,mighty,goals',
+                                 'arm session'])
+        self.assertEqual(up(['up', 'multi_agent_swap'], 1), 1)
+        self.assertEqual(order[-1], 'arm session')
+        self.assertEqual(up(['up', 'multi_agent_swap'], 130), 130)         # Ctrl-C while arming: nothing more
+        self.assertEqual(order[-1], 'arm session')
+        self.assertEqual(up(['up', 'multi_agent_swap', '--no-arm'], 0), 0)
+        self.assertEqual(order, ['bring_up zenoh,gazebo,drive,frame_align,dlio,mapping,elevation,mighty,goals'])
+        self.assertEqual(up(['up', 'office_explore'], 0), 0)                # explore: goal_relay's first drive
+        self.assertEqual(order, ['bring_up zenoh,gazebo,drive,frame_align,dlio,mapping,elevation,mighty,goals',
+                                 'arm session'])
+
+
+class StartCommand(unittest.TestCase):
+    def start(self, argv, isolation=(), project=('sim-drive', 'sim-gazebo', 'sim-mighty'), s=SWAP, nodes=(1.0, [], [])):
+        calls = []
+        with tempfile.TemporaryDirectory() as d:
+            run, logs = Path(d) / 'run', Path(d) / 'logs'
+            run.mkdir()
+            (logs / '20261019_120000' / 'rviz').mkdir(parents=True)
+            (logs / '20261019_120000' / 'rviz' / 'rviz.log').write_text('old run\n')
+            (logs / 'latest').symlink_to('20261019_120000')
+            (run / 'session.json').write_text(json.dumps(s.to_json()))
+            patches = {'running_sim_containers': lambda: list(project), 'resolve_run_dir': lambda: run,
+                       'check_isolation': lambda: list(isolation), 'tmux_sessions': lambda: ['rsim-mighty'],
+                       'LOG_ROOT': logs, 'grant_x_access': lambda: calls.append('xhost'),
+                       'stop_processes': lambda name, **kw: calls.append(('stop', name, kw['match'])) or 1,
+                       'start_stack': lambda st, panes, log_dir: calls.append(
+                           ('start', st.name, [p.slug for p in panes], log_dir)) or 'rsim-' + st.name,
+                       'wait_nodes_started': lambda plan, log_dir, timeout: nodes}
+            out, err = io.StringIO(), io.StringIO()
+            with mock.patch.multiple(sim, **patches), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                rc = sim.main(argv)
+            files = sorted(str(p.relative_to(d)) for p in Path(d).rglob('*') if p.is_file())
+        return rc, calls, out.getvalue() + err.getvalue(), files
+
+    def test_rviz(self):
+        rc, calls, text, files = self.start(['start', 'rviz'])
+        self.assertEqual(rc, 0, text)
+        self.assertEqual(calls[0], ('stop', 'sim-gazebo', 'rviz2 -d /rover_sim/run/rviz/session.rviz'))
+        self.assertEqual(calls[1], 'xhost')
+        self.assertEqual(calls[2][:3], ('start', 'rviz', ['rviz']))
+        self.assertTrue(str(calls[2][3]).endswith('20261019_120000'))       # the running session's log dir
+        self.assertIn('run/rviz/session.rviz', files)                      # the session has rviz: false
+        self.assertTrue([f for f in files if re.match(r'logs/20261019_120000/rviz/rviz\.\d{8}_\d{6}\.log$', f)])
+        self.assertIn('joins the running graph', text)
+
+    def test_goals_and_refusals(self):
+        rc, calls, text, _ = self.start(['start', 'goals'])
+        self.assertEqual(rc, 0, text)
+        self.assertEqual([c[:3] for c in calls], [('stop', 'sim-mighty', '/goal_relay.py '),
+                                                  ('start', 'goals', ['goal-relay'])])
+        rc, calls, text, _ = self.start(['start', 'goals'], s=sim.load_session('odom_eval'))
+        self.assertEqual((rc, calls), (1, []))
+        self.assertIn('runs no planner', text)
+        rc, calls, text, _ = self.start(['start', 'rviz'], isolation=['network rover-sim is not internal'])
+        self.assertEqual((rc, calls), (3, []))                               # no ROS session at all
+        self.assertIn('isolation: BROKEN', text)
+        rc, calls, text, _ = self.start(['start', 'rviz'], project=('sim-drive',))
+        self.assertEqual((rc, calls), (1, []))
+        self.assertIn('sim-gazebo of project rover-sim-stack is not running', text)
+        rc, calls, text, _ = self.start(['start', 'goals'], nodes=(60.0, ['goals/goal-relay'], []))
+        self.assertEqual(rc, 1)
+        self.assertIn('ended before starting their node', text)
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                sim.build_parser().parse_args(['start', 'mighty'])        # only the restartable ones
+
+
+class Phase5Status(unittest.TestCase):
+    def test_specs_and_lines(self):
+        self.assertEqual(sim.status_specs(['JR81'], ['mighty']), ['twist:/JR81/cmd_vel_auto', 'bool:/JR81/map_hold'])
+        vals = sim.parse_status('@@ /JR81/cmd_vel_auto 30.00 90 0.420 -0.100\n@@ /JR81/map_hold false\n'
+                                '@@ /RR83/cmd_vel_auto\n@@ /RR83/map_hold true\n')
+        lines = sim.agent_lines(['JR81', 'RR83', 'RR84'], vals, {'mighty'})
+        self.assertEqual(lines[0], 'JR81  planner: cmd_vel_auto 30 Hz (v 0.42 m/s, w -0.10 rad/s), map_hold off')
+        self.assertEqual(lines[1], 'RR83  planner: cmd_vel_auto: none in 8 s (mpc running? scripts/sim.py attach '
+                                   'mighty), map_hold ON: mighty holds the agent, its maps are stale')
+        self.assertIn('no map_hold in 8 s (mighty_node running?', lines[2])
+        both = sim.agent_lines(['JR81'], dict(vals, **sim.parse_status('@@ /JR81/mode AUTO\n')), {'drive', 'mighty'})[0]
+        self.assertTrue(both.startswith('JR81  safety AUTO,  planner: cmd_vel_auto 30 Hz'), both)
+
+    def test_query_reads_twist_and_bool(self):
+        world = {'pubs': {'/JR81/cmd_vel_auto': {'hz': 30, 'v': 0.25, 'w': 0.5},
+                          '/JR81/map_hold': {'hz': 5, 'value': False}}}
+        specs = ['twist:/JR81/cmd_vel_auto', 'bool:/JR81/map_hold', 'twist:/RR83/cmd_vel_auto', 'bool:/RR83/map_hold']
+        vals = sim.parse_status(run_with_fake_ros(sim._STATUS_PY, ['1.5', '0.5'] + specs, world))
+        hz, n, v, w = vals['/JR81/cmd_vel_auto']
+        self.assertGreater(float(hz), 10)
+        self.assertEqual((float(v), float(w)), (0.25, 0.5))
+        self.assertEqual(vals['/JR81/map_hold'], ['false'])
+        self.assertEqual((vals['/RR83/cmd_vel_auto'], vals['/RR83/map_hold']), ([], []))
+        # A held agent's map_hold is one value, like the mode: the query does not wait for more.
+        held = {'pubs': {'/JR81/map_hold': {'hz': 50, 'value': True}}}
+        t0 = time.time()
+        vals = sim.parse_status(run_with_fake_ros(sim._STATUS_PY, ['5', '0.3', 'bool:/JR81/map_hold'], held))
+        self.assertLess(time.time() - t0, 4.0)
+        self.assertEqual(vals['/JR81/map_hold'], ['true'])
+
+    def test_status_shows_the_planner_and_a_degraded_gate(self):
+        class Panes:
+            returncode = 0
+            stdout = ('rsim-mighty\tJR81\t0\tJR81 MIGHTY planner\tdocker\tmighty-node-JR81\tstrict\n'
+                      'rsim-mighty\tJR81\t2\tJR81 MPC\tdocker\tmpc-JR81\tstrict\n'
+                      'rsim-mighty\tJR81\t1\tJR81 convert_odom_to_state\tdocker\todom-to-state-JR81\t\n'
+                      'rsim-drive\tteleop\t0\tx\tdocker\tteleop-safety-JR81\t\n')
+        with tempfile.TemporaryDirectory() as d:
+            run, logs = Path(d) / 'run', Path(d) / 'logs'
+            run.mkdir()
+            (logs / 'x' / 'mighty').mkdir(parents=True)
+            (logs / 'latest').symlink_to('x')
+            (logs / 'x' / 'mighty' / 'mighty-node-JR81.log').write_text(TYPED + GATE_TIMEOUT + MARKER)
+            (logs / 'x' / 'mighty' / 'mpc-JR81.log').write_text(TYPED + GATE_OK + MARKER)
+            (run / 'session.json').write_text(json.dumps(SMOKE.to_json()))
+            asked = []
+            with mock.patch.multiple(sim, running_sim_containers=lambda: ['sim-drive'], LOG_ROOT=logs,
+                                     docker_inspect=lambda kind, name: None, resolve_run_dir=lambda: run,
+                                     check_isolation=lambda: [], router_up=lambda: True,
+                                     link_snapshot=lambda up: {'router': 1, 'p2p': 0, 'listen': 1, 'syn_sent': 0},
+                                     tmux=lambda *a, **k: Panes(), status_values=lambda specs: asked.append(specs) or
+                                     sim.parse_status('@@ /JR81/cmd_vel_auto 30.0 90 0.0 0.0\n'
+                                                      '@@ /JR81/map_hold false\n')), \
+                    contextlib.redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(sim.cmd_status(sim.build_parser().parse_args(['status'])), 0)
+        text = out.getvalue()
+        self.assertEqual(asked, [sim.status_specs(['JR81', 'RR83'], {'drive', 'mighty'})])
+        self.assertIn('JR81 MIGHTY planner  (TF gate TIMED OUT: the node started without <ns>/map -> <ns>/odom)', text)
+        self.assertIn('JR81 MPC  (TF gate passed)', text)
+        self.assertIn('JR81 convert_odom_to_state\n', text)
+        self.assertIn("planner: mpc's cmd_vel_auto, mighty_node's map_hold", text)
+        self.assertIn('JR81  safety: no /JR81/mode (scripts/sim.py attach drive),  planner: cmd_vel_auto 30 Hz '
+                      '(v 0.00 m/s, w 0.00 rad/s), map_hold off', text)
+
+
+class ArmLeave(unittest.TestCase):
+    def test_arm_query_leaves_one_entity_at_a_time(self):
+        world = safety_world(('JR81', 'DISARMED', 'now', True), ('RR83', 'AUTO', 'now', True))
+        err = []
+        t0 = time.time()
+        args = sim.arm_args('auto_mode', 'dlio', 1.5, ['JR81', 'RR83'])[4:]
+        out = run_with_fake_ros(sim._ARM_PY, args, world, err=err)
+        took = time.time() - t0
+        self.assertEqual(sorted(sim.parse_arm(out)), ['JR81', 'RR83'])
+        left = [l for l in err if l.startswith(('LEFT', 'DESTROYED'))]
+        self.assertEqual(left, ['LEFT /JR81/mode', 'LEFT /JR81/dlio/odom_node/odom',
+                                'LEFT /JR81/dlio/odom_node/pointcloud/deskewed', 'LEFT /JR81/dlio/session',
+                                'LEFT /RR83/mode', 'LEFT /RR83/dlio/odom_node/odom',
+                                'LEFT /RR83/dlio/odom_node/pointcloud/deskewed', 'LEFT /RR83/dlio/session',
+                                'LEFT client /JR81/auto_mode', 'LEFT client /RR83/auto_mode',
+                                "DESTROYED with 0 subscription(s) left, [('enable_rosout', False), "
+                                "('start_parameter_services', False)]"])
+        self.assertGreater(took, 10 * sim.STATUS_LEAVE_GAP_S + sim.STATUS_LEAVE_PAUSE_S)
+        self.assertIn('LEAVE_GAP_S, LEAVE_PAUSE_S = %r, %r\n' % (sim.STATUS_LEAVE_GAP_S, sim.STATUS_LEAVE_PAUSE_S),
+                      sim._ARM_PY)
+
+
+class Phase5DryRuns(unittest.TestCase):
+    def dry(self, name, *extra):
+        env = dict(os.environ)
+        env.pop('ROVER_SIM_AGENTS', None)
+        return subprocess.run([sys.executable, str(REPO / 'scripts' / 'sim.py'), 'up', name, '--dry-run'] + list(extra),
+                              stdout=subprocess.PIPE, universal_newlines=True, check=True, env=env).stdout
+
+    def check_planner(self, out, s):
+        for a in s.agents:
+            self.assertIn('  window %s\n    [mighty-node-%s] %s MIGHTY planner\n' % (a.name, a.name, a.name), out)
+            for slug in ('odom-to-state-', 'mpc-', 'goal-selector-'):
+                self.assertIn('[%s%s]' % (slug, a.name), out)
+            self.assertIn('-e ROBOT_NAME=%s sim-mighty bash -c' % a.name, out)
+        self.assertEqual(out.count('ros2 launch mighty onboard_mighty.launch.py'), 4 * len(s.agents))
+        self.assertEqual(out.count(' num_agents:=%d\'' % s.num_agents), 4 * len(s.agents))
+        self.assertEqual(out.count(sim.MIGHTY_TF_GATE), 2 * len(s.agents))
+        self.assertEqual(out.count('(ready: MPC controller started\\.)'), len(s.agents))
+        self.assertIn('stack mighty -> tmux session rsim-mighty', out)
+        # The planner's wave is the last before the unpause, after mapping.
+        order = [out.index(t) for t in ('stack mapping ->', 'stack mighty ->', 'after the last wave: unpause')]
+        self.assertEqual(order, sorted(order))
+
+    def test_multi_agent_swap(self):
+        out = self.dry('multi_agent_swap')
+        self.check_planner(out, SWAP)
+        self.assertIn('planner on, demo swap, num_agents 84', out)
+        order = [out.index(t) for t in ('stack mighty ->', 'stack goals -> tmux session rsim-goals',
+                                        '[goal-relay] goal_relay --mode swap',
+                                        'after the last wave, before the unpause: arm JR81, JR82, RR83, RR84',
+                                        'after the last wave: unpause',
+                                        'goal_relay.py drives each agent in AUTO 1.2 m ahead in JOY mode first, then '
+                                        'starts the swap\n')]
+        self.assertEqual(order, sorted(order))
+        self.assertIn('goal_relay.py --spawn /rover_sim/run/spawn.yaml --session /rover_sim/run/session.json '
+                      '--mode swap', out)
+        self.assertNotIn('stack rviz', out)
+        self.assertIn('JR81  jr  id 81  pose (2.83, 2.83, -135.0 deg)  calibrated from JR02, lidar at 0.36 m  '
+                      'goals (-1.69, -3.63)', out)
+        # Without arming, goal_relay.py holds the first drive and the swap until scripts/sim.py arm.
+        self.assertIn('goal_relay.py drives each agent in AUTO 1.2 m ahead in JOY mode first, then starts the swap '
+                      '(after scripts/sim.py arm)', self.dry('multi_agent_swap', '--no-arm'))
+
+    def test_office_explore_and_smoke(self):
+        office = self.dry('office_explore')
+        self.check_planner(office, OFFICE)
+        self.assertIn('demo explore', office)
+        self.assertIn('[goal-relay] goal_relay --mode explore (first drive, then RViz /sim/goal only)', office)
+        smoke = self.dry('smoke')
+        self.check_planner(smoke, SMOKE)
+        self.assertIn('[goal-relay] goal_relay --mode swap', smoke)
+        self.assertNotIn('onboard_mighty', self.dry('odom_eval'))
+
+    def test_rviz_session(self):
+        with tempfile.TemporaryDirectory() as d:
+            f = Path(d) / 'rv.yaml'
+            data = yaml.safe_load((REPO / 'config' / 'sessions' / 'office_explore.yaml').read_text())
+            data.update(name='rv', rviz=True)
+            f.write_text(yaml.safe_dump(data))
+            out = self.dry(str(f))
+        self.assertIn('rviz: /rover_sim/run/rviz/session.rviz from rviz/templates/ on $DISPLAY', out)
+        self.assertIn('write_rviz_config', out)
+        order = [out.index(t) for t in ('stack mighty ->', 'stack rviz ->', 'stack goals ->', '--mode explore',
+                                        'after the last wave: unpause')]
+        self.assertEqual(order, sorted(order))
+        self.assertIn("sim-gazebo bash -c '", out[out.index('[rviz]'):])
+        self.assertIn('rviz2 -d /rover_sim/run/rviz/session.rviz', out)
+
+    def test_up_rviz_flag(self):
+        # --rviz is the session's rviz: true for one run: the same stack, last paused wave.
+        out = self.dry('multi_agent_swap', '--rviz')
+        self.assertIn('gui off, mapping gpu, rviz on', out)
+        order = [out.index(t) for t in ('stack mighty ->', 'wave 5: rviz, goals', 'stack rviz ->', 'stack goals ->',
+                                        'after the last wave: unpause')]
+        self.assertEqual(order, sorted(order))
+        self.assertIn('rviz2 -d /rover_sim/run/rviz/session.rviz', out)
+        self.assertNotIn('stack rviz', self.dry('multi_agent_swap'))
+
+
+def load_sim_viz():
+    scripts = str(REPO / 'scripts')
+    if scripts not in sys.path:
+        sys.path.insert(0, scripts)
+    import sim_viz
+    return sim_viz
+
+
+class VizCommand(unittest.TestCase):
+    """`sim.py viz`: sim_viz.py in its own sim container (profile viz), never on the host."""
+
+    def viz(self, argv, isolation=(), project=('sim-drive', 'sim-gazebo', 'sim-mighty'), s=SWAP, display=':1',
+            spawn=True, nodes=(2.0, [], [])):
+        calls = []
+        with tempfile.TemporaryDirectory() as d:
+            run, logs = Path(d) / 'run', Path(d) / 'logs'
+            run.mkdir()
+            (logs / '20261019_120000').mkdir(parents=True)
+            (logs / 'latest').symlink_to('20261019_120000')
+            (run / 'session.json').write_text(json.dumps(s.to_json()))
+            if spawn:
+                (run / 'spawn.yaml').write_text('agents: []\n')
+            up = list(project)
+
+            def stop(name, **kw):
+                calls.append(('stop', name, kw.get('match'), kw.get('grace_int')))
+                return 1
+
+            def compose(args, **kw):
+                calls.append(('sh', list(args)))
+                if 'up' in args:
+                    up.append('sim-viz')
+            patches = {'running_sim_containers': lambda: list(up), 'resolve_run_dir': lambda: run,
+                       'check_isolation': lambda: calls.append('isolation') or list(isolation),
+                       'tmux_sessions': lambda: ['rsim-mighty', 'rsim-viz'], 'LOG_ROOT': logs,
+                       'grant_x_access': lambda: calls.append('xhost'), 'stop_processes': stop,
+                       'tmux': lambda *a, **k: calls.append(('tmux',) + a),
+                       'sh': compose, 'compose_env': lambda run_dir: {}, 'wait_running': lambda n: calls.append(
+                           ('wait', list(n))),
+                       'start_stack': lambda st, panes, log_dir: calls.append(('start', st.name, panes)) or 'rsim-viz',
+                       'wait_nodes_started': lambda plan, log_dir, timeout: nodes}
+            env = {'DISPLAY': display} if display else {}
+            out, err = io.StringIO(), io.StringIO()
+            with mock.patch.multiple(sim, **patches), mock.patch.dict(os.environ, env), \
+                    contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                if not display:
+                    os.environ.pop('DISPLAY', None)
+                rc = sim.main(argv)
+        return rc, calls, out.getvalue() + err.getvalue()
+
+    def test_start(self):
+        rc, calls, text = self.viz(['viz', '--agents', 'RR83', '--layers', 'default,map', '--follow'])
+        self.assertEqual(rc, 0, text)
+        kinds = [c if isinstance(c, str) else c[0] for c in calls]
+        # The old viewer leaves first, then compose starts sim-viz alone, isolation is checked on it, X
+        # granted, and only then the pane joins the graph.
+        self.assertEqual(kinds, ['tmux', 'sh', 'wait', 'isolation', 'xhost', 'start'])
+        compose = calls[1][1]
+        self.assertEqual(compose[-3:], ['up', '-d', 'sim-viz'])
+        self.assertIn('--profile', compose)
+        self.assertEqual(compose[compose.index('--profile') + 1], 'viz')
+        self.assertNotIn('gpu', compose)
+        self.assertEqual(calls[2], ('wait', ['sim-viz']))
+        pane = calls[-1][2][0]
+        self.assertEqual((calls[-1][1], pane.container, pane.slug), ('viz', 'sim-viz', 'viz'))
+        self.assertEqual(pane.cmd, 'python3 /rover_sim/scripts/sim_viz.py --spawn /rover_sim/run/spawn.yaml '
+                                   '--agents RR83 --layers default,map --follow')
+        line = sim.pane_command(pane)
+        argv = shlex.split(line)
+        self.assertEqual(argv[:4], ['docker', 'exec', '-it', 'sim-viz'])     # in its container, never the host
+        self.assertNotIn('--network', line)
+        self.assertIn('until (exec 3<>/dev/tcp/sim-drive/7447', argv[-1])     # gated on the router
+        self.assertIn('joins the running graph', text)
+
+    def test_snapshot(self):
+        def run(rc=0, **kw):
+            execs = []
+
+            def dexec(name, args, check=True, timeout=None, **k):
+                execs.append((name, list(args), timeout))
+                return types.SimpleNamespace(returncode=rc, stdout='sim_viz: wrote it\n', stderr='')
+            with mock.patch.object(sim, 'dexec', dexec):
+                rc, calls, text = self.viz(['viz', '--snapshot', '/tmp/x/out.png', '--snapshot-after', '4',
+                                            '--agents', 'JR81', '--follow'], display='', **kw)
+            return rc, calls, text, execs
+        rc, calls, text, execs = run()
+        self.assertEqual(rc, 0, text)                                       # no DISPLAY needed
+        kinds = [c if isinstance(c, str) else c[0] for c in calls]
+        # sim-viz up (no viewer to stop: none ran), isolation, the exec, then docker cp to the host.
+        self.assertEqual(kinds, ['sh', 'wait', 'isolation', 'sh'])
+        self.assertEqual(calls[0][1][-3:], ['up', '-d', 'sim-viz'])
+        self.assertEqual(calls[-1][1], ['docker', 'cp', 'sim-viz:/tmp/sim_viz_snapshot.png', '/tmp/x/out.png'])
+        ((name, argv, timeout),) = execs
+        self.assertEqual((name, argv[:2]), ('sim-viz', ['bash', '-c']))
+        self.assertTrue(argv[2].startswith('source /opt/ros/humble/setup.bash && exec python3 '
+                                           '/rover_sim/scripts/sim_viz.py --spawn /rover_sim/run/spawn.yaml'), argv[2])
+        self.assertTrue(argv[2].endswith('--agents JR81 --follow --snapshot /tmp/sim_viz_snapshot.png --snapshot-after 4.0'),
+                        argv[2])
+        self.assertGreaterEqual(timeout, 4 + sim.VIZ_STOP_GRACE_S)
+        self.assertIn('sim_viz: wrote it', text)
+        # A running sim-viz is used as it is (a recreate would stop its viewer); broken isolation: no exec.
+        rc, calls, text, execs = run(project=('sim-drive', 'sim-viz'))
+        self.assertEqual([c if isinstance(c, str) else c[0] for c in calls], ['isolation', 'sh'])
+        rc, calls, text, execs = run(isolation=['network rover-sim is not internal'])
+        self.assertEqual((rc, execs), (3, []))
+        self.assertIn('not taking the snapshot', text)
+        rc, calls, text, execs = run(rc=1)
+        self.assertEqual(rc, 1)
+        self.assertNotIn('cp', [a for c in calls if not isinstance(c, str) for a in c[1]])
+
+    def test_docker_stop_is_a_ctrl_c(self):
+        # docker-init gives a stop's SIGTERM to the container's command alone, and the kernel SIGKILLs the
+        # exec'd viewer once it exits: sim-viz's command traps it, Ctrl-Cs the viewer and waits for it.
+        doc = yaml.safe_load((REPO / 'docker' / 'compose.stack.yaml').read_text())
+        svc = doc['services']['sim-viz']
+        cmd = svc['command']
+        self.assertEqual(cmd[:2], ['bash', '-c'])
+        self.assertIn('pkill -INT -f "[s]im_viz.py"', cmd[2])
+        self.assertTrue(cmd[2].endswith('TERM; sleep infinity & wait'), cmd[2])
+        self.assertEqual(svc['stop_grace_period'], '%ds' % sim.VIZ_STOP_GRACE_S)
+        if not (shutil.which('pkill') and shutil.which('pgrep') and shutil.which('bash')):
+            self.skipTest('no pkill/pgrep here')
+        # The trap itself, on a stand-in named apart from any real viewer (the host sees the containers').
+        with tempfile.TemporaryDirectory() as d:
+            name = 'sim_viz_trap_%d.py' % os.getpid()
+            fake = Path(d) / name
+            fake.write_text('import signal, sys, time\n'
+                            'signal.signal(signal.SIGINT, lambda *a: (time.sleep(1.0), open(sys.argv[1], "w")'
+                            '.write("left"), sys.exit(0)))\n'
+                            'time.sleep(30)\n')
+            viewer = subprocess.Popen([sys.executable, str(fake), str(Path(d) / 'left')])
+            # Its own group: the `sleep infinity &` it leaves behind (docker-init's exit reaps it there) goes too.
+            init = subprocess.Popen(['bash', '-c', cmd[2].replace('[s]im_viz.py', '[s]' + name[1:])],
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+            try:
+                time.sleep(0.5)
+                t0 = time.time()
+                init.terminate()
+                self.assertEqual(init.wait(10), 0)
+                self.assertGreaterEqual(time.time() - t0, 0.9)               # it waited for the leave
+                self.assertEqual(viewer.wait(5), 0)
+                self.assertEqual((Path(d) / 'left').read_text(), 'left')
+            finally:
+                viewer.kill()
+                with contextlib.suppress(OSError):
+                    os.killpg(init.pid, signal.SIGKILL)
+                viewer.wait()
+                init.wait()
+
+    def test_stop_waits_for_the_paced_leave(self):
+        rc, calls, text = self.viz(['viz', '--stop'], project=('sim-drive', 'sim-viz'))
+        self.assertEqual(rc, 0, text)
+        self.assertEqual(calls[0], ('stop', 'sim-viz', None, sim.VIZ_STOP_GRACE_S))
+        self.assertEqual(calls[1], ('tmux', 'kill-session', '-t', '=rsim-viz'))
+        self.assertEqual(len(calls), 2)                                     # no compose, no isolation, no ROS
+        self.assertIn('left the graph one subscription at a time', text)
+        sim_viz = load_sim_viz()
+        self.assertGreaterEqual(sim.VIZ_STOP_GRACE_S, sim_viz.leave_seconds(sim.VIZ_MAX_PANELS * len(sim_viz.LAYERS))
+                                + 10)
+
+    def test_refusals(self):
+        rc, calls, text = self.viz(['viz'], isolation=['network rover-sim is not internal'])
+        self.assertEqual(rc, 3)
+        self.assertNotIn('start', [c[0] for c in calls if not isinstance(c, str)])
+        self.assertNotIn('xhost', calls)
+        self.assertIn('isolation: BROKEN', text)
+        for argv, kw, why in ((['viz'], {'project': ('sim-gazebo',)}, 'sim-drive of project rover-sim-stack'),
+                              (['viz', '--agents', 'JR99'], {}, 'JR99: not an agent'),
+                              (['viz', '--layers', 'bogus'], {}, 'unknown layer(s) bogus'),
+                              (['viz'], {'display': ''}, 'headless: scripts/sim.py viz --snapshot <png>'),
+                              (['viz'], {'spawn': False}, 'no spawn.yaml')):
+            rc, calls, text = self.viz(argv, **kw)
+            self.assertEqual((rc, calls), (1, []), why)
+            self.assertIn(why, text)
+        five = dataclasses.replace(SWAP, agents=tuple(sim.Agent('JR%d' % (81 + i), 'jr', float(i), 0.0, 0.0)
+                                                       for i in range(5)))
+        rc, calls, text = self.viz(['viz'], s=five)
+        self.assertEqual((rc, calls), (1, []))
+        self.assertIn('pick up to 4 with --agents', text)
+        rc, calls, text = self.viz(['viz'], nodes=(60.0, ['viz/viz'], []))
+        self.assertEqual(rc, 1)
+        self.assertIn('ended before starting the viewer', text)
+
+    def test_down_stops_the_viewer_first(self):
+        order = []
+        patches = {'running_sim_containers': lambda: ['sim-gazebo', 'sim-drive', 'sim-viz'],
+                   'stop_processes': lambda name, **kw: order.append((name, kw.get('grace_int'))) or 1,
+                   'tmux_sessions': lambda: [s for s in ('rsim-viz', 'rsim-gazebo') if ('kill', s) not in order],
+                   'tmux': lambda *a, **k: order.append(('kill', a[2][1:])),
+                   'parallel': lambda fn, items: order.append(('parallel', list(items))) or [fn(i) for i in items],
+                   'resolve_run_dir': lambda: Path('/tmp/x'), 'compose_env': lambda r: {},
+                   'sh': lambda args, **kw: order.append(('compose', list(args)))}
+        with mock.patch.multiple(sim, **patches), contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            sim.stop_run(remove_containers=True)
+        self.assertEqual(order[0], ('sim-viz', sim.VIZ_STOP_GRACE_S))
+        self.assertEqual(order[1], ('kill', 'rsim-viz'))
+        self.assertEqual(order[2], ('parallel', ['sim-gazebo', 'sim-drive']))  # the rest after it has left
+        self.assertEqual(order[3:5], [('sim-gazebo', 10.0), ('sim-drive', 10.0)])
+        compose = order[-1][1]
+        self.assertEqual(compose[-2:], ['down', '--remove-orphans'])
+        self.assertEqual([compose[i + 1] for i, a in enumerate(compose) if a == '--profile'], ['gpu', 'viz'])
+
+    def test_down_waits_for_goal_relays_leave(self):
+        # sim-mighty's goal_relay.py leaves one entity at a time: 4 agents, ~17 s, longer than 10 s.
+        seen = {}
+        with tempfile.TemporaryDirectory() as d:
+            Path(d, 'session.json').write_text(json.dumps(SWAP.to_json()))
+            patches = {'running_sim_containers': lambda: ['sim-mighty', 'sim-drive'],
+                       'stop_processes': lambda name, **kw: seen.setdefault(name, kw.get('grace_int')) and 0,
+                       'tmux_sessions': lambda: [], 'resolve_run_dir': lambda: Path(d)}
+            with mock.patch.multiple(sim, **patches), contextlib.redirect_stdout(io.StringIO()):
+                sim.stop_run()
+        self.assertEqual(seen['sim-drive'], 10.0)
+        self.assertEqual(seen['sim-mighty'], sim.goal_relay_leave_s(4))
+        self.assertGreater(seen['sim-mighty'], (8 * 4 + 2) * sim.STATUS_LEAVE_GAP_S)
+
+    def test_registry_and_isolation_cover_it(self):
+        self.assertIn('sim-viz', sim.CONTAINERS)
+        self.assertEqual(sim.sim_only('sim-viz'), 'sim-viz')
+        self.assertNotIn('viz', sim.STACKS)                                 # `up` never starts it
+        self.assertNotIn('sim-viz', {c for st in sim.STACKS.values() for c in st.containers})
+        with mock.patch.object(sim, 'sh', lambda *a, **k: types.SimpleNamespace(
+                stdout='sim-viz\nsim-drive\nacl-c2-zenoh\n', returncode=0)):
+            self.assertEqual(sim.running_sim_containers(), ['sim-drive', 'sim-viz'])
+        self.assertEqual(sim.build_parser().parse_args(['attach', 'viz']).stack, 'viz')
+
+    def test_layers_match_the_viewer(self):
+        sim_viz = load_sim_viz()
+        self.assertEqual(sim.VIZ_LAYERS, tuple(sim_viz.LAYERS))
+        self.assertEqual(sim.VIZ_MAX_PANELS, sim_viz.MAX_PANELS)
+        self.assertEqual(sim.VIZ_SCRIPT, Path(sim_viz.__file__).name)
+
+    def test_viz_cpus(self):
+        self.assertEqual(sim.cpu_budget(12, sim.CONTAINERS)['sim-viz'], '6-7')    # 8-11 are 2-5's siblings
+        self.assertEqual(sim.cpu_budget(32, sim.CONTAINERS)['sim-viz'], '28-31')
+        no_smt = sim.cpu_budget(20, sim.CONTAINERS, lambda c: ())
+        self.assertEqual(no_smt['sim-viz'], '16-19')
+        self.assertEqual(sim.cpu_list([16, 17, 18, 19, 21, 3]), '3,16-19,21')
+        self.assertEqual(sim.parse_cpu_list('2,12'), [2, 12])
+        self.assertEqual(sim.parse_cpu_list('16-19\n'), [16, 17, 18, 19])
+        self.assertEqual(sim.half_siblings(20)(2), {12})
+        self.assertEqual(sim.half_siblings(20)(12), {2})
+        self.assertEqual(sim.cpuset_var('sim-viz'), 'ROVER_SIM_CPUSET_VIZ')
+
+    def test_compose_service(self):
+        svc = yaml.safe_load((REPO / 'docker' / 'compose.stack.yaml').read_text())['services']['sim-viz']
+        self.assertEqual(svc['profiles'], ['viz'])
+        self.assertTrue(svc['image'].startswith('${GAZEBO_IMAGE:?'))
+        self.assertEqual(svc['networks'], ['rover-sim'])
+        self.assertNotIn('network_mode', svc)
+        self.assertEqual(svc['environment']['DISPLAY'], '${DISPLAY:-}')
+        self.assertIn('/tmp/.X11-unix:/tmp/.X11-unix:ro', svc['volumes'])
+        for v in svc['volumes']:
+            if v.split(':')[1].startswith('/rover_sim/'):
+                self.assertTrue(v.endswith(':ro'), v)                       # zenoh, scripts, config, run
+        grace = svc['stop_grace_period']
+        self.assertTrue(grace.endswith('s') and float(grace[:-1]) >= sim.VIZ_STOP_GRACE_S)
 
 
 if __name__ == '__main__':

@@ -2,18 +2,26 @@
 # one P3-AT (RR, from RR08) face each other 4 m apart in the arena (the empty world walled
 # in: DLIO drifts on a bare floor), with the no-GPU fallback mapping (NOT PARITY: global_mapper
 # on a sim config and scripts/grid_relay.py in place of the elevation mapper and map_fusion) and
-# no RViz. Phases 2-4 bring up the router, Gazebo (spawns, sensor bridges, world-><ns>/map),
-# each agent's DLIO, teleop + safety_node (DISARMED until scripts/sim.py arm) and
-# rover_description, frame_align, and the mapping stack; Phase 5 adds the planner.
+# no RViz. It brings up the router, Gazebo (spawns, sensor bridges, world-><ns>/map), each
+# agent's DLIO, teleop + safety_node and rover_description, frame_align, the mapping stack and
+# the planner, arms both agents, drives each 1.2 m off its spot (goal_relay.py's first drive),
+# and then swaps them: each drives to 1 m beside the other's start and back, over and over
+# (scripts/goal_relay.py). The two paths cross at (0, 0.5), so mighty's multi-agent avoidance has
+# to pass them. That is the fallback's "the planner moves" check. Not the other's start itself:
+# mighty refuses a terminal goal on an occupied cell, and the other agent is parked there when
+# the swap begins.
 #
 #   scripts/sim.py up smoke        (make session S=smoke)
 #
-# Agent ids (the two digits) must be unique across classes; see scripts/sim.py.
+# Goals are [x m, y m] in the world frame. Agent ids (the two digits) must be unique across
+# classes; see scripts/sim.py.
 name: smoke
 world: arena
 gui: false
 mapping: fallback
 rviz: false
+demo: swap
+auto_arm: true
 agents:
-  - {name: JR81, class: jr, pose: [-2.0, 0.0, 0.0]}
-  - {name: RR83, class: rr, pose: [2.0, 0.0, 180.0]}
+  - {name: JR81, class: jr, pose: [-2.0, 0.0, 0.0], goals: [[2.0, 1.0]]}
+  - {name: RR83, class: rr, pose: [2.0, 0.0, 180.0], goals: [[-2.0, 1.0]]}

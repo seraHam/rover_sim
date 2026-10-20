@@ -27,8 +27,11 @@ Why a bridge: the stack runs on wall clock as on the robot, Gazebo on sim time. 
 input stamp is mapped through one offset (ClockMapper) shared by lidar, IMU and ground
 truth, so DLIO sees them exactly as consistent as they are in sim time. The offset
 follows the lower envelope of (arrival - sim stamp) with a slew limit, so stamps never
-jump and lag wall time by tens of ms. RTF < 0.95 for > 5 s invalidates a run (the stack's
-staleness gates assume real time): it is logged and appended to <run-dir>/rtf_violations.log.
+jump and lag wall time by tens of ms. Late delivery (a zenoh stall and its backlog) never
+moves it: those messages keep their stamps and are late, as hardware-stamped data is on
+the robot. Only lost sim time does (a pause, a stall the world could not catch up), seen
+on the IMU. RTF < 0.95 for > 5 s invalidates a run (the stack's staleness gates assume
+real time): it is logged and appended to <run-dir>/rtf_violations.log.
 
 The pure parts (ClockMapper, RtfMonitor, the CDR codec, the numpy packing) import
 without rclpy; tests/test_livox_sim_bridge.py covers them.
@@ -51,6 +54,7 @@ except ImportError:  # host-side unit tests skip the packing tests
     np = None
 
 NS_PER_S = 1000000000
+MS_NS = 1000000
 G = 9.80665                      # livox_ros_driver2 passes the SDK's accel through, in g
 LIVOX_FRAME_IMU = 'livox_frame'  # hardcoded in lddc.cpp InitImuMsg
 MID360_LINES = 4                 # pub_handler.cpp: line = point index % kLineNumberMid360
@@ -71,6 +75,21 @@ LIVOX_POINT_STEP = 26
 
 # ---------------------------------------------------------------------------- clock
 
+SLEW_DT_MAX_NS = 10000000
+
+
+class _High:
+    """The clock stream's episode of d more than jump_s above the offset."""
+    __slots__ = ('start', 'worst', 'kind', 'since', 'ref', 'min', 'n', 'last')
+
+    def __init__(self, wall_ns, d, kind):
+        self.start, self.worst, self.kind, self.last = wall_ns, d, kind, wall_ns
+        self.restart(wall_ns, d)
+
+    def restart(self, wall_ns, d):
+        self.since, self.ref, self.min, self.n = wall_ns, d, d, 0
+
+
 class ClockMapper:
     """sim stamp -> wall stamp, one per agent, shared by all its streams.
 
@@ -81,46 +100,79 @@ class ClockMapper:
     most `slew` s per wall second: stamps never jump, and at RTF r < 1 the offset grows
     at 1 - r, which keeps stamps advancing at the wall rate while r >= 1 - slew.
 
-    Re-initialised (offset := d) on the first sample; when d stays more than `jump_s`
-    above the offset for `confirm_s` without falling (pause/unpause, a stall the world's
-    real_time_lock gave up on, world reset, a sustained RTF < 1 - slew: an RTF violation by
-    then); and when the target falls more than `ahead_s` below the offset (sim stamps
-    jumping ahead). A single late message, e.g. after a stall of this process, does not
-    move the offset. Per stream, published stamps are strictly increasing: a stamp not
-    after the previous one is nudged to previous + 1 us and counted.
+    d rising more than `jump_s` above the offset is late delivery or lost sim time, and
+    only lost sim time may move the offset:
+    - A delivery stall (rmw_zenoh 0.1.9 stalls the whole graph for ~45 ms per entity a
+      session undeclares at once) holds every stream back, then its backlog arrives in a
+      burst, d falling back to the old floor (or the backlog is dropped and d is back at
+      once). Its messages keep their sim-consistent stamps and are late, as hardware-
+      stamped data is on the robot. Re-anchoring on it (0.2 s confirmation on any stream,
+      before) moved the stamps by the stall and back, and parked DLIOs diverged.
+    - Lost sim time (pause/unpause, a stall the world's real_time_lock gave up on: max_lag
+      0.5 s) keeps d up for good. The offset re-anchors at the minimum d of the episode once
+      the clock stream's d has stayed high and steady for `confirm_s`: its floor (the
+      minimum over the first `ref_s` of the window) not undercut by more than `settle_s`,
+      and no `gap_s` without a sample (live, a stall came 0.43 s late, went silent for
+      2.9 s, and its burst would have confirmed the 0.43 s otherwise).
+      A falling d (a backlog draining, or the lock catching up a shorter stall at up to
+      1.5x) restarts the window, so the offset never moves up only to leave stamps in the
+      future. 'jump' when d rose at once, 'drift' when it crept up (a sustained RTF <
+      1 - slew: an RTF violation by then).
+    Only the clock stream (the IMU: 200 Hz, small messages, the RTF stream) decides. The
+    large clouds lag longest after a stall, and other streams' late messages are mapped
+    with the offset as it is. Its sim stamps going back (world reset) re-anchor at once
+    ('reset'). The offset also re-anchors down when the target falls more than `ahead_s`
+    below it (sim stamps jumping ahead; 'drift'). A clock-stream episode that ends without
+    a re-anchor is counted in `held` (`last_held`: worst lag, s; duration, s); one that began
+    with a sudden rise (a stall) is returned as 'held'. During an episode, and after a
+    sudden one until the clock stream has been back within settle_s for a window (at most
+    drain_s), the slew may lower the offset but not raise it: a backlog that drains slowly
+    would otherwise fill the window with late samples and pull the stamps up to them.
 
-    jump_s sits below real_time_lock's max_lag (0.5 s in worlds/*.world): a stall the lock
-    will not catch up is re-anchored here within confirm_s, instead of the slew taking
-    ~lag / slew s to absorb it while every stamp is that stale. A stall it does catch up (at up to
-    1.5x) shows as d falling back: while d falls by more than settle_s within a
-    confirmation window, the window restarts, so the offset is not moved up only to leave
-    stamps in the future as sim time catches up.
+    Per stream, published stamps are strictly increasing: a stamp not after the previous
+    one is nudged to previous + 1 us and counted.
     """
 
-    def __init__(self, window_s=2.0, slew=0.05, jump_s=0.4, bucket_s=0.1, confirm_s=0.2,
-                 settle_s=0.02, ahead_s=1.0, rtf_window_s=5.0, stall_s=1.0, nudge_ns=1000):
-        if window_s <= 0 or bucket_s <= 0 or slew < 0 or jump_s <= 0 or ahead_s <= 0:
-            raise ValueError('window, bucket, jump and ahead must be > 0 and slew >= 0')
+    def __init__(self, window_s=2.0, slew=0.05, jump_s=0.4, bucket_s=0.1, confirm_s=2.5,
+                 settle_s=0.02, ref_s=0.2, ahead_s=1.0, rtf_window_s=5.0, rtf_bucket_s=0.25,
+                 stall_s=1.0, nudge_ns=1000, clock_stream='imu', drain_s=30.0, gap_s=0.25, drain_flat_s=1.0):
+        if (window_s <= 0 or bucket_s <= 0 or slew < 0 or jump_s <= 0 or ahead_s <= 0
+                or rtf_bucket_s <= 0 or not 0 < ref_s < confirm_s):
+            raise ValueError('window, buckets, jump and ahead must be > 0, slew >= 0, '
+                             '0 < ref < confirm')
         self.bucket_ns = int(bucket_s * NS_PER_S)
         self.nbuckets = max(1, int(round(window_s / bucket_s)))
         self.slew = float(slew)
         self.jump_ns = int(jump_s * NS_PER_S)
         self.confirm_ns = int(confirm_s * NS_PER_S)
         self.settle_ns = int(settle_s * NS_PER_S)
+        self.ref_ns = int(ref_s * NS_PER_S)
         self.ahead_ns = int(ahead_s * NS_PER_S)
+        self.drain_ns = int(drain_s * NS_PER_S)
+        self.drain_flat_ns = int(drain_flat_s * NS_PER_S)
+        self.gap_ns = int(gap_s * NS_PER_S)
         self.rtf_window_ns = int(rtf_window_s * NS_PER_S)
+        self.rtf_bucket_ns = int(rtf_bucket_s * NS_PER_S)
         self.stall_ns = int(stall_s * NS_PER_S)
         self.nudge_ns = int(nudge_ns)
+        self.clock_stream = clock_stream
         self.offset_ns = None            # applied: published = sim + offset
         self.target_ns = None
         self._buckets = collections.deque()  # [bucket index, min d]
         self._last_wall = None
         self._prev_d = {}                # stream -> last d (labels a jump as sudden)
-        self._high = None                # [since wall, min d, samples, kind, d at since] while d >> offset
+        self._prev_sim = None            # the clock stream's last sim stamp
+        self._high = None                # _High while the clock stream's d >> offset
+        self._drain_until = None         # after a held episode: until its lag is back
+        self._drain_min = self._drain_min_t = None   # the clock stream's lowest d since, and when
         self._last_out = {}              # stream -> last published stamp
         self.nudges = collections.Counter()
-        self.events = collections.Counter()   # init / jump / drift
-        self._rtf = collections.deque()  # (wall, sim) of the RTF stream
+        self.events = collections.Counter()   # init / jump / drift / reset
+        self.held = 0
+        self.last_held = None
+        self._max_lag = {}               # stream -> max d - offset since take_max_lag()
+        self._rtf = collections.deque()  # [bucket, wall, sim]: each bucket's least delayed sample
+        self._rtf_last = None            # (wall, sim) of the newest RTF sample
         self._rtf_seen = False
 
     def _reset(self, d, wall_ns):
@@ -128,34 +180,77 @@ class ClockMapper:
         self._buckets.clear()
         self._buckets.append([wall_ns // self.bucket_ns, d])
         self._last_wall = wall_ns
-        self._high = None
+        self._high = self._drain_until = None
+
+    def _high_sample(self, d, prev, wall_ns):
+        """One clock-stream sample more than jump_s above the offset."""
+        h = self._high
+        if h is None:
+            sudden = prev is None or d - prev > self.jump_ns
+            h = self._high = _High(wall_ns, d, 'jump' if sudden else 'drift')
+        else:
+            h.worst = max(h.worst, d)
+            if wall_ns - h.last > self.gap_ns:
+                h.restart(wall_ns, d)            # silence is no evidence: delivery stalled again
+            elif wall_ns - h.since <= self.ref_ns:
+                h.ref = min(h.ref, d)
+            elif h.ref - d > self.settle_ns:
+                h.restart(wall_ns, d)            # still falling: a backlog or a catch-up
+            h.last = wall_ns
+        h.min = min(h.min, d)
+        h.n += 1
+        if wall_ns - h.since >= self.confirm_ns and h.n >= 3:
+            kind = h.kind
+            self._reset(h.min, wall_ns)
+            self.events[kind] += 1
+            return kind
+        return None
 
     def observe(self, stream, sim_ns, wall_ns):
-        """Feed one message's (sim stamp, arrival). Returns None, or the event that
-        re-initialised the offset: 'init', 'jump' or 'drift'."""
+        """Feed one message's (sim stamp, arrival). Returns None, the event that
+        re-initialised the offset ('init', 'jump', 'drift', 'reset'), or 'held' when a
+        clock-stream episode of high d ended without moving it."""
         d = wall_ns - sim_ns
         prev = self._prev_d.get(stream)
         self._prev_d[stream] = d
-        if self.offset_ns is None:
+        clock = stream == self.clock_stream
+        back = clock and self._prev_sim is not None and sim_ns < self._prev_sim
+        if clock:
+            self._prev_sim = sim_ns
+        if self.offset_ns is None or back:
+            kind = 'reset' if back else 'init'
             self._reset(d, wall_ns)
-            self.events['init'] += 1
-            return 'init'
-        if d - self.offset_ns > self.jump_ns:
-            h = self._high
-            if h is None:
-                sudden = prev is None or d - prev > self.jump_ns
-                self._high = h = [wall_ns, d, 0, 'jump' if sudden else 'drift', d]
-            elif h[4] - d > self.settle_ns:
-                h[0], h[1], h[2], h[4] = wall_ns, d, 0, d     # still falling: sim catching up
-            h[1] = min(h[1], d)
-            h[2] += 1
-            if wall_ns - h[0] >= self.confirm_ns and h[2] >= 3:
-                kind = h[3]
-                self._reset(h[1], wall_ns)
-                self.events[kind] += 1
-                return kind
-            return None
-        self._high = None
+            self.events[kind] += 1
+            return kind
+        lag = d - self.offset_ns
+        if lag > self._max_lag.get(stream, lag - 1):
+            self._max_lag[stream] = lag
+        if lag > self.jump_ns:
+            return self._high_sample(d, prev, wall_ns) if clock else None
+        held = None
+        if clock and self._high is not None:
+            h, self._high = self._high, None
+            self.held += 1
+            self.last_held = ((h.worst - self.offset_ns) / NS_PER_S, (wall_ns - h.start) / NS_PER_S)
+            if h.kind == 'jump':
+                # A delivery stall starts with d rising at once. One that crept up (RTF < 1,
+                # lag hovering at jump_s) is not a backlog: the slew keeps following it.
+                held = 'held'
+                self._drain_until = wall_ns + self.drain_ns
+                self._drain_min, self._drain_min_t = None, wall_ns
+        if self._drain_until is not None:
+            if clock and lag <= self.settle_ns:      # back on time: hold until the window is fresh
+                self._drain_until = min(self._drain_until, wall_ns + self.nbuckets * self.bucket_ns)
+            elif clock:
+                # A backlog drains with d falling. Once it has stopped falling for drain_flat_s, the
+                # backlog is in, and what lag is left is the sim's own pace (RTF a little under 1),
+                # which the slew must follow: held for the whole drain_s, the lag grew to a re-anchor.
+                if self._drain_min is None or d < self._drain_min - MS_NS:
+                    self._drain_min, self._drain_min_t = d, wall_ns
+                elif wall_ns - self._drain_min_t >= self.drain_flat_ns:
+                    self._drain_until = wall_ns
+            if wall_ns >= self._drain_until:
+                self._drain_until = None
 
         b = wall_ns // self.bucket_ns
         if self._buckets and self._buckets[-1][0] == b:
@@ -166,6 +261,10 @@ class ClockMapper:
         while self._buckets[0][0] <= b - self.nbuckets:
             self._buckets.popleft()
         self.target_ns = min(m for _, m in self._buckets)
+        if self._high is not None or self._drain_until is not None:
+            # While the clock stream is late or its backlog still drains, the window holds
+            # only late samples: the offset may come down, never go up to them.
+            self.target_ns = min(self.target_ns, self.offset_ns)
 
         # (d never enters the window more than jump_s above the offset: see above.)
         if self.offset_ns - self.target_ns > self.ahead_ns:
@@ -175,10 +274,18 @@ class ClockMapper:
         dt = wall_ns - self._last_wall
         if dt > 0:
             self._last_wall = wall_ns
-            step = int(self.slew * dt)
+            # At most 10 ms worth per sample (messages come every few ms): after a silence
+            # (a stall) slew x the silence in one step would be a stamp step, nudges behind it.
+            step = int(self.slew * min(dt, SLEW_DT_MAX_NS))
             err = self.target_ns - self.offset_ns
             self.offset_ns += max(-step, min(step, err))
-        return None
+        return held
+
+    def take_max_lag(self):
+        """{stream: largest d - offset (s) since the last call}: how late each stream came."""
+        out = {k: v / NS_PER_S for k, v in self._max_lag.items()}
+        self._max_lag.clear()
+        return out
 
     def stamp(self, stream, sim_ns):
         """Published stamp (ns) for a sim stamp of `stream`, after observe()."""
@@ -195,28 +302,52 @@ class ClockMapper:
         return self.stamp(stream, sim_ns), ev
 
     def observe_rtf(self, sim_ns, wall_ns):
-        """The RTF stream (the IMU: the densest and most regular). A pause or hang stays
-        in the window, as the lost real time it is; a world reset (sim going backwards)
-        restarts it."""
-        if self._rtf and sim_ns <= self._rtf[-1][1]:
+        """The RTF stream (the IMU: the densest and most regular). Each rtf bucket keeps its
+        least delayed sample (min wall - sim), so a delivery stall's backlog, which arrives
+        all at once with older sim stamps, does not read as sim running fast. A pause or
+        hang stays in the window, as the lost real time it is; a world reset (sim going
+        backwards) restarts it."""
+        if self._rtf_last is not None and sim_ns < self._rtf_last[1]:
             self._rtf.clear()
-        self._rtf.append((wall_ns, sim_ns))
+        self._rtf_last = (wall_ns, sim_ns)
         self._rtf_seen = True
-        while self._rtf and self._rtf[0][0] < wall_ns - self.rtf_window_ns:
+        b = wall_ns // self.rtf_bucket_ns
+        last = self._rtf[-1] if self._rtf else None
+        if last is not None and last[0] == b:
+            if wall_ns - sim_ns < last[1] - last[2]:
+                last[1], last[2] = wall_ns, sim_ns
+        else:
+            self._rtf.append([b, wall_ns, sim_ns])
+        # Keep the bucket the window's start falls in: the span stays about rtf_window_s.
+        while len(self._rtf) > 1 and self._rtf[1][0] * self.rtf_bucket_ns <= wall_ns - self.rtf_window_ns:
             self._rtf.popleft()
 
     def rtf(self, now_ns, min_span_s=1.0):
-        """d(sim)/d(wall) over the RTF window. 0.0 once samples stop for stall_s after
-        having flowed (a stalled or paused sim), None while unknown."""
+        """d(sim)/d(wall) over the RTF window: from its earliest bucket on the window's floor of
+        d to the latest bucket of its last second on that second's floor (within settle_s), so
+        late samples (a stall's burst) are never an end, while a pause or a sustained RTF < 1
+        spans the window. 0.0 once samples stop for stall_s after having flowed (a stalled or
+        paused sim, or no delivery); None while unknown, which includes the seconds after a long
+        stall or during a catch-up, when less than min_span_s of on-time data separates the ends."""
         if not self._rtf_seen:
             return None
-        if not self._rtf or now_ns - self._rtf[-1][0] > self.stall_ns:
+        if not self._rtf or now_ns - self._rtf_last[0] > self.stall_ns:
             return 0.0
-        w0, s0 = self._rtf[0]
-        w1, s1 = self._rtf[-1]
+        recent = [x for x in self._rtf if x[1] >= self._rtf[-1][1] - NS_PER_S]
+        floor0 = min(w - s for _, w, s in self._rtf) + self.settle_ns
+        floor1 = min(w - s for _, w, s in recent) + self.settle_ns
+        _, w0, s0 = next(x for x in self._rtf if x[1] - x[2] <= floor0)
+        _, w1, s1 = [x for x in recent if x[1] - x[2] <= floor1][-1]
         if w1 - w0 < min_span_s * NS_PER_S:
             return None
         return (s1 - s0) / float(w1 - w0)
+
+
+REINIT_WHY = {
+    'jump': 'Sim time lost (paused, or a stall real_time_lock did not catch up): stamps jumped.',
+    'drift': 'Sim slower than wall for long (RTF < 1 - slew), or ahead of it: stamps jumped.',
+    'reset': 'World reset (sim time went back).',
+}
 
 
 class RtfMonitor:
@@ -633,12 +764,16 @@ def main(argv=None):
             if ev == 'init':
                 self.get_logger().info('time offset initialised from %s: wall - sim = %.6f s'
                                        % (stream, self.clock_map.offset_ns / 1e9))
+            elif ev == 'held':
+                lag, dur = self.clock_map.last_held
+                self.get_logger().warning(
+                    'imu came up to %.3f s late for %.2f s, then back on time: a delivery stall '
+                    '(or a stall the sim caught up), offset held at wall - sim = %.6f s'
+                    % (lag, dur, self.clock_map.offset_ns / 1e9))
             elif ev is not None:
                 self.get_logger().warning(
                     'time offset re-initialised (%s, from %s): wall - sim = %.6f s. %s'
-                    % (ev, stream, self.clock_map.offset_ns / 1e9,
-                       'Sim paused/reset?' if ev == 'jump' else
-                       'Sim slower than wall for long (RTF < 1 - slew): stamps jumped.'))
+                    % (ev, stream, self.clock_map.offset_ns / 1e9, REINIT_WHY[ev]))
             return out
 
         def publish_cloud(self, sim_ns, wall_ns, cols, frame_in):
@@ -755,14 +890,17 @@ def main(argv=None):
                 self.get_logger().info('waiting for sensor data')
                 return
             rtf = cm.rtf(time.time_ns())
+            lag = cm.take_max_lag()
             self.get_logger().info(
                 'lidar %d in / %d out (%d empty), points kept %.1f%%, imu %d, odom %d; '
-                'offset %.6f s (target %+.1f ms), rtf %s, nudges %s, reinits %s'
+                'offset %.6f s (target %+.1f ms), rtf %s, nudges %s, reinits %s, held %d, '
+                'max lag %s'
                 % (c['lidar_in'], c['lidar_out'], c['lidar_empty'],
                    100.0 * c['points_out'] / max(1, c['points_in']), c['imu'], c['odom'],
                    cm.offset_ns / 1e9, (cm.target_ns - cm.offset_ns) / 1e6,
                    'n/a' if rtf is None else '%.3f' % rtf, dict(cm.nudges) or 0,
-                   dict(cm.events)))
+                   dict(cm.events), cm.held,
+                   ' '.join('%s %.0f ms' % (k, v * 1e3) for k, v in sorted(lag.items())) or '-'))
 
     rclpy.init(args=argv)
     node = Bridge()
