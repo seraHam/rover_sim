@@ -55,6 +55,7 @@ class Parsing(unittest.TestCase):
             self.assertEqual(cp.read_env(str(p)), {'MIGHTY_SHA': '1' * 40, 'MIGHTY_IMAGE': 'rover-sim/mighty-hw:1111111'})
         self.assertEqual(cp.repos_versions(repos(x=A, y=B)), {'x': A, 'y': B})
         self.assertEqual(cp.dockerfile_args('ARG A=1\nARG B\n  ARG C=no\nARG D=x y\n'), {'A': '1', 'D': 'x'})
+        self.assertEqual(cp.dockerfile_args('ARG HW_DEPS="mpc DecompROS2"\nARG E=""\n'), {'HW_DEPS': 'mpc DecompROS2', 'E': ''})
 
     def test_same(self):
         self.assertTrue(cp.same(A, A[:7]))
