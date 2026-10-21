@@ -19,7 +19,7 @@ No ROS install is needed on the host. Everything runs in docker, and `scripts/si
 - Linux with Docker Engine and its compose and buildx plugins, your user in the `docker` group,
   and `git`, `tmux` and Python 3.8+ with PyYAML (`sudo apt install git tmux python3-yaml`).
 - 12 or more CPU cores (with fewer, the containers run unpinned), and about 30 GB free under
-  docker's root (45 GB with the GPU image).
+  docker's root (40 GB with the GPU image: 24 GB of images and 16 GB of build cache).
 - Optional: an NVIDIA GPU with the NVIDIA Container Toolkit, for the `mapping: gpu` sessions.
   `smoke` and `odom_eval` run without one.
 - An ssh key on your GitHub and GitLab accounts, loaded in an ssh agent (`ssh-add`) or given as
@@ -36,14 +36,18 @@ No ROS install is needed on the host. Everything runs in docker, and `scripts/si
 
 ```bash
 git clone https://github.com/seraHam/rover_sim.git && cd rover_sim
+tmux new -s bootstrap          # over ssh: the first run is long, and must outlive the connection
 scripts/bootstrap.py --run
 ```
 
 `scripts/bootstrap.py` checks the host and your access to every repo first, so a missing grant
 fails in seconds, not part-way through the build. It then builds the images (without a GPU, all
-but the elevation image) and starts `smoke`: JR81 and RR83 swap places in a walled arena. The
-first build takes roughly an hour on a 20-core machine; after a failure, run it again and it
-resumes. Without `--run` it stops after a dry run of `smoke`; `--check` only checks. Then:
+but the elevation image) and starts `smoke`: JR81 and RR83 swap places in a walled arena. From
+an empty build cache on a 24-core machine this took 51 minutes: 44 building the seven images one
+at a time (gazebo 13, mighty 9, the rest 2-6 each) and 7 starting `smoke`. After a failure, run
+it again and it resumes. Without `--run` it stops after a dry run of `smoke`; `--check` only
+checks. In the drive image's build, rosdep's `ERROR: ... Cannot locate rosdep definition for
+[ament_python]` (acl_ctrl_safety) is expected and harmless. Then:
 
 ```bash
 scripts/sim.py status          # containers, panes, sim time, DLIO, modes
@@ -51,6 +55,10 @@ scripts/sim.py viz             # the live 2D view (needs a display)
 scripts/demo_eval.py swap      # grade the swap from ground truth (records 300 s)
 scripts/sim.py down            # stop it; make down also removes the containers
 ```
+
+A working install passes six of `demo_eval`'s seven checks (separation, contact, trajs, errors,
+rtf, odometry). `legs` often FAILs with a few leg timeouts out of about 20 legs: that is
+[Open issue 1](#open-issues), not your setup.
 
 ## Architecture
 

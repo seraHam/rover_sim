@@ -61,9 +61,9 @@ NO_GPU_UNITS = ['mighty', 'mapping', 'dlio', 'drive', 'gazebo']   # every unit b
 ELEVATION_REPOS = ('ELEVATION_REPO', 'ROS2_NUMPY_REPO')            # cloned for elevation only
 SUBMODULE = 'acl_ctrl_safety'   # the one submodule build_images.sh initialises in rover
 EXAMPLE = 'smoke'
-# Free space docker's root should have: the images (about 23 GB, 15 without elevation) plus
-# BuildKit's cache.
-DISK_GB = {True: 45, False: 30}
+# Free space docker's root should have: a cold build measured 24 GB of images (about 16 without
+# elevation) and 16 GB of BuildKit cache.
+DISK_GB = {True: 40, False: 30}
 
 
 def run(cmd, timeout=60, **kw):
@@ -236,13 +236,23 @@ def ssh_key_check(env=None):
         agent = bool(sock) and stat.S_ISSOCK(os.stat(sock).st_mode)
     except OSError:
         agent = False
+    keys = key_hint(env.get('HOME', ''))
     if not agent:
-        return [(FAIL, 'ssh key', 'no ssh agent: eval "$(ssh-agent -s)" && ssh-add ~/.ssh/<key>, or set '
-                                  'SSH_KEY=<key> (the builds clone private repos with it)')]
+        return [(FAIL, 'ssh key', 'no ssh agent: eval "$(ssh-agent -s)" && ssh-add (loads %s), or run with '
+                                  'SSH_KEY=<the one on your GitHub/GitLab accounts> (the builds clone private '
+                                  'repos with it)' % keys)]
     p = run(['ssh-add', '-l'], env=env)
     if p is not None and p.returncode == 0:
         return [(OK, 'ssh key', 'the ssh agent holds %d key(s)' % len(p.stdout.splitlines()))]
-    return [(FAIL, 'ssh key', 'the ssh agent holds no key: ssh-add ~/.ssh/<key>, or set SSH_KEY=<key>')]
+    return [(FAIL, 'ssh key', 'the ssh agent holds no key: ssh-add (loads %s), or run with SSH_KEY=<the one '
+                              'on your GitHub/GitLab accounts>' % keys)]
+
+
+def key_hint(home):
+    """The default private keys in ~/.ssh, which a bare `ssh-add` loads, for the hints. Which of them
+    GitHub/GitLab know is not checked here: step 2 shows it."""
+    names = [n for n in ('id_ed25519', 'id_ecdsa', 'id_rsa') if home and os.path.isfile(os.path.join(home, '.ssh', n))]
+    return ', '.join('~/.ssh/' + n for n in names) if names else 'your default keys; there are none in ~/.ssh'
 
 
 def gpu_check(docker_ok):
