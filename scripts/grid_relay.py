@@ -13,11 +13,11 @@ under voxel/, a fallback param file), and this node, grid_relay_<ns> in /<ns>, p
                                                                 persistent_map_node's window)
   voxel/esdf_2d_topic  -> esdf_2d_topic                         (mighty_node's ESDF cost)
 so persistent_map runs the robot's own parameters. occ_2d_topic is the live window, not
-map_fusion's composite with the persistent map. Nothing in mighty 3cf7320 subscribes
+map_fusion's composite with the persistent map. Nothing in mighty dbc69ea subscribes
 planning_occ_2d_topic, so it is not made.
 
 What it does, matching the robot's map_fusion outputs as configured in
-mapping_ws@c1233f7:config/mapping/map_fusion_*.yaml:
+mapping_ws@31c20fe:config/mapping/map_fusion_*.yaml:
   rate   a --rate Hz timer (default 5) sends the newest grids it has not sent;
   stamp  the newest DLIO deskewed cloud's, so a dead lidar or DLIO shows as a frozen data stamp
          to mighty's map-age hold (map_max_age_sec) however often global_mapper publishes;

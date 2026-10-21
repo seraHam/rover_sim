@@ -268,7 +268,7 @@ class LegsTest(unittest.TestCase):
 
 class ConfigTest(unittest.TestCase):
     def test_goal_radius_of_the_robot_config(self):
-        """The reference copy of hw_mighty_ground_robot.yaml (byte-identical to mighty 3cf7320)."""
+        """The reference copy of hw_mighty_ground_robot.yaml (byte-identical to mighty 3cf7320 and dbc69ea)."""
         path = REPO / 'tools' / 'reference' / 'jr02' / 'config' / 'mighty' / 'hw_mighty_ground_robot.yaml'
         self.assertEqual(gr.load_goal_radius(str(path)), 0.5)
         with tempfile.TemporaryDirectory() as d:

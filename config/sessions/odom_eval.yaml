@@ -2,7 +2,7 @@
 # and as goals each agent's square of 3 m to its left and behind it (away from the centre), in
 # the world frame, ending back at the start. Four laps (48 m: odom_eval.py --drive --pattern
 # waypoints with the goals repeated 4 times) of all four agents at once stay 0.9 m off the
-# walls and never cross. This is the plan's "scripted 50 m square" check, and the drive the
+# walls and never cross. This is the scripted ~50 m square check of DLIO, and the drive the
 # arena's odom_eval.py numbers in src/rover_sim/config/worlds.yaml come from: one 12.5 m
 # square does not fit in the arena (drive_pattern.py refuses it there).
 #

@@ -1,7 +1,7 @@
 # mapping: fallback (no GPU, "not parity"), RR class: the keys global_mapper needs on top of
 # the robot's file to make the planner's grids by itself.
 #
-# Appended to the pinned robot file, mapping_ws@c1233f7:config/mapping/global_mapper_red_rover.yaml
+# Appended to the pinned robot file, mapping_ws@31c20fe:config/mapping/global_mapper_red_rover.yaml
 # (at /mapping_config), to make the one param_file the robot's global_mapper pane passes; every
 # other key, and the pane command, stay the robot's. This block comes later in the file than the
 # robot's /** block, so rcl applies it last.
@@ -15,7 +15,7 @@
 #                 from their lower corner, so 0.15 keeps the floor voxels (0-0.1 m) out and counts
 #                 from 0.2 m up.
 #   agent_height  top of the projected band: the RR's height plus a margin, as map_fusion's
-#                 body band (mapping_ws@c1233f7:config/mapping/map_fusion_red_rover.yaml).
+#                 body band (mapping_ws@31c20fe:config/mapping/map_fusion_red_rover.yaml).
 #   esdf_enabled  mighty_node plans with the ESDF cost (use_esdf_cost in
 #                 tools/reference/jr02/config/mighty/hw_mighty_ground_robot.yaml), which map_fusion
 #                 makes on the robot; truncation_distance stays the robot file's.

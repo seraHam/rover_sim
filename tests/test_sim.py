@@ -3102,7 +3102,7 @@ class Phase4Mapping(unittest.TestCase):
             topics = re.search(r'^TOPIC_ARGS=" (.*)"$', script.read_text(), re.M).group(1).split()
             self.assertEqual(tuple(topics), sim.ELEVATION_TOPIC_ARGS)
             self.assertIn("OVERLAY_ARGS=\" 'extra_cloud_exclude:=livox/*'\"", script.read_text())
-            # mapping_ws c1233f7 has overlays for neither class (only types/JK.yaml).
+            # mapping_ws 31c20fe has overlays for neither class (only types/JK.yaml).
             self.assertEqual([sim.elevation_overlays(a, sim.read_pins()) for a in OFFICE.agents], [[]] * 4)
 
     def test_elevation_overlays(self):

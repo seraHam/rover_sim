@@ -19,12 +19,12 @@ ALLOWED.
 
 ## What JR02 was running
 
-Sources: the survey (`jr02_vs_rover_sim_survey.md`), the 2026-10-18 captures, and
-`processes/` (image IDs and full process command lines).
+Sources: the 2026-10-18 survey of JR02 (its notes are not kept in this repo), the 19:23–19:24
+UTC captures, and `processes/` (image IDs and full process command lines).
 
 | Stack (container) | Code | Config |
 |---|---|---|
-| hw-mighty | mighty binary built from `5094cdb` (`main`); mpc `193c36b`; goal_selector_msgs `4a03aed` | mighty `db3018a` `config/`, mounted read-only over the installed share. It is byte-identical to `3cf7320`, the sim's pin |
+| hw-mighty | mighty binary built from `5094cdb` (`main`); mpc `193c36b`; goal_selector_msgs `4a03aed` | mighty `db3018a` `config/`, mounted read-only over the installed share. It is byte-identical to `3cf7320` and to `dbc69ea`, the sim's pin |
 | mapping | acl-mapping `f44e045`, map_fusion `8ea4ca7` (image `rover-mapping:local`, built from rover `b226206`) | mapping_ws `c1233f7` `config/mapping`, mounted at `/mapping_config` |
 | dlio | DLIO `73c2489`; image `dlio:JR02-04c7239` | `cfg_overlay/JR02` baked in, byte-identical to dlio_ws `e676331`; scripts `59f6ee2`, mounted |
 | drive | rover `b39c898` (tree `0dc816f`), acl_ctrl_safety `5cb2be0` | rover_control `teleop_logitech.yaml`; `sensor_calib/JR02_*` |
@@ -66,9 +66,9 @@ rest of the fleet or the robot's hardware are left out or trimmed, as marked bel
 | `launch_params/dlio_odom_node.*.yaml` | `dlio:/tmp/launch_params_gedp22vx` (`initial_pose_topic: world`) and `_q7ftxy6g` (`output/twoDOnly: false`), applied after `cfg/dlio.yaml` and `cfg/params.yaml` (dlio_odom_node, pid 5756) | 19:24 UTC |
 | `launch_params/safety_node.yaml` (**fetched**) | `drive:/tmp/launch_params_5pz6vhj3` (safety_node, pid 6026): launch's copy of the deployed `teleop_logitech.yaml`, with all robots' blocks; joy_node and teleop_twist_joy get the same file. Same content as rover `b39c898` (what JR02 runs) `rover_control/config/teleop_logitech.yaml`, which is what is fetched | 19:24 UTC |
 | `launch_params/robot_state_publisher.yaml` (**trimmed**) | `drive:/tmp/launch_params_z_ufdiqh`. Its `robot_description`, the deployed URDF (private rover_description), is replaced by a placeholder: the checker compares the sim's URDF against `tf/tf_tree.yaml`, which holds its joints | 19:24 UTC |
-| `config/mighty/{mighty,hw_mighty_ground_robot,hw_goal_selector}.yaml` | mounted mighty config, byte-identical to `db3018a` and `3cf7320`. `robot_type:=red_rover` loads `mighty.yaml` and then `hw_mighty_ground_robot.yaml`. The unused `hw_mighty.yaml` (quadrotor) and `mighty_ground_robot.yaml` are left out | survey |
+| `config/mighty/{mighty,hw_mighty_ground_robot,hw_goal_selector}.yaml` | mounted mighty config, byte-identical to `db3018a`, `3cf7320` and `dbc69ea` (the sim's pin). `robot_type:=red_rover` loads `mighty.yaml` and then `hw_mighty_ground_robot.yaml`. The unused `hw_mighty.yaml` (quadrotor) and `mighty_ground_robot.yaml` are left out | survey |
 | `config/mpc/mpc.yaml` (**fetched**) | `hw-mighty:.../share/mpc/config/mpc.yaml`, identical to mpc `193c36b` `config/mpc.yaml` | 19:24 UTC |
-| `config/mapping/*.yaml` (**fetched**) | `mapping:/mapping_config/{global_mapper_junior_dlio,map_fusion_junior,persistent_map}.yaml`, byte-identical to mapping_ws `c1233f7` `config/mapping/`. Their mtimes predate the container start | 19:24 UTC |
+| `config/mapping/*.yaml` (**fetched**) | `mapping:/mapping_config/{global_mapper_junior_dlio,map_fusion_junior,persistent_map}.yaml`, byte-identical to mapping_ws `c1233f7` `config/mapping/` and to `31c20fe` (the sim's pin). Their mtimes predate the container start | 19:24 UTC |
 | `config/dlio/{dlio,params}.yaml` (**fetched**) | `dlio:/home/swarm/code/dlio_ws/install/share/direct_lidar_inertial_odometry/cfg/*.yaml`, byte-identical to dlio_ws `e676331` `cfg_overlay/JR02` | 19:24 UTC |
 | `rover.env` (**trimmed**) | `/etc/rover/rover.env`: identity, RMW, `DLIO_SEED_Z=0.36`, `MAPPER_*`. Its change-history comments, the router config path and the serial device line are left out. It sets no `ZENOH_SESSION_CONFIG_URI`; the containers get that from their compose files | 19:23 UTC |
 | `graph/node_info.txt` | `ros2 node info` of mighty_node, goal_selector, convert_odom_to_state, mpc | survey, ~17:15 UTC |
@@ -96,7 +96,7 @@ No ros2 CLI was run on the robot for these. The survey's earlier ros2 CLI calls 
 | `graph/edges.yaml` | The survey's graph captures (`node_info.txt` and the three not kept here), normalised. `nodes:` holds the complete pub/sub sets of the 4 hw-mighty nodes (from `node_info.txt`). `topics:` holds, per topic, the endpoints of the JR02 stack only: namespace `/JR02`, plus its root-level `map_odom_tf_broadcaster` and `dlio_map_node`. Other robots, C2 and base-station RViz are dropped. `/tf`'s two `map_odom_tf_broadcaster` (two robots', same root name) collapse into one. Types come from the topic list and `node_info.txt` |
 | `tf/tf_tree.yaml` | **JR: static joints** come from the deployed URDF (robot_state_publisher's launch params; the URDF itself is not kept here). They were checked identical to the derivation from rover `9b0b4ba` `red_rover_sensors_ns_frame_ids.urdf.xml`, `sensor_calib/JR02_lidar_mount.yaml` (pitch 0.5117309 rad = 29.32°) and `JR02_calib.npy`, which applies `state_publisher.launch.py`'s logic. **RR: static joints** come from the same derivation with RR08's files (pitch 0.3590419 rad = 20.5716°). That part is not a capture. **Dynamic edges** come from the process list: `<ns>/map→<ns>/odom` is `map_odom_tf.py` (periodic `/tf`), and `<ns>/odom→<ns>/base_link` is DLIO. `world→<ns>/map` is sim only. No `tf2_echo` was run on the robot |
 | `manifest.yaml` | Node table: robot name, sim container, and which files make up each node's reference |
-| `class_rr/` (**fetched**, all four files) | **Not from a robot**; no RR robot was surveyed. Used when the agent is RR-class. Contents: mapping_ws `c1233f7` `global_mapper_red_rover.yaml` and `map_fusion_red_rover.yaml`, and dlio_ws `e676331` `cfg_overlay/RR08/{dlio,params}.yaml`. The RR mapping panes use the same launch args as JR (`mapping_host_tmux.sh`), so JR02's launch params are reused with the name substituted |
+| `class_rr/` (**fetched**, all four files) | **Not from a robot**; no RR robot was surveyed. Used when the agent is RR-class. Contents: mapping_ws `c1233f7` `global_mapper_red_rover.yaml` and `map_fusion_red_rover.yaml` (at `31c20fe`, the sim's pin, only a comment in `map_fusion_red_rover.yaml` differs), and dlio_ws `e676331` `cfg_overlay/RR08/{dlio,params}.yaml`. The RR mapping panes use the same launch args as JR (`mapping_host_tmux.sh`), so JR02's launch params are reused with the name substituted |
 
 ## How the checker reads these
 
@@ -118,9 +118,9 @@ These are the robot images run as `JR81` in throwaway containers with `--network
 
 | Stack | Result |
 |---|---|
-| mighty-hw `3cf7320` (the sim's pin) | mighty_node, goal_selector, mpc and convert_odom_to_state match JR02's `5094cdb`/`db3018a` params and edges. The only difference is the allowed `num_agents` |
-| rover-mapping `b226206` + mapping_ws `c1233f7` config | Only allowed differences (`save_dir`, `corrected_path_topic`), plus the `radius_drone` note |
-| rover-drive `0dc816f` | 2 DIFFs, both expected until later phases. There is no `JR81_lidar_mount.yaml`, so the lidar joint is stripped (Phase 2 generates the file), and there is no `/JR81/safety_node` `ang_vel_max: 4.0` block (Phase 3's `teleop_sim.yaml` adds it) |
+| mighty-hw `3cf7320` (the sim's pin then; `dbc69ea` now has the same config and passes the same `num_agents`) | mighty_node, goal_selector, mpc and convert_odom_to_state match JR02's `5094cdb`/`db3018a` params and edges. The only difference is the allowed `num_agents` |
+| rover-mapping `b226206` + mapping_ws `c1233f7` config (the sim's pin then) | Only allowed differences (`save_dir`, `corrected_path_topic`), plus the `radius_drone` note |
+| rover-drive `0dc816f` | 2 DIFFs at the time, both since fixed in the sim. There was no `JR81_lidar_mount.yaml`, so the lidar joint was stripped (`sim.py` now generates `<ns>_lidar_mount.yaml`), and there was no `/JR81/safety_node` `ang_vel_max: 4.0` block (`sim.py`'s `teleop_sim.yaml` now adds it) |
 
 ## Updating
 
