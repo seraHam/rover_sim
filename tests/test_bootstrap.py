@@ -152,6 +152,11 @@ class Messages(unittest.TestCase):
         status, _, detail = bs.ssh_key_check({'SSH_AUTH_SOCK': '/nonexistent/sock'})[0]
         self.assertEqual(status, bs.FAIL)
         self.assertIn('no ssh agent', detail)
+        with tempfile.TemporaryDirectory() as home:
+            self.assertIn('there are none in ~/.ssh', bs.ssh_key_check({'HOME': home})[0][2])
+            write(Path(home, '.ssh', 'id_rsa'), 'k')
+            write(Path(home, '.ssh', 'id_ed25519'), 'k')
+            self.assertIn('ssh-add (loads ~/.ssh/id_ed25519, ~/.ssh/id_rsa)', bs.ssh_key_check({'HOME': home})[0][2])
 
 
 class Steps(unittest.TestCase):
