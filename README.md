@@ -13,6 +13,45 @@ why, is listed under [Deviations from the robot](#deviations-from-the-robot).
 
 No ROS install is needed on the host. Everything runs in docker, and `scripts/sim.py` drives it.
 
+## Quickstart
+
+**What you need**
+- Linux with Docker Engine and its compose and buildx plugins, your user in the `docker` group,
+  and `git`, `tmux` and Python 3.8+ with PyYAML (`sudo apt install git tmux python3-yaml`).
+- 12 or more CPU cores (with fewer, the containers run unpinned), and about 30 GB free under
+  docker's root (45 GB with the GPU image).
+- Optional: an NVIDIA GPU with the NVIDIA Container Toolkit, for the `mapping: gpu` sessions.
+  `smoke` and `odom_eval` run without one.
+- An ssh key on your GitHub and GitLab accounts, loaded in an ssh agent (`ssh-add`) or given as
+  `SSH_KEY=<key>`. The image builds forward it to clone private repos, and never bake it in.
+- Read access to the private repos the stacks are built from:
+  - GitHub: `blakete/dlio_ws`;
+  - mit-acl GitLab: `ugv/redrover/mapping_ws`, `ugv/redrover/rover`, `ugv/redrover/map_fusion`,
+    `ugv/acl_ctrl_safety`, `ugv/ugv_control/mpc` and `lab/acl-mapping`.
+
+  The pins decide this list: `scripts/bootstrap.py --check` reads it from them and names each
+  repo you cannot read.
+
+**Run it**
+
+```bash
+git clone https://github.com/seraHam/rover_sim.git && cd rover_sim
+scripts/bootstrap.py --run
+```
+
+`scripts/bootstrap.py` checks the host and your access to every repo first, so a missing grant
+fails in seconds, not part-way through the build. It then builds the images (without a GPU, all
+but the elevation image) and starts `smoke`: JR81 and RR83 swap places in a walled arena. The
+first build takes roughly an hour on a 20-core machine; after a failure, run it again and it
+resumes. Without `--run` it stops after a dry run of `smoke`; `--check` only checks. Then:
+
+```bash
+scripts/sim.py status          # containers, panes, sim time, DLIO, modes
+scripts/sim.py viz             # the live 2D view (needs a display)
+scripts/demo_eval.py swap      # grade the swap from ground truth (records 300 s)
+scripts/sim.py down            # stop it; make down also removes the containers
+```
+
 ## Architecture
 
 - **One container per robot stack** (`docker/compose.yaml`, project `rover-sim-stack`). Each
@@ -72,22 +111,19 @@ No ROS install is needed on the host. Everything runs in docker, and `scripts/si
   RR08): the Gazebo lidar mount, rover_description's base_link → lidar, and the DLIO image's
   cfg overlay all come from that rover.
 
-## Setup
+## Images
 
-1. **Docker** with the compose plugin, your user in the `docker` group, and an NVIDIA GPU with
-   the container toolkit for `mapping: gpu`.
-2. **SSH keys for GitHub and GitLab.** mighty, mapping_ws, dlio_ws and rover are cloned over
-   ssh by `scripts/build_images.sh`. BuildKit forwards the agent's key, and it is never baked
-   into an image.
-3. **Images:** `make images` (`scripts/build_images.sh`). It builds each stack from its own
-   repo's Dockerfile at the `docker/stacks.env` pins, plus this repo's `gazebo` and `elevation`
-   targets. It reuses an image whose inputs are unchanged. Useful options:
-   - `--src UNIT=DIR` builds a local checkout into the stack's tag;
-   - `--reuse UNIT=IMAGE` retags an existing image;
-   - `--list` shows the state.
+`make images` (`scripts/build_images.sh`, which `bootstrap.py` runs) builds each stack from its
+own repo's Dockerfile at the `docker/stacks.env` pins, plus this repo's `gazebo` and `elevation`
+targets. It reuses an image whose inputs are unchanged. Useful options:
+- `make images STACKS="mighty mapping dlio drive gazebo"` builds those only (here: all but
+  elevation);
+- `--src UNIT=DIR` builds a local checkout into the stack's tag;
+- `--reuse UNIT=IMAGE` retags an existing image;
+- `--list` shows the state.
 
-   Images are labelled with the commit and inputs they were built from, and `up` / `status`
-   warn about one built from uncommitted changes.
+Images are labelled with the commit and inputs they were built from, and `up` / `status` warn
+about one built from uncommitted changes.
 
 ## Usage
 

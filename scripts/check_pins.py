@@ -71,8 +71,9 @@ def repos_versions(text):
 
 
 def dockerfile_args(text):
-    """{ARG name: default} of a Dockerfile's `ARG NAME=value` lines."""
-    return dict(m.groups() for m in re.finditer(r'^ARG\s+(\w+)=(\S+)', text, re.M))
+    """{ARG name: default} of a Dockerfile's `ARG NAME=value` and `ARG NAME="a b"` lines."""
+    return dict((m.group(1), m.group(2) if m.group(2) is not None else m.group(3))
+                for m in re.finditer(r'^ARG\s+(\w+)=(?:"([^"]*)"|(\S+))', text, re.M))
 
 
 def same(a, b):
