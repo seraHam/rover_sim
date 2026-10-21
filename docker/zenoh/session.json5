@@ -20,7 +20,7 @@
 // (loadtest --agents 4 --variant all, each variant started on an idle router;
 // discovery = all 80 hear every expected publisher):
 //   this file    2.9 s,   80 TCP links (all to the router),  delivery 1.01
-//   client       2.8 s,   80 links: as fast, and the plan's fallback if gossip ever
+//   client       2.8 s,   80 links: as fast, and the fallback if gossip ever
 //                         misbehaves
 //   local-mesh   3.5 s,  548 links (468 peer-to-peer)
 //   mesh         7.8 s, 3240 links (3160 peer-to-peer)

@@ -30,7 +30,7 @@ stamped t is where the agent was |offset| earlier.
 Reports ATE RMSE/max (3D, xy, z), yaw and rotation error, end-point drift (m and % of the
 truth path length), the SE(2)-aligned xy ATE (what is left once a constant offset is
 removed), sample counts and rates, and prints one verdict line: PASS when the 3D ATE RMSE is
-under --target (the plan's 10 cm). Exit 0 PASS, 1 FAIL, 2 no data or a setup error, 3 when
+under --target (default 10 cm). Exit 0 PASS, 1 FAIL, 2 no data or a setup error, 3 when
 the --drive pattern did not complete (the run is still graded). An agent whose spawn.yaml entry
 has odometry: truth (NOT PARITY: truth_odom.py publishes the truth as DLIO) is refused with exit 2
 before anything is recorded: graded against the truth it would pass by construction.

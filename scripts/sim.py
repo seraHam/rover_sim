@@ -1851,7 +1851,7 @@ def elevation_overlays(a: Agent, pins: Dict[str, str]) -> List[str]:
     """The param overlays the Orin passes (elevation_mapper_host_tmux.sh's OVERLAY_DIR loop), as
     container paths: types/<VEHTYPE>.yaml, then vehicles/<robot>.yaml, those in the pinned
     checkout. The robot is the class's reference robot, which the agent stands in for, not the
-    agent. mapping_ws c1233f7 has none for JR or RR (only types/JK.yaml)."""
+    agent. mapping_ws 31c20fe has none for JR or RR (only types/JK.yaml)."""
     d = mapping_checkout(pins) / 'config' / 'elevation'
     rel = ['types/%s.yaml' % a.prefix, 'vehicles/%s.yaml' % reference_robot(a.cls, pins)]
     return ['%s/%s' % (ELEVATION_OVERLAY_IN, r) for r in rel if (d / r).is_file()]
