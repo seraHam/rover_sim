@@ -24,7 +24,8 @@ Enter in a pane restarts that one node.
   name: smoke
   world: arena                  # src/rover_sim/worlds/<world>.world; not empty: DLIO drifts
                                 # metres on a bare floor (src/rover_sim/config/worlds.yaml)
-  gui: false                    # gzclient on $DISPLAY
+  simulator: gazebo             # gazebo | isaac (Isaac Sim 5.0 in gzserver's place: scripts/isaac_sim.py)
+  gui: false                    # gzclient on $DISPLAY (gazebo only)
   mapping: fallback             # gpu (parity) | fallback (no GPU, "not parity")
   odometry: dlio                # dlio (parity) | truth (ground truth as DLIO, "not parity"); per agent too
   rviz: false                   # RViz on $DISPLAY (<run>/rviz/session.rviz)
@@ -46,7 +47,8 @@ on the far side, past the opposite start (circle_goal); elsewhere the extra ones
 
 Stacks are a registry (STACKS below). Each names its containers and builds its panes
 from the session: `zenoh` (the router in sim-drive), `gazebo` (world, spawns, sensor
-bridges, world-><ns>/map), `drive` (teleop + safety_node, rover_description per agent),
+bridges, world-><ns>/map; with simulator: isaac, isaac_sim.py in sim-isaac runs the world and
+the spawn pane only writes the URDFs it imports), `drive` (teleop + safety_node, rover_description per agent),
 `frame_align` (ground-truth alignment for mighty), `dlio` (DLIO, its seed pose and
 map->odom per agent; truth_odom.py and map->odom for odometry: truth), `mapping` (global_mapper, map_fusion, persistent_map per agent), for
 `mapping: gpu` `elevation` (the Orin's elevation mapper per agent), `mighty` (mighty_hw.sh's
@@ -166,6 +168,7 @@ SESSIONS_DIR = REPO / 'config' / 'sessions'
 PROJECT = 'rover-sim-stack'          # compose project; every compose call is scoped to it
 NETWORK = 'rover-sim'                # internal docker network (compose.yaml)
 GPU_PROFILE = 'gpu'                  # compose profile of sim-elevation
+ISAAC_PROFILE = 'isaac'              # compose profile of sim-isaac
 TMUX_PREFIX = 'rsim-'
 ROUTER_CONTAINER = 'sim-drive'
 ROUTER_HOST = 'sim-drive'            # DNS name on the rover-sim network
@@ -303,8 +306,11 @@ ODOMETRY_MODES = ('dlio', 'truth')
 # between its start and its goals, over and over; explore leaves the goals to goal_selector's
 # exploration (hw_goal_selector.yaml has it on), as on the robot; none sends nothing.
 DEMOS = ('none', 'swap', 'explore')
+# What runs the world: gzserver in sim-gazebo, or scripts/isaac_sim.py (Isaac Sim 5.0) in sim-isaac,
+# which publishes the Gazebo models' topics, so everything downstream is the same.
+SIMULATORS = ('gazebo', 'isaac')
 IDENT_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_.-]*$')
-SESSION_KEYS = ('name', 'world', 'gui', 'mapping', 'odometry', 'rviz', 'auto_arm', 'planner', 'demo', 'agents')
+SESSION_KEYS = ('name', 'world', 'simulator', 'gui', 'mapping', 'odometry', 'rviz', 'auto_arm', 'planner', 'demo', 'agents')
 AGENT_KEYS = ('name', 'class', 'pose', 'goals', 'odometry')
 
 
@@ -347,6 +353,7 @@ class Session:
     demo: str = 'none'
     odometry: str = 'dlio'             # the default for agents that set none (Agent.odometry is each one's)
     agents_env: str = ''               # the ROVER_SIM_AGENTS this `up` took its agents from
+    simulator: str = 'gazebo'          # SIMULATORS
 
     @property
     def num_agents(self) -> int:
@@ -363,7 +370,8 @@ class Session:
 
     def settings(self) -> 'OrderedDict[str, Any]':
         """The session's own keys, as its YAML spells them (agents aside)."""
-        return OrderedDict([('name', self.name), ('world', self.world), ('gui', self.gui), ('mapping', self.mapping),
+        return OrderedDict([('name', self.name), ('world', self.world), ('simulator', self.simulator),
+                            ('gui', self.gui), ('mapping', self.mapping),
                             ('odometry', self.odometry), ('rviz', self.rviz), ('auto_arm', self.auto_arm),
                             ('planner', self.planner), ('demo', self.demo)])
 
@@ -415,6 +423,11 @@ def validate_session(data: Any, source: str = '<session>') -> Session:
     for k, v in flags.items():
         if not isinstance(v, bool):
             errs.append('%s: %r is not true/false' % (k, v))
+    simulator = data.get('simulator', 'gazebo')
+    if simulator not in SIMULATORS:
+        errs.append('simulator: %r is not one of %s' % (simulator, ', '.join(SIMULATORS)))
+    elif simulator == 'isaac' and flags['gui'] is True:
+        errs.append('gui: gzclient is gazebo\'s; isaac runs headless')
     demo = data.get('demo', 'none')
     if demo not in DEMOS:
         errs.append('demo: %r is not one of %s' % (demo, ', '.join(DEMOS)))
@@ -482,7 +495,7 @@ def validate_session(data: Any, source: str = '<session>') -> Session:
     if errs:
         raise SessionError('%s: invalid session:\n  - %s' % (source, '\n  - '.join(errs)))
     return Session(name, world, mapping, flags['rviz'], tuple(agents), source, flags['gui'], flags['auto_arm'],
-                   flags['planner'], demo, odometry)
+                   flags['planner'], demo, odometry, simulator=simulator)
 
 
 def session_path(arg: str) -> Path:
@@ -765,6 +778,10 @@ CONTAINERS = OrderedDict((c.name, c) for c in (
     # mighty-hw bakes no probe: its own mighty_hw.sh gates on the router port only.
     Container('sim-mighty', (ROS_SETUP, '/home/swarm/code/mighty_ws/install/setup.bash'),
               role='mighty_node, convert_odom_to_state, mpc, goal_selector; frame_align'),
+    # simulator: isaac only (profile isaac). Isaac's own python.sh and bundled rclpy; the image's
+    # setup.bash puts the fleet's rmw_zenoh on its library path. No probe: gated on the router port.
+    Container('sim-isaac', ('/opt/rover_sim/setup.bash',),
+              role='Isaac Sim 5.0 for simulator: isaac (scripts/isaac_sim.py): world, robots, sensors'),
     # Gazebo's image (rclpy, numpy, cv2), on demand only (profile viz): `sim.py viz`.
     Container('sim-viz', (ROS_SETUP,), role='sim_viz.py, the 2D viewer (sim.py viz; profile viz)'),
 ))
@@ -1061,6 +1078,47 @@ def spawn_cmd(session: Session, ctx: RunContext) -> str:
            % (names, PANE_TIME), 'exec sleep infinity'])
 
 
+ISAAC_CONTAINER = 'sim-isaac'
+ISAAC_DIR = 'isaac'                  # <run>/isaac: isaac_sim.py's state (spawned, unpause, running) and imports
+ISAAC_CSV = '/opt/rover_sim/mid360.csv'   # the isaac image's copy of the Livox sim's pattern
+SRC_IN = '/rover_sim/src/rover_sim'  # the rover_sim package source, mounted in sim-gazebo and sim-isaac
+
+
+def xacro_cmd(a: Agent, lidar_samples: int) -> str:
+    """spawn_agent.launch.py's xacro step alone (simulator: isaac): <run>/urdf/<ns>.urdf, written
+    whole (isaac_sim.py waits for the name)."""
+    out = run_path(URDF_DIR, a.name + '.urdf')
+    return ('xacro "$(ros2 pkg prefix rover_sim)/share/rover_sim/urdf/%s.urdf.xacro" namespace:=%s '
+            'lidar_mount_file:=%s lidar_height:=%s lidar_samples:=%d -o %s.tmp && mv %s.tmp %s'
+            % (a.cls, a.name, run_path(CALIB_DIR, calib_name(a, 'mount')),
+               fmt_float(ROBOT_CLASSES[a.cls].lidar_height), lidar_samples, out, out, out))
+
+
+def isaac_spawn_cmd(session: Session, ctx: RunContext) -> str:
+    """The spawn pane for simulator: isaac: the URDFs, then the spawned line once isaac_sim.py
+    has put every agent into its paused world (<run>/isaac/spawned), as spawn_cmd prints it."""
+    names = ' '.join(a.name for a in session.agents)
+    samples = world_lidar_samples(session.world)
+    spawned = run_path(ISAAC_DIR, 'spawned')
+    return ' && '.join(
+        [pin_self('rest', ctx)] + [xacro_cmd(a, samples) for a in session.agents]
+        + ['echo "[rover_sim] URDFs written; waiting for isaac_sim.py to spawn them (%s)..."' % spawned,
+           'until [ -f %s ]; do sleep 1; done' % spawned,
+           'echo "[rover_sim] spawned %s into the paused world at %s; scripts/sim.py up unpauses it"'
+           % (names, PANE_TIME), 'exec sleep infinity'])
+
+
+def isaac_cmd(session: Session) -> str:
+    """isaac_sim.py on session.world, with the agents of <run>/spawn.yaml, the MID-360 rays
+    Gazebo casts in that world (world_lidar_samples) and each agent's D455 where its calibration
+    (write_agent_files) mounts it, paused until `up` unpauses it."""
+    return ('/isaac-sim/python.sh %s/isaac_sim.py --world %s/worlds/%s.world --spawn %s --urdf-dir %s --classes %s '
+            '--package-dir %s --state-dir %s --mid360-csv %s --calib-dir %s --lidar-samples %d'
+            % (SCRIPTS_IN, SRC_IN, session.world, run_path(SPAWN_FILE), run_path(URDF_DIR),
+               run_path(CLASSES_FILE), SRC_IN, run_path(ISAAC_DIR), ISAAC_CSV, run_path(CALIB_DIR),
+               world_lidar_samples(session.world)))
+
+
 def gazebo_panes(session: Session, ctx: RunContext) -> List[Pane]:
     """sim-gazebo. One gzserver on session.world (rover_sim world.launch.py, ODE at 1 ms,
     real-time capped), started paused; the spawn pane adds every agent, and `up` unpauses it.
@@ -1068,16 +1126,23 @@ def gazebo_panes(session: Session, ctx: RunContext) -> List[Pane]:
     robot's /<ns>/livox/{lidar,imu} on wall-clock stamps and reports sim/rtf and
     sim/time_offset. sim_tf.py publishes world-><ns>/map for every agent from
     <run>/spawn.yaml (write_agent_files). With session.gui, gzclient gets a pane of its own,
-    off gzserver's cores: the worlds' real-time budgets were measured without it."""
-    panes = [
-        Pane('gzserver %s' % session.world, 'gzserver', 'sim-gazebo', pin_self('gz', ctx)
-             + ' && ros2 launch rover_sim world.launch.py world:=%s gui:=false paused:=true' % session.world,
-             window='gazebo'),
-        Pane('spawn %s (paused)' % ', '.join(a.name for a in session.agents), 'spawn', 'sim-gazebo',
-             spawn_cmd(session, ctx), window='gazebo'),
-        Pane('world -> <ns>/map (sim_tf)', 'sim-tf', 'sim-gazebo', pin_self('rest', ctx)
-             + ' && python3 %s/sim_tf.py --spawn %s' % (SCRIPTS_IN, run_path(SPAWN_FILE)), window='gazebo'),
-    ]
+    off gzserver's cores: the worlds' real-time budgets were measured without it.
+    With simulator: isaac, isaac_sim.py in sim-isaac takes gzserver's place and publishes the same
+    topics and each agent's D455, whose frames sim_tf.py adds (--d455); the spawn pane writes the
+    URDFs it imports."""
+    spawn = 'spawn %s (paused)' % ', '.join(a.name for a in session.agents)
+    if session.simulator == 'isaac':
+        panes = [Pane('Isaac Sim %s' % session.world, 'isaac', ISAAC_CONTAINER, isaac_cmd(session), window='gazebo'),
+                 Pane(spawn, 'spawn', 'sim-gazebo', isaac_spawn_cmd(session, ctx), window='gazebo')]
+    else:
+        panes = [Pane('gzserver %s' % session.world, 'gzserver', 'sim-gazebo', pin_self('gz', ctx)
+                      + ' && ros2 launch rover_sim world.launch.py world:=%s gui:=false paused:=true' % session.world,
+                      window='gazebo'),
+                 Pane(spawn, 'spawn', 'sim-gazebo', spawn_cmd(session, ctx), window='gazebo')]
+    panes.append(Pane('world -> <ns>/map (sim_tf)', 'sim-tf', 'sim-gazebo', pin_self('rest', ctx)
+                      + ' && python3 %s/sim_tf.py --spawn %s%s' % (SCRIPTS_IN, run_path(SPAWN_FILE),
+                                                                    ' --d455' if session.simulator == 'isaac' else ''),
+                      window='gazebo'))
     if session.gui:
         panes.append(Pane('gzclient', 'gzclient', 'sim-gazebo', pin_self('rest', ctx)
                           + ' && ros2 launch rover_sim world.launch.py server:=false gui:=true', window='gazebo'))
@@ -1304,6 +1369,7 @@ def write_agent_files(session: Session, ctx: RunContext) -> None:
       <run>/classes.yaml                     the drive limits, for drive_pattern.py / odom_eval.py
                                              in any container (only sim-gazebo mounts src/)
       <run>/urdf/                            the spawn pane's xacro output
+      <run>/isaac/                           isaac_sim.py's state files (simulator: isaac)
     Stale files of an earlier session go first: the containers read these by name."""
     if not running(DESCRIPTION_CONTAINER):
         raise SimError('the reference calibration is read from %s, which is not running '
@@ -1312,7 +1378,7 @@ def write_agent_files(session: Session, ctx: RunContext) -> None:
     refs = sorted({reference_robot(a.cls, pins) for a in session.agents})
     calib = dict(zip(refs, parallel(reference_calib, refs)))
     run_dir = ctx.run_dir
-    for sub in (CALIB_DIR, URDF_DIR):
+    for sub in (CALIB_DIR, URDF_DIR, ISAAC_DIR):
         empty_own_dir(run_dir / sub)
     for a in session.agents:
         ref = reference_robot(a.cls, pins)
@@ -2028,8 +2094,10 @@ def goals_panes(session: Session, ctx: RunContext) -> List[Pane]:
 RVIZ_TEMPLATES = REPO / 'rviz' / 'templates'
 RVIZ_CONFIG_IN = run_path(RVIZ_RUN_DIR, RVIZ_FILE)
 # The parts rviz_config joins: the header (panels, global displays), one agent part per agent
-# with the gpu part inside it for mapping: gpu (elev/*), then the footer (tools, view).
-RVIZ_PARTS = ('session.rviz.part', 'agent.rviz.part', 'agent_gpu.rviz.part', 'footer.rviz.part')
+# with the gpu part inside it for mapping: gpu (elev/*) and the camera part for simulator: isaac,
+# then the footer (tools, view).
+RVIZ_PARTS = ('session.rviz.part', 'agent.rviz.part', 'agent_gpu.rviz.part', 'agent_camera.rviz.part',
+              'footer.rviz.part')
 RVIZ_TOKEN_RE = re.compile(r'@[A-Z_]+@')
 # One colour per agent (cloud, goal), in session order; RViz's "r; g; b".
 AGENT_COLORS = ('237; 51; 59', '53; 132; 228', '51; 209; 122', '246; 211; 45', '192; 97; 203', '255; 120; 0',
@@ -2067,18 +2135,19 @@ def rviz_config(session: Session, templates: Path = RVIZ_TEMPLATES) -> str:
             return (templates / name).read_text()
         except OSError as e:
             raise SimError('RViz template %s: %s' % (templates / name, e.strerror))
-    head, agent, gpu, foot = (read(n) for n in RVIZ_PARTS)
+    head, agent, gpu, camera, foot = (read(n) for n in RVIZ_PARTS)
     out = [fill_template(head, {'SESSION': '%s (%s)' % (session.name, session.source)}, RVIZ_PARTS[0])]
     for i, a in enumerate(session.agents):
         values = {'NS': a.name, 'COLOR': AGENT_COLORS[i % len(AGENT_COLORS)],
                   'EXPLORE': 'true' if session.demo == 'explore' else 'false'}
         extra = fill_template(gpu, values, RVIZ_PARTS[2]) if session.mapping == 'gpu' else ''
+        extra += fill_template(camera, values, RVIZ_PARTS[3]) if session.simulator == 'isaac' else ''
         if agent.count('@MAPPING_DISPLAYS@\n') != 1:
             raise SimError('%s: needs one @MAPPING_DISPLAYS@ line' % RVIZ_PARTS[1])
         out.append(fill_template(agent.replace('@MAPPING_DISPLAYS@\n', extra), values, RVIZ_PARTS[1]))
     fx, fy, dist = rviz_view(session)
     out.append(fill_template(foot, {'GOAL_TOPIC': GOAL_TOPIC, 'FOCAL_X': fmt_float(fx, 2), 'FOCAL_Y': fmt_float(fy, 2),
-                                    'DISTANCE': fmt_float(dist, 1)}, RVIZ_PARTS[3]))
+                                    'DISTANCE': fmt_float(dist, 1)}, RVIZ_PARTS[4]))
     text = ''.join(out)
     try:
         doc = yaml.safe_load(text)
@@ -2114,7 +2183,8 @@ def rviz_panes(session: Session, ctx: RunContext) -> List[Pane]:
 # subscriptions per agent); 5 RViz and the goals, which talk to the planner.
 STACKS = OrderedDict((s.name, s) for s in (
     Stack('zenoh', 1, 'zenoh router in sim-drive', ('sim-drive',), zenoh_panes, implemented=True),
-    Stack('gazebo', 2, 'Gazebo world, spawns, sensor bridges, world-><ns>/map', ('sim-gazebo',), gazebo_panes,
+    Stack('gazebo', 2, 'the world (Gazebo, or Isaac Sim), spawns, sensor bridges, world-><ns>/map', ('sim-gazebo',),
+          gazebo_panes,
           implemented=True, generate=(write_agent_files,), needs_display=lambda s: s.gui),
     Stack('drive', 2, 'teleop + safety_node and rover_description per agent', ('sim-drive',), drive_panes,
           implemented=True, generate=(write_agent_files, link_calib, write_teleop_file), wave=1),
@@ -2230,7 +2300,13 @@ def pending_stacks(session: Session) -> List[str]:
 
 
 def session_profiles(session: Session) -> List[str]:
-    return [GPU_PROFILE] if session.mapping == 'gpu' else []
+    return ([GPU_PROFILE] if session.mapping == 'gpu' else []) + ([ISAAC_PROFILE] if session.simulator == 'isaac' else [])
+
+
+def stack_containers(stack: Stack, session: Session) -> List[str]:
+    """The containers a stack's panes run in for this session."""
+    extra = [ISAAC_CONTAINER] if stack.name == 'gazebo' and session.simulator == 'isaac' else []
+    return list(stack.containers) + extra
 
 
 def mapping_label(mode: str, runs: bool = True, absent: str = 'not running') -> str:
@@ -3078,7 +3154,7 @@ def stop_run(remove_containers: bool = False) -> None:
         info('closed tmux session %s' % s)
     if remove_containers:
         run_dir = resolve_run_dir()
-        sh(compose_cmd([GPU_PROFILE, VIZ_PROFILE]) + ['down', '--remove-orphans'], capture=False,
+        sh(compose_cmd([GPU_PROFILE, VIZ_PROFILE, ISAAC_PROFILE]) + ['down', '--remove-orphans'], capture=False,
            env=compose_env(run_dir))
 
 
@@ -3665,9 +3741,9 @@ def print_loadtest(summaries: Sequence[Dict[str, Any]], max_discovery: float) ->
 def print_plan(session: Session, plan: Sequence[Tuple[Stack, List[Pane]]], arm: bool = False,
                ctx: Optional[RunContext] = None) -> None:
     ctx = ctx or RunContext(run_dir=run_dir_from_env())
-    print('session %s (%s): world %s (MID-360 %d rays/scan), gui %s, mapping %s, rviz %s, planner %s, demo %s, '
-          'num_agents %d' % (session.name, session.source, session.world, world_lidar_samples(session.world),
-                             'on' if session.gui else 'off', session.mapping, 'on' if session.rviz else 'off',
+    print('session %s (%s): world %s (%s, MID-360 %d rays/scan), gui %s, mapping %s, rviz %s, planner %s, demo %s, '
+          'num_agents %d' % (session.name, session.source, session.world, session.simulator,
+                             world_lidar_samples(session.world), 'on' if session.gui else 'off', session.mapping, 'on' if session.rviz else 'off',
                              'on' if session.planner else 'off', session.demo, session.num_agents))
     names = {stack.name for stack, _ in plan}
     print('mapping: ' + mapping_label(session.mapping, 'mapping' in names, 'not started'))
@@ -3745,9 +3821,10 @@ def print_plan(session: Session, plan: Sequence[Tuple[Stack, List[Pane]]], arm: 
               'skips): nothing commands motion until DLIO tracks, and the query leaves a graph with no sensor data'
               % ', '.join(a.name for a in session.agents))
     if 'gazebo' in names:
-        print('after the last wave: unpause physics over gazebo transport (up to %d tries; fails if the world stays '
-              'paused):\n      %s' % (UNPAUSE_TRIES, shlex_join(['docker', 'exec', 'sim-gazebo', 'bash', '-c',
-                                                                  unpause_cmd(ctx)])))
+        print('after the last wave: unpause physics %s (up to %d tries; fails if the world stays paused):\n      %s'
+              % ('through isaac_sim.py\'s state dir' if session.simulator == 'isaac' else 'over gazebo transport',
+                 UNPAUSE_TRIES, shlex_join(['docker', 'exec', 'sim-gazebo', 'bash', '-c',
+                                            unpause_cmd(ctx, session.simulator)])))
     if arm and not session.planner:
         print('after the panes: arm %s: /<ns>/auto_mode once its DLIO registers scans (auto_arm; '
               '--no-arm skips)' % ', '.join(a.name for a in session.agents))
@@ -4047,26 +4124,32 @@ def settle_wave(wave: Sequence[Tuple[Stack, List[Pane]]], n_agents: int, log_dir
 GZ_SETUP = '. /usr/share/gazebo/setup.sh'
 
 
-def unpause_cmd(ctx: RunContext) -> str:
+def unpause_cmd(ctx: RunContext, simulator: str = 'gazebo') -> str:
     """The one unpause, in sim-gazebo: gz world over gazebo transport, then gz stats until the
     world reports it runs (gz stats prints nothing while paused). Not /unpause_physics:
     gzserver's ROS executor is what stops answering services (rmw_zenoh 0.1.9's lost wakeup;
     Phase 3 and 4 runs), and gazebo transport does not go through it. Not pinned to the rest
     core like the other gazebo panes: gz world and gz stats never return when their affinity
-    is one core (any of sim-gazebo's, every try), and the world is paused while gz world runs."""
+    is one core (any of sim-gazebo's, every try), and the world is paused while gz world runs.
+    simulator: isaac: <run>/isaac/unpause, then until isaac_sim.py writes <run>/isaac/running."""
     del ctx
+    if simulator == 'isaac':
+        return ('touch %s && for i in $(seq %d); do [ -f %s ] && exit 0; sleep 1; done; '
+                'echo "isaac_sim.py did not start running"; exit 1'
+                % (run_path(ISAAC_DIR, 'unpause'), UNPAUSE_CALL_S, run_path(ISAAC_DIR, 'running')))
     return ' && '.join([GZ_SETUP, 'timeout -k 2 %d gz world -p 0' % UNPAUSE_CALL_S,
                         'for i in 1 2 3; do timeout -k 2 6 gz stats -d 2 | grep -m1 -o "Paused\\[F\\]" '
                         '&& exit 0; done; echo "gz stats: the world still reports no Paused[F]"; exit 1'])
 
 
-def unpause_physics(ctx: RunContext, log: Optional[Path] = None) -> int:
+def unpause_physics(ctx: RunContext, log: Optional[Path] = None, simulator: str = 'gazebo') -> int:
     """Unpauses the world (idempotent), a second time if the first try does not work. Raises
     when neither does; returns the try that worked."""
     for attempt in range(1, UNPAUSE_TRIES + 1):
         t0 = time.time()
         try:
-            p = dexec('sim-gazebo', ['bash', '-c', unpause_cmd(ctx)], check=False, timeout=UNPAUSE_CALL_S + 40)
+            p = dexec('sim-gazebo', ['bash', '-c', unpause_cmd(ctx, simulator)], check=False,
+                      timeout=UNPAUSE_CALL_S + 40)
             rc, out = p.returncode, ((p.stdout or '') + (p.stderr or '')).strip()
         except SimError as e:            # the docker exec client hung
             rc, out = None, str(e)
@@ -4075,8 +4158,9 @@ def unpause_physics(ctx: RunContext, log: Optional[Path] = None) -> int:
         if rc == 0:
             return attempt
         warn('unpause %d of %d failed (exit %s): %s' % (attempt, UNPAUSE_TRIES, rc, ''.join(out.splitlines()[-1:])))
-    raise SimError('physics was not unpaused: gz world -p 0 did not take (%s); the world stays paused: '
-                   'scripts/sim.py down, then up again' % (log or 'no log'))
+    raise SimError('physics was not unpaused: %s did not take (%s); the world stays paused: '
+                   'scripts/sim.py down, then up again'
+                   % ('isaac_sim.py\'s unpause' if simulator == 'isaac' else 'gz world -p 0', log or 'no log'))
 
 
 def bring_up(session: Session, plan: Sequence[Tuple[Stack, List[Pane]]], ctx: RunContext, log_dir: Path,
@@ -4124,7 +4208,7 @@ def bring_up(session: Session, plan: Sequence[Tuple[Stack, List[Pane]]], ctx: Ru
         log_line(log, 'interrupted before the unpause: the world stays paused')
         return rc
     if gazebo:
-        attempt = unpause_physics(ctx, log)
+        attempt = unpause_physics(ctx, log, session.simulator)
         log_line(log, 'physics unpaused')
         info('physics unpaused at %s%s; DLIO calibrates its IMU now' % (
             time.strftime(HOST_TIME_FMT), '' if attempt == 1 else ' (try %d)' % attempt))
@@ -4261,11 +4345,13 @@ def cmd_up(args: argparse.Namespace) -> int:
             raise SimError('%s not found on PATH' % tool)
     profiles = session_profiles(session)
     if profiles and not gpu_available():
-        raise SimError('session %s has mapping: gpu but this host has no nvidia-smi; '
-                       'use mapping: fallback' % session.name)
+        raise SimError('session %s has %s but this host has no nvidia-smi; %s'
+                       % (session.name, ' and '.join(w for w, on in (('mapping: gpu', session.mapping == 'gpu'),
+                                                                     ('simulator: isaac', session.simulator == 'isaac')) if on),
+                          'use mapping: fallback and simulator: gazebo'))
     images = compose_images(profiles, run_dir)
     # Every pane gates on the router, and write_agent_files reads from sim-drive.
-    services = (sorted({c for s in stacks for c in s.containers} | {ROUTER_CONTAINER}) if args.partial
+    services = (sorted({c for s in stacks for c in stack_containers(s, session)} | {ROUTER_CONTAINER}) if args.partial
                 else list(images))
     used = OrderedDict((k, v) for k, v in images.items() if k in services)
     check_images(used)

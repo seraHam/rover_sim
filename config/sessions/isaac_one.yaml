@@ -1,0 +1,15 @@
+# One JR on Isaac Sim, the lightest isaac session: JR81 explores ACL_office_simple from
+# office_explore's JR81 start, with the fallback mapping (no GPU elevation mapper).
+# Needs an NVIDIA GPU.
+#
+#   scripts/sim.py up isaac_one --rviz
+name: isaac_one
+world: ACL_office_simple
+simulator: isaac
+gui: false
+mapping: fallback
+rviz: false
+demo: explore
+auto_arm: true
+agents:
+  - {name: JR81, class: jr, pose: [-4.5, 4.0, -45.0]}

@@ -21,7 +21,8 @@ No ROS install is needed on the host. Everything runs in docker, and `scripts/si
 - 12 or more CPU cores (with fewer, the containers run unpinned), and about 30 GB free under
   docker's root (45 GB with the GPU image).
 - Optional: an NVIDIA GPU with the NVIDIA Container Toolkit, for the `mapping: gpu` sessions.
-  `smoke` and `odom_eval` run without one.
+  `smoke` and `odom_eval` run without one. `simulator: isaac` needs one too, with driver 550 or
+  later (Isaac Sim 5.0; 5.1 and later want 570).
 - An ssh key on your GitHub and GitLab accounts, loaded in an ssh agent (`ssh-add`) or given as
   `SSH_KEY=<key>`. The image builds forward it to clone private repos, and never bake it in.
 - Read access to the private repos the stacks are built from:
@@ -68,6 +69,7 @@ scripts/sim.py down            # stop it; make down also removes the containers
   | `sim-elevation` | this repo's `elevation` target (GPU) | elevation_mapping_cupy, as the robot's Orin runs it |
   | `sim-mighty` | mighty `Dockerfile.hw` (`MIGHTY_SHA`) | mighty_node, convert_odom_to_state, mpc, goal_selector, frame_align, goal_relay.py |
   | `sim-viz` | `gazebo` (profile `viz`) | sim_viz.py, the 2D viewer |
+  | `sim-isaac` | this repo's `isaac` target (profile `isaac`, GPU) | isaac_sim.py in gzserver's place, for `simulator: isaac` |
 
 - **Transport:** rmw_zenoh, the fleet's exact build (`docker/stacks.env` pins it; every image
   is checked with `dpkg-query`). One router runs in `sim-drive` on `tcp/sim-drive:7447`, and
@@ -110,6 +112,12 @@ scripts/sim.py down            # stop it; make down also removes the containers
   id, unique across classes. Each class is calibrated from one real robot (JR from JR02, RR from
   RR08): the Gazebo lidar mount, rover_description's base_link → lidar, and the DLIO image's
   cfg overlay all come from that rover.
+- `simulator: isaac` adds each agent's RealSense D455, mounted where its calibration
+  (`<ns>_calib.npy`) puts rover_description's `<ns>_d455_link`: upside down, looking ahead.
+  It publishes `/<ns>/d455/color/image_raw` (rgb8, 1280×720) and
+  `/<ns>/d455/aligned_depth_to_color/image_raw` (16UC1 mm), each with its `camera_info`, in
+  `<ns>_d455_color_optical_frame`, on the bridge's wall stamps. `sim_tf.py --d455` publishes
+  `<ns>_d455_link` → `<ns>_d455_color_frame` → `<ns>_d455_color_optical_frame`.
 
 ## Images
 
@@ -120,7 +128,9 @@ targets. It reuses an image whose inputs are unchanged. Useful options:
   elevation);
 - `--src UNIT=DIR` builds a local checkout into the stack's tag;
 - `--reuse UNIT=IMAGE` retags an existing image;
-- `--list` shows the state.
+- `--list` shows the state;
+- `scripts/build_images.sh isaac` builds the `isaac` target (Isaac Sim 5.0.0 by digest, about
+  15 GB). `make images` never builds it: only `simulator: isaac` sessions need it.
 
 Images are labelled with the commit and inputs they were built from, and `up` / `status` warn
 about one built from uncommitted changes.
@@ -146,9 +156,14 @@ scripts/sim.py up <session> --dry-run        # every pane and command; touches n
 | `multi_agent_swap` | arena | JR81, JR82, RR83, RR84 | gpu | swap (pinwheel) |
 | `office_explore` | ACL_office_simple | 4 | gpu | explore (goal_selector's frontiers) |
 | `odom_eval` | arena | 4 | fallback | no planner: `odom_eval.py --drive` |
+| `smoke_isaac` | arena | JR81, RR83 | fallback | `smoke` on Isaac Sim |
+| `isaac_one` | ACL_office_simple | JR81 | fallback | explore, on Isaac Sim |
 
 **Session keys.** The `scripts/sim.py` docstring has the full list. The main ones:
 - `world`;
+- `simulator: gazebo | isaac`: Isaac Sim 5.0 in gzserver's place (`scripts/isaac_sim.py`, which
+  lists how it differs), with the same topics downstream; `scripts/build_images.sh isaac`
+  builds its image, and it needs an NVIDIA GPU;
 - `gui` (gzclient);
 - `mapping: gpu | fallback`;
 - `odometry: dlio | truth`, also settable per agent;
@@ -252,6 +267,13 @@ The sim changes these on purpose. `allowed_deviations.yaml` lists the parameter-
 - **Worlds:** swap and smoke run in a walled arena (DLIO drifts metres on a bare floor). The
   office has sim-only pilasters, shelves and a corridor ceiling, where DLIO slid along bare
   corridors.
+- **`simulator: isaac`** (`scripts/isaac_sim.py` has the details):
+  - the drive pushes the chassis at its centre of mass, within the wheels' traction; the
+    wheels do not turn;
+  - the IMU is the lidar origin's motion plus Gazebo's noise model, not a physics sensor;
+  - the world is the Gazebo world's boxes on a ground plane;
+  - the D455 renders at 10 Hz with the lidar (the robot's runs at 30 fps), best effort, with no
+    stereo noise; its infrared, unaligned depth and point cloud are not simulated.
 
 **Bring-up and tooling**
 - Stacks start in waves into a paused world, and each pane prints one extra start-marker line.
@@ -300,3 +322,6 @@ The sim changes these on purpose. `allowed_deviations.yaml` lists the parameter-
 6. **Planner debug logs grow** in sim-mighty's `/tmp`, about 240 MB/h for 4 agents.
 7. **'Dropping traj' is invisible at `--log-level error`**, on the robot too. demo_eval counts
    the received trajectories instead.
+8. **Isaac with the D455 is not real time on l01:** `isaac_one` lost about 1.6 s per 10 s
+   (RTF ~0.8; ~0.95 with a 640×480 colour-only camera). The bridge then keeps re-anchoring
+   its time offset.

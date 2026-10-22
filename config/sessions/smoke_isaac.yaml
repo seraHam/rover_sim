@@ -1,0 +1,16 @@
+# smoke (config/sessions/smoke.yaml) with Isaac Sim in gzserver's place: the same agents,
+# world, fallback mapping and swap; the world, robots and sensors from scripts/isaac_sim.py in
+# sim-isaac (scripts/build_images.sh isaac builds its image). Needs an NVIDIA GPU.
+#
+#   scripts/sim.py up smoke_isaac
+name: smoke_isaac
+world: arena
+simulator: isaac
+gui: false
+mapping: fallback
+rviz: false
+demo: swap
+auto_arm: true
+agents:
+  - {name: JR81, class: jr, pose: [-2.0, 0.0, 0.0], goals: [[2.0, 1.0]]}
+  - {name: RR83, class: rr, pose: [2.0, 0.0, 180.0], goals: [[-2.0, 1.0]]}

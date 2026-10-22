@@ -5,8 +5,9 @@
 #   scripts/build_images.sh [UNIT...] [--force] [--src UNIT=DIR]... [--reuse UNIT=IMAGE]...
 #                           [--keep-external] [--jobs N] [--parallel N] [--prepare-only] [--list]
 #
-# UNITs: mighty mapping dlio drive gazebo elevation, where dlio = dlio-jr + dlio-rr (the
-# JR02- and RR08-calibrated images). No UNIT = all of them.
+# UNITs: mighty mapping dlio drive gazebo elevation isaac, where dlio = dlio-jr + dlio-rr (the
+# JR02- and RR08-calibrated images). No UNIT = all of them but isaac (Isaac Sim, for
+# `simulator: isaac` sessions: built only when named).
 #
 # Per unit:
 #   1. fetch its repo at the pin into .cache/src/<repo>@<sha> (gitignored) and do the
@@ -17,7 +18,7 @@
 #   3. docker buildx build --load with that repo's Dockerfile and build args, every
 #      `FROM ros:humble-ros-base` pinned to ROS_BASE_IMAGE, tagged as in stacks.env;
 #   4. check the image's rmw_zenoh + vendor builds against stacks.env (dpkg-query).
-# gazebo and elevation are this repo's own docker/Dockerfile targets.
+# gazebo, elevation and isaac are this repo's own docker/Dockerfile targets.
 #
 # A unit is skipped when its tag exists and this script built it from the same inputs
 # (pin, patches, build args: the rover_sim.inputs label). An image without that label
@@ -55,6 +56,7 @@ PATCHES="$ROOT/docker/patches"
 CACHE="$ROOT/.cache"
 PYTHON=${PYTHON:-python3}
 UNITS_ALL=(mighty mapping dlio-jr dlio-rr drive gazebo elevation)
+UNITS_NAMED=(isaac)              # built only when named
 
 log() { printf '[images] %s\n' "$*" >&2; }
 die() { printf '[images] error: %s\n' "$*" >&2; exit 1; }
@@ -79,7 +81,7 @@ load_pins() {
   for key in ROS_BASE_IMAGE ROS_SNAPSHOT RMW_ZENOH_CPP_VER ZENOH_CPP_VENDOR_VER ROS_SNAPSHOT_KEY_FPR \
              MIGHTY_REPO MIGHTY_SHA MIGHTY_IMAGE MAPPING_REPO MAPPING_SHA MAPPING_IMAGE \
              DLIO_REPO DLIO_SHA DLIO_JR_ROBOT DLIO_JR_IMAGE DLIO_RR_ROBOT DLIO_RR_IMAGE \
-             DRIVE_REPO DRIVE_SHA DRIVE_IMAGE GAZEBO_IMAGE \
+             DRIVE_REPO DRIVE_SHA DRIVE_IMAGE GAZEBO_IMAGE ISAAC_IMAGE \
              ELEVATION_REPO ELEVATION_SHA ROS2_NUMPY_REPO ROS2_NUMPY_SHA ELEVATION_IMAGE; do
     p="PIN_$key"
     [[ -n ${!p:-} ]] || die "stacks.env: $key is missing"
@@ -133,6 +135,9 @@ unit_spec() {
       U_LOCAL_CTX=stack-elevation-src
       U_ARGS=("STACK_ELEVATION_GIT_URL=$PIN_ELEVATION_REPO" "STACK_ELEVATION_GIT_REF=$PIN_ELEVATION_SHA"
               "STACK_ROS2_NUMPY_GIT_URL=$PIN_ROS2_NUMPY_REPO" "STACK_ROS2_NUMPY_GIT_REF=$PIN_ROS2_NUMPY_SHA") ;;
+    isaac)  # FROM NVIDIA's Isaac Sim image (docker/Dockerfile ISAAC_BASE_IMAGE) + stack-base's rmw_zenoh
+      U_KIND=self U_LAYOUT=self U_NAME=rover_sim U_DOCKERFILE=docker/Dockerfile U_TARGET=isaac
+      U_REPO_URL='' U_SHA='' U_IMAGE=$PIN_ISAAC_IMAGE U_LOCAL_CTX=stack-sim-src ;;
     *) die "unknown unit $1" ;;
   esac
   # The fleet RMW pin goes to every Dockerfile that declares it (mighty, mapping, drive,
@@ -152,8 +157,8 @@ unit_spec() {
 add_unit() {  # $1: unit or stack name -> WANT
   case $1 in
     dlio) WANT[dlio-jr]=1 WANT[dlio-rr]=1 ;;
-    mighty|mapping|dlio-jr|dlio-rr|drive|gazebo|elevation) WANT[$1]=1 ;;
-    *) die "unknown unit '$1' (units: mighty mapping dlio dlio-jr dlio-rr drive gazebo elevation)" ;;
+    mighty|mapping|dlio-jr|dlio-rr|drive|gazebo|elevation|isaac) WANT[$1]=1 ;;
+    *) die "unknown unit '$1' (units: mighty mapping dlio dlio-jr dlio-rr drive gazebo elevation isaac)" ;;
   esac
 }
 
@@ -407,10 +412,16 @@ verify_unit() {  # $1 unit -> 0 when its image carries exactly the stacks.env rm
   unit_spec "$1"
   want=$(printf '%s\n' "ros-humble-rmw-zenoh-cpp=$PIN_RMW_ZENOH_CPP_VER" \
                        "ros-humble-zenoh-cpp-vendor=$PIN_ZENOH_CPP_VENDOR_VER")
-  # A throwaway, network-less container named like the sim's own.
-  VERIFY_GOT=$(docker run --rm --network none --name "rover-sim-verify-$1-$$" --entrypoint dpkg-query \
-                 "$U_IMAGE" -W -f '${Package}=${Version}\n' ros-humble-rmw-zenoh-cpp ros-humble-zenoh-cpp-vendor \
-                 2>/dev/null | sort) || true
+  # A throwaway, network-less container named like the sim's own. isaac has no ROS packages:
+  # its libraries are stack-base's, and it carries the pin stack-base verified with them.
+  if [[ $1 == isaac ]]; then
+    VERIFY_GOT=$(docker run --rm --network none --name "rover-sim-verify-$1-$$" --entrypoint cat \
+                   "$U_IMAGE" /etc/rover_sim/rmw-zenoh.pin 2>/dev/null | awk -F'\t' '{print $1 "=" $2}' | sort) || true
+  else
+    VERIFY_GOT=$(docker run --rm --network none --name "rover-sim-verify-$1-$$" --entrypoint dpkg-query \
+                   "$U_IMAGE" -W -f '${Package}=${Version}\n' ros-humble-rmw-zenoh-cpp ros-humble-zenoh-cpp-vendor \
+                   2>/dev/null | sort) || true
+  fi
   [[ $VERIFY_GOT == "$want" ]]
 }
 
@@ -490,7 +501,7 @@ done
 for u in "${!REUSE[@]}"; do add_unit "$u"; done
 if (( ${#WANT[@]} == 0 )); then for u in "${UNITS_ALL[@]}"; do WANT[$u]=1; done; fi
 UNITS=()
-for u in "${UNITS_ALL[@]}"; do
+for u in "${UNITS_ALL[@]}" "${UNITS_NAMED[@]}"; do
   if [[ -n ${WANT[$u]:-} ]]; then UNITS+=("$u"); fi
 done
 

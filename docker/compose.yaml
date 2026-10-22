@@ -121,6 +121,34 @@ services:
       # rover_sim package source, for later phases to mount over the installed share.
       - ../src/rover_sim:/rover_sim/src/rover_sim:ro
 
+  # Isaac Sim in gzserver's place for `simulator: isaac` sessions (scripts/isaac_sim.py), behind
+  # the `isaac` profile, which sim.py enables for them (plain compose: --profile isaac). The sensor
+  # bridges, sim_tf and RViz stay in sim-gazebo. NVIDIA's EULA and privacy prompts are answered as
+  # its container docs do; the network is internal, so nothing reaches NVIDIA. Isaac's shader and
+  # asset caches are named volumes: without them every start compiles shaders for minutes.
+  sim-isaac:
+    <<: *sim
+    profiles: [isaac]
+    image: ${ISAAC_IMAGE:?set in docker/stacks.env; pass --env-file docker/stacks.env}
+    container_name: sim-isaac
+    hostname: sim-isaac
+    cpuset: ${ROVER_SIM_CPUSET_ISAAC:-}
+    runtime: nvidia
+    environment:
+      NVIDIA_VISIBLE_DEVICES: ${ROVER_SIM_ISAAC_GPUS:-all}
+      NVIDIA_DRIVER_CAPABILITIES: all
+      ACCEPT_EULA: "Y"
+      PRIVACY_CONSENT: "Y"
+    volumes:
+      - *vol-zenoh
+      - *vol-scripts
+      - *vol-config
+      - *vol-run
+      - ../src/rover_sim:/rover_sim/src/rover_sim:ro
+      - isaac-cache:/root/.cache
+      - isaac-nv-cache:/root/.nv
+      - isaac-kit-cache:/isaac-sim/kit/cache
+
   # Hosts the zenoh router (as drive.service does on a rover), then per agent
   # safety_node/teleop and the rover_description state publisher.
   sim-drive:
@@ -229,6 +257,12 @@ services:
 volumes:
   cupy-kernel-cache:
     name: rover-sim-cupy-kernel-cache
+  isaac-cache:
+    name: rover-sim-isaac-cache
+  isaac-nv-cache:
+    name: rover-sim-isaac-nv-cache
+  isaac-kit-cache:
+    name: rover-sim-isaac-kit-cache
 
 networks:
   rover-sim:

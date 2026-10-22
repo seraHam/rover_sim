@@ -1,0 +1,30 @@
+        # simulator: isaac only: isaac_sim.py's D455, each stream in a panel of its own (the depth off:
+        # megabytes a frame).
+        - Class: rviz_default_plugins/Image
+          Enabled: true
+          Max Value: 1
+          Median window: 5
+          Min Value: 0
+          Name: @NS@ D455 colour (Isaac)
+          Normalize Range: true
+          Topic:
+            Depth: 1
+            Durability Policy: Volatile
+            History Policy: Keep Last
+            Reliability Policy: Best Effort
+            Value: /@NS@/d455/color/image_raw
+          Value: true
+        - Class: rviz_default_plugins/Image
+          Enabled: false
+          Max Value: 1
+          Median window: 5
+          Min Value: 0
+          Name: @NS@ D455 aligned depth (Isaac)
+          Normalize Range: true
+          Topic:
+            Depth: 1
+            Durability Policy: Volatile
+            History Policy: Keep Last
+            Reliability Policy: Best Effort
+            Value: /@NS@/d455/aligned_depth_to_color/image_raw
+          Value: false

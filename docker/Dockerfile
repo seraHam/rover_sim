@@ -11,6 +11,9 @@
 #   elevation   elevation_mapping_cupy + ros2_numpy and their CUDA Python deps
 #               (the robot runs this natively on its Orin; needs an NVIDIA GPU
 #               to run). Local checkout: --build-context stack-elevation-src=<dir>
+#   isaac       Isaac Sim 5.0 for `simulator: isaac` sessions (scripts/isaac_sim.py),
+#               with the fleet's rmw_zenoh for its bundled rclpy and the MID-360
+#               pattern; needs an NVIDIA GPU to run
 # Their helper stages are named stack-*. Every source they clone is public, so
 # they need no SSH.
 ARG WS=/home/swarm/code/rover_sim_ws
@@ -32,6 +35,9 @@ ARG STACK_ELEVATION_GIT_URL=https://github.com/blakete/elevation_mapping_cupy.gi
 ARG STACK_ELEVATION_GIT_REF=43803679774cd04b36007aca84577b74999e9771
 ARG STACK_ROS2_NUMPY_GIT_URL=https://github.com/Box-Robotics/ros2_numpy.git
 ARG STACK_ROS2_NUMPY_GIT_REF=d5ebf723e1d2457d36fa89bf021b212e340c3c11
+# isaac target: Isaac Sim 5.0.0, the newest release that runs on a 550 driver (5.1 and 6.x
+# declare 570, and 6.2's RTX lidar fails on 550 with a PTX toolchain error).
+ARG ISAAC_BASE_IMAGE=nvcr.io/nvidia/isaac-sim:5.0.0@sha256:499e1fd7a3ffc68c6c6fff466d4a6a6dc9ab1573e0a28dbd5f100501ea64e410
 
 # ---------- stack-base: pinned base + the fleet's rmw_zenoh build ------------
 FROM ${STACK_BASE_IMAGE} AS stack-base
@@ -312,3 +318,38 @@ ENV LD_LIBRARY_PATH=${NV}/cusolver/lib:${NV}/cublas/lib:${NV}/cusparse/lib:${NV}
 COPY --from=stack-elevation-build ${WS}/install ${WS}/install
 RUN printf 'source /opt/ros/humble/setup.bash\nsource %s/install/setup.bash\n' "${WS}" >> /root/.bashrc
 # Command comes from compose: the container only idles (sleep infinity).
+
+# ---------- stack-mid360: the Livox sim's MID-360 pattern, for isaac ----------
+FROM stack-base AS stack-mid360
+COPY --from=stack-sim-src /livox_laser_simulation_ros2 /src
+RUN f=$(find /src -path "*/scan_mode/mid360.csv" -print -quit) && test -n "$f" && cp "$f" /mid360.csv
+
+# ---------- isaac: the sim-isaac container -----------------------------------
+# NVIDIA's image (Ubuntu 22.04, root, Python 3.11), its bundled ROS 2 Humble rclpy on the
+# fleet's rmw_zenoh: stack-base's librmw_zenoh_cpp, zenohc and tracetools, plus the ament
+# index entry and default configs rmw_zenoh looks up.
+FROM ${ISAAC_BASE_IMAGE} AS isaac
+ARG ISAAC_BASE_IMAGE
+LABEL rover_sim.stack="isaac" \
+      org.opencontainers.image.base.name="${ISAAC_BASE_IMAGE}"
+ARG Z=/opt/rover_sim/zenoh
+COPY --from=stack-base /opt/ros/humble/lib/librmw_zenoh_cpp.so /opt/ros/humble/lib/libtracetools.so \
+     /opt/ros/humble/opt/zenoh_cpp_vendor/lib/libzenohc.so ${Z}/lib/
+COPY --from=stack-base /opt/ros/humble/share/rmw_zenoh_cpp/config ${Z}/share/rmw_zenoh_cpp/config
+COPY --from=stack-base /opt/ros/humble/share/ament_index/resource_index/packages/rmw_zenoh_cpp \
+     ${Z}/share/ament_index/resource_index/packages/rmw_zenoh_cpp
+# The pin stack-base verified, which these libraries are (build_images.sh checks it).
+COPY --from=stack-base /etc/rover_sim/rmw-zenoh.pin /etc/rover_sim/rmw-zenoh.pin
+COPY --from=stack-mid360 /mid360.csv /opt/rover_sim/mid360.csv
+# The panes source this (scripts/sim.py CONTAINERS). sim.py lists and stops processes with python3
+# (stdlib only), which the image has only as Kit's.
+RUN ln -s /isaac-sim/kit/python/bin/python3 /usr/local/bin/python3 \
+ && printf 'export ROS_DISTRO=humble\nexport AMENT_PREFIX_PATH=%s\nexport LD_LIBRARY_PATH=%s/lib:/isaac-sim/exts/isaacsim.ros2.bridge/humble/lib\n' "${Z}" "${Z}" \
+        > /opt/rover_sim/setup.bash \
+ && . /opt/rover_sim/setup.bash \
+ && ! ldd ${Z}/lib/librmw_zenoh_cpp.so | grep "not found" \
+ && /isaac-sim/python.sh -c "import yaml, numpy" \
+ && test -f /opt/rover_sim/mid360.csv \
+ && python3 -c "import json, os, signal"
+# The image's own entrypoint starts its streaming app; compose's command only idles.
+ENTRYPOINT []

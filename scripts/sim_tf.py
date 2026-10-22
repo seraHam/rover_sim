@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """world -> <ns>/map for every agent of a run, on /tf.
 
-  sim_tf.py --spawn /rover_sim/run/spawn.yaml [--rate 10]
+  sim_tf.py --spawn /rover_sim/run/spawn.yaml [--rate 10] [--d455]
 
 One node, sim_tf, publishes one TFMessage per tick with a transform per agent: the
 spawn pose (x, y, 0, yaw about z) from <run>/spawn.yaml (written by sim.py), stamped
 with wall time as the rest of the stack. It goes on periodic /tf rather than /tf_static
 because rmw_zenoh does not deliver latched samples to late joiners (dlio_ws
-scripts/map_odom_tf.py). Sim only: the robot has no world frame.
+scripts/map_odom_tf.py). Sim only: the robot has no world frame. With --d455 (simulator: isaac,
+which renders the camera) it also has each agent's D455 frames below <ns>_d455_link, as
+realsense-ros publishes them for rover_sensors' d455.launch.yaml (d455_frames).
 
 The pure parts (spawn.yaml parsing, the transforms) import without rclpy;
 tests/test_sim_tf.py covers them, and checks them against sim.py's spawn.yaml and
@@ -23,6 +25,9 @@ from collections import namedtuple
 AGENT_NAME_RE = re.compile(r'^[A-Z]{2}[0-9]{2}$')
 
 SpawnPose = namedtuple('SpawnPose', 'name x y yaw')
+
+D455_COLOR_T = (0.0, -0.059, 0.0)            # realsense2_description's nominal colour imager offset
+D455_OPTICAL_Q = (-0.5, 0.5, -0.5, 0.5)      # (x, y, z, w): +z ahead, +x right, +y down
 
 
 class SpawnError(ValueError):
@@ -83,10 +88,19 @@ def world_to_map(p):
     return 'world', p.name + '/map', (p.x, p.y, 0.0), yaw_quat(p.yaw)
 
 
+def d455_frames(p):
+    """[(parent, child, t, q)] of the D455's frames on agent p, below the description's
+    <ns>_d455_link (realsense-ros with tf_prefix <ns>_): the colour imager and its optical frame."""
+    f = p.name + '_d455_'
+    return [(f + 'link', f + 'color_frame', D455_COLOR_T, (0.0, 0.0, 0.0, 1.0)),
+            (f + 'color_frame', f + 'color_optical_frame', (0.0, 0.0, 0.0), D455_OPTICAL_Q)]
+
+
 def parse_args(argv):
     ap = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
     ap.add_argument('--spawn', default='/rover_sim/run/spawn.yaml')
     ap.add_argument('--rate', type=float, default=10.0, help='Hz')
+    ap.add_argument('--d455', action='store_true', help="also each agent's D455 frames (d455_frames)")
     a = ap.parse_args(argv)
     if not a.rate > 0:
         ap.error('--rate must be > 0')
@@ -113,15 +127,18 @@ def main(argv=None):
             self.tfb = TransformBroadcaster(self)
             self.msgs = []
             for p in poses:
-                parent, child, t, q = world_to_map(p)
-                m = TransformStamped()
-                m.header.frame_id, m.child_frame_id = parent, child
-                tr, rot = m.transform.translation, m.transform.rotation
-                tr.x, tr.y, tr.z = t
-                rot.x, rot.y, rot.z, rot.w = q
-                self.msgs.append(m)
-                self.get_logger().info('%s -> %s: x %.3f y %.3f yaw %.4f rad (%.2f deg)'
-                                       % (parent, child, p.x, p.y, p.yaw, math.degrees(p.yaw)))
+                for i, (parent, child, t, q) in enumerate([world_to_map(p)] + (d455_frames(p) if args.d455 else [])):
+                    m = TransformStamped()
+                    m.header.frame_id, m.child_frame_id = parent, child
+                    tr, rot = m.transform.translation, m.transform.rotation
+                    tr.x, tr.y, tr.z = t
+                    rot.x, rot.y, rot.z, rot.w = q
+                    self.msgs.append(m)
+                    if i == 0:
+                        self.get_logger().info('%s -> %s: x %.3f y %.3f yaw %.4f rad (%.2f deg)'
+                                               % (parent, child, p.x, p.y, p.yaw, math.degrees(p.yaw)))
+                    else:
+                        self.get_logger().info('%s -> %s' % (parent, child))
             self.create_timer(1.0 / args.rate, self.tick)
 
         def tick(self):
